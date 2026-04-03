@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  build-and-release:
+    name: Build, Sign & Release
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Detect available secrets ─────────────────────────────────
+      - name: Detect signing and notarization secrets
+        id: secrets
+        run: |
+          if [ -n "$CERT_B64" ] && [ -n "$CERT_PASS" ]; then
+            echo "has_cert=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cert=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$NOTARY_ID" ] && [ -n "$NOTARY_PASS" ] && [ -n "$NOTARY_TEAM" ]; then
+            echo "has_notary=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_notary=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERT_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          NOTARY_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASS: ${{ secrets.APPLE_APP_PASSWORD }}
+          NOTARY_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+
+      # ── Build ────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: brew install cmake
+
+      - name: Build driver
+        run: |
+          cd Driver
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Build Swift app
+        run: |
+          cd App/Loopbacker
+          swift build -c release
+
+      # ── Package .app bundle ──────────────────────────────────────
+      - name: Create .app bundle
+        run: |
+          mkdir -p Loopbacker.app/Contents/MacOS
+          mkdir -p Loopbacker.app/Contents/Resources
+
+          cp App/Loopbacker/.build/release/Loopbacker Loopbacker.app/Contents/MacOS/
+          cp App/Loopbacker/Resources/Info.plist        Loopbacker.app/Contents/
+          cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
+
+      # ── Code Signing ─────────────────────────────────────────────
+      - name: Import signing certificate
+        if: steps.secrets.outputs.has_cert == 'true'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          # Decode certificate
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Extract signing identity
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Code sign (Developer ID)
+        if: steps.secrets.outputs.has_cert == 'true'
+        run: |
+          codesign --force --options runtime \
+            --sign "$SIGNING_IDENTITY" \
+            Loopbacker.app/Contents/Resources/Loopbacker.driver
+
+          codesign --force --options runtime \
+            --sign "$SIGNING_IDENTITY" \
+            Loopbacker.app
+
+      - name: Code sign (ad-hoc fallback)
+        if: steps.secrets.outputs.has_cert != 'true'
+        run: |
+          echo "::notice::No signing certificate found — using ad-hoc signature"
+          codesign --force --sign - \
+            Loopbacker.app/Contents/Resources/Loopbacker.driver
+          codesign --force --sign - \
+            Loopbacker.app
+
+      # ── Notarization ─────────────────────────────────────────────
+      - name: Notarize app
+        if: steps.secrets.outputs.has_cert == 'true' && steps.secrets.outputs.has_notary == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent Loopbacker.app Loopbacker-notarize.zip
+
+          xcrun notarytool submit Loopbacker-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple Loopbacker.app
+          rm Loopbacker-notarize.zip
+
+      # ── Create release artifacts ─────────────────────────────────
+      - name: Create DMG
+        run: |
+          hdiutil create \
+            -volname Loopbacker \
+            -srcfolder Loopbacker.app \
+            -ov \
+            -format UDZO \
+            "Loopbacker-${TAG}.dmg"
+
+      - name: Create driver zip
+        run: |
+          cd Driver/build
+          zip -r "../../Loopbacker-Driver-${TAG}.zip" Loopbacker.driver/
+
+      # ── SBOM ─────────────────────────────────────────────────────
+      - name: Generate SBOM
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json > "Loopbacker-${TAG}.sbom.json"
+
+      # ── Checksums ────────────────────────────────────────────────
+      - name: Generate checksums
+        run: |
+          shasum -a 256 \
+            "Loopbacker-${TAG}.dmg" \
+            "Loopbacker-Driver-${TAG}.zip" \
+            "Loopbacker-${TAG}.sbom.json" \
+            > checksums-sha256.txt
+
+      # ── GitHub Release ───────────────────────────────────────────
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            --generate-notes \
+            "Loopbacker-${TAG}.dmg" \
+            "Loopbacker-Driver-${TAG}.zip" \
+            "Loopbacker-${TAG}.sbom.json" \
+            checksums-sha256.txt
+
+      # ── Cleanup ──────────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

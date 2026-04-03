@@ -1,0 +1,38 @@
+# Build artifacts
+build/
+.build/
+*.o
+*.d
+*.dia
+*.pcm
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+*.dSYM/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.app
+*.dmg
+*.driver
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
