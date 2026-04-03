@@ -16,7 +16,7 @@
   <a href="https://github.com/JacobCoffee/loopbacker/actions/workflows/ci.yml"><img src="https://github.com/JacobCoffee/loopbacker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/JacobCoffee/loopbacker/releases"><img src="https://img.shields.io/github/v/release/JacobCoffee/loopbacker?include_prereleases" alt="Release"></a>
   <img src="https://img.shields.io/badge/platform-macOS%2011%2B-blue" alt="macOS 11+">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/JacobCoffee/loopbacker" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue" alt="FSL-1.1-MIT"></a>
 </p>
 
 ---
@@ -91,4 +91,4 @@ loopbacker/
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+[FSL-1.1-MIT](LICENSE) -- free to use for any non-competing purpose, converts to MIT after 2 years.
