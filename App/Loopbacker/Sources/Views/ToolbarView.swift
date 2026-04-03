@@ -94,6 +94,24 @@ struct ToolbarView: View {
             }
             .buttonStyle(.plain)
             .disabled(driverInstaller.isProcessing)
+
+            // Quit button (fully exits, stops audio routing)
+            Button(action: {
+                AppDelegate.forceQuit()
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "power")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Quit")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundColor(LoopbackerTheme.textMuted)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(LoopbackerTheme.bgInset))
+                .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)

@@ -2,6 +2,9 @@ import Foundation
 import CoreAudio
 import AudioToolbox
 import Combine
+import os.log
+
+private let logger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "AudioRouter")
 
 /// Routes audio from real input devices to the Loopbacker virtual output device,
 /// providing real-time meter levels back to the UI.
@@ -40,8 +43,9 @@ class AudioRouter: ObservableObject {
         var renderBuffer: UnsafeMutablePointer<Float>?
         var renderBufferFrames: UInt32 = 1024
 
-        // Meter levels (updated from render callback, read from main thread)
-        var meterLevels: [Float] = [0.0, 0.0]
+        // Meter levels -- C buffer for thread safety (written from RT thread, read from main)
+        var meterLevelsPtr: UnsafeMutablePointer<Float>?
+        var meterChannelCount: Int = 0
 
         init(sourceDeviceUID: String, sourceDeviceID: AudioObjectID, loopbackerDeviceID: AudioObjectID,
              channelCount: UInt32, sampleRate: Float64) {
@@ -50,7 +54,10 @@ class AudioRouter: ObservableObject {
             self.loopbackerDeviceID = loopbackerDeviceID
             self.channelCount = channelCount
             self.sampleRate = sampleRate
-            self.meterLevels = Array(repeating: 0.0, count: Int(channelCount))
+            self.meterChannelCount = Int(channelCount)
+
+            meterLevelsPtr = UnsafeMutablePointer<Float>.allocate(capacity: meterChannelCount)
+            meterLevelsPtr?.initialize(repeating: 0.0, count: meterChannelCount)
 
             let totalSamples = Int(ringBufferFrames * channelCount)
             ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
@@ -65,6 +72,7 @@ class AudioRouter: ObservableObject {
         deinit {
             if let buf = ringBuffer { buf.deallocate() }
             if let buf = renderBuffer { buf.deallocate() }
+            if let buf = meterLevelsPtr { buf.deallocate() }
         }
 
         func writeToRing(_ data: UnsafePointer<Float>, frames: UInt32) {
@@ -108,7 +116,7 @@ class AudioRouter: ObservableObject {
 
         func computeRMS(from buffer: UnsafePointer<Float>, frames: UInt32) {
             let chCount = Int(channelCount)
-            guard chCount > 0 && frames > 0 else { return }
+            guard chCount > 0 && frames > 0, let levels = meterLevelsPtr else { return }
 
             for ch in 0..<chCount {
                 var sumSquares: Float = 0.0
@@ -117,13 +125,9 @@ class AudioRouter: ObservableObject {
                     sumSquares += sample * sample
                 }
                 let rms = sqrtf(sumSquares / Float(frames))
-                // Smooth with exponential decay
                 let smoothing: Float = 0.3
-                let prev = ch < meterLevels.count ? meterLevels[ch] : 0.0
-                let level = max(rms, prev * (1.0 - smoothing))
-                if ch < meterLevels.count {
-                    meterLevels[ch] = min(level, 1.0)
-                }
+                let prev = levels[ch]
+                levels[ch] = min(max(rms, prev * (1.0 - smoothing)), 1.0)
             }
         }
     }
@@ -178,24 +182,19 @@ class AudioRouter: ObservableObject {
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevels: [Int: Float] = [:]
 
-        // Aggregate across all active routes
         for (uid, ctx) in activeRoutes {
+            guard let levels = ctx.meterLevelsPtr else { continue }
             var channelLevels: [Int: Float] = [:]
-            for (i, level) in ctx.meterLevels.enumerated() {
+            for i in 0..<ctx.meterChannelCount {
+                let level = levels[i]
                 channelLevels[i + 1] = level
-                // Also contribute to output meters (channel i+1)
                 let existingOutput = newOutputLevels[i + 1] ?? 0.0
                 newOutputLevels[i + 1] = max(existingOutput, level)
+                // Decay
+                levels[i] = level * 0.85
+                if levels[i] < 0.001 { levels[i] = 0.0 }
             }
             newSourceLevels[uid] = channelLevels
-
-            // Decay meter levels
-            for i in 0..<ctx.meterLevels.count {
-                ctx.meterLevels[i] *= 0.85
-                if ctx.meterLevels[i] < 0.001 {
-                    ctx.meterLevels[i] = 0.0
-                }
-            }
         }
 
         DispatchQueue.main.async { [weak self] in
@@ -212,20 +211,20 @@ class AudioRouter: ObservableObject {
 
         // Find the source device ID
         guard let sourceDeviceID = findDeviceByUID(sourceDeviceUID) else {
-            print("[AudioRouter] Source device not found: \(sourceDeviceUID)")
+            logger.error("Source device not found: \(sourceDeviceUID)")
             return
         }
 
         // Find the Loopbacker virtual device
         guard let loopbackerDeviceID = findDeviceByUID("LoopbackerDevice_UID") else {
-            print("[AudioRouter] Loopbacker virtual device not found")
+            logger.error("Loopbacker virtual device not found")
             return
         }
 
         // Get channel count from source device
         let channelCount = getInputChannelCount(sourceDeviceID)
         guard channelCount > 0 else {
-            print("[AudioRouter] Source device has no input channels")
+            logger.error("Source device has no input channels")
             return
         }
 
@@ -242,13 +241,13 @@ class AudioRouter: ObservableObject {
 
         // Create input AUHAL (captures from source device)
         guard setupInputUnit(ctx) else {
-            print("[AudioRouter] Failed to set up input unit")
+            logger.error("Failed to set up input unit for \(sourceDeviceUID)")
             return
         }
 
         // Create output AUHAL (sends to Loopbacker device)
         guard setupOutputUnit(ctx) else {
-            print("[AudioRouter] Failed to set up output unit")
+            logger.error("Failed to set up output unit")
             teardownUnit(&ctx.inputUnit)
             return
         }
@@ -257,7 +256,7 @@ class AudioRouter: ObservableObject {
         if let inputUnit = ctx.inputUnit {
             let status = AudioOutputUnitStart(inputUnit)
             if status != noErr {
-                print("[AudioRouter] Failed to start input unit: \(status)")
+                logger.info(" Failed to start input unit: \(status)")
                 teardownUnit(&ctx.inputUnit)
                 teardownUnit(&ctx.outputUnit)
                 return
@@ -267,7 +266,7 @@ class AudioRouter: ObservableObject {
         if let outputUnit = ctx.outputUnit {
             let status = AudioOutputUnitStart(outputUnit)
             if status != noErr {
-                print("[AudioRouter] Failed to start output unit: \(status)")
+                logger.info(" Failed to start output unit: \(status)")
                 if let inputUnit = ctx.inputUnit { AudioOutputUnitStop(inputUnit) }
                 teardownUnit(&ctx.inputUnit)
                 teardownUnit(&ctx.outputUnit)
@@ -276,7 +275,7 @@ class AudioRouter: ObservableObject {
         }
 
         activeRoutes[sourceDeviceUID] = ctx
-        print("[AudioRouter] Started routing: \(sourceDeviceUID)")
+        logger.info(" Started routing: \(sourceDeviceUID)")
     }
 
     private func stopRoutingInternal(sourceDeviceUID: String) {
@@ -291,7 +290,7 @@ class AudioRouter: ObservableObject {
         teardownUnit(&ctx.inputUnit)
         teardownUnit(&ctx.outputUnit)
 
-        print("[AudioRouter] Stopped routing: \(sourceDeviceUID)")
+        logger.info(" Stopped routing: \(sourceDeviceUID)")
     }
 
     // MARK: - AUHAL setup

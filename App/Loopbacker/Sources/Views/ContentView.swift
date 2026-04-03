@@ -17,17 +17,21 @@ struct ContentView: View {
         .background(LoopbackerTheme.bgDeep)
         .onAppear {
             audioDeviceManager.populateInitialSources(into: routingState)
-            // Start routing for any sources loaded from saved state
-            syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
+            // Start routing for saved state after a brief settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
+            }
         }
-        // Sync audio routing when sources are toggled or routes change
-        .onChange(of: routingState.sources) { newSources in
+        .onChange(of: routingState.sources) { _, newSources in
             syncAudioRouting(sources: newSources, routes: routingState.routes)
         }
-        .onChange(of: routingState.routes) { newRoutes in
+        .onChange(of: routingState.routes) { _, newRoutes in
             syncAudioRouting(sources: routingState.sources, routes: newRoutes)
         }
-        // Update meter levels from AudioRouter into the model
+        // Re-sync when devices are hotplugged (e.g. M2 connected/disconnected)
+        .onChange(of: audioDeviceManager.systemDevices) { _, _ in
+            syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
+        }
         .onReceive(audioRouter.$sourceMeterLevels) { levels in
             updateSourceMeters(levels)
         }
