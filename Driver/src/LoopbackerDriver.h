@@ -8,6 +8,45 @@
 #include "RingBuffer.h"
 #include "LoopbackerTypes.h"
 
+/// Per-device state for each virtual loopback device.
+struct DeviceState {
+    const char* name;
+    const char* uid;
+    AudioObjectID deviceID;
+    AudioObjectID inputStreamID;
+    AudioObjectID outputStreamID;
+    AudioObjectID volumeControlID;
+
+    Float64 sampleRate;
+    std::atomic<UInt32> ioIsRunning;       // number of active IO clients
+    UInt64  ioCycleCount;                  // counts IO cycles for timestamp synthesis
+
+    Float32 volume;
+    bool    mute;
+
+    std::unique_ptr<RingBuffer> ringBuffer;
+
+    UInt64  anchorHostTime;                // mach_absolute_time at IO start
+    Float64 hostTicksPerFrame;             // host ticks per sample frame
+
+    DeviceState()
+        : name(nullptr)
+        , uid(nullptr)
+        , deviceID(0)
+        , inputStreamID(0)
+        , outputStreamID(0)
+        , volumeControlID(0)
+        , sampleRate(kDefaultSampleRate)
+        , ioIsRunning(0)
+        , ioCycleCount(0)
+        , volume(1.0f)
+        , mute(false)
+        , anchorHostTime(0)
+        , hostTicksPerFrame(0.0)
+    {
+    }
+};
+
 /// The Loopbacker audio driver object. Implements AudioServerPlugInDriverInterface.
 struct LoopbackerDriver {
     // COM-style vtable pointer — MUST be the first field.
@@ -19,24 +58,11 @@ struct LoopbackerDriver {
     // Host interface (provided by coreaudiod)
     AudioServerPlugInHostRef mHost;
 
-    // Audio state
-    Float64 mSampleRate;
-    std::atomic<UInt32> mIOIsRunning;       // number of active IO clients
-    UInt64  mIOCycleCount;                  // counts IO cycles for timestamp synthesis
+    // Per-device state array
+    DeviceState mDevices[kMaxDevices];
 
-    // Volume / mute (cosmetic only — no DSP applied)
-    Float32 mVolume;
-    bool    mMute;
-
-    // Ring buffer for loopback
-    std::unique_ptr<RingBuffer> mRingBuffer;
-
-    // Mutex for non-realtime property changes
+    // Mutex for non-realtime property changes (shared across all devices)
     std::mutex mMutex;
-
-    // Timing
-    UInt64 mAnchorHostTime;                 // mach_absolute_time at IO start
-    Float64 mHostTicksPerFrame;             // host ticks per sample frame
 
     // Static vtable
     static AudioServerPlugInDriverInterface sInterface;
@@ -45,6 +71,12 @@ struct LoopbackerDriver {
     // Construction
     // ---------------------------------------------------------------------------
     LoopbackerDriver();
+
+    // ---------------------------------------------------------------------------
+    // Helper: find the DeviceState that owns a given object ID
+    // (device, stream, or volume control)
+    // ---------------------------------------------------------------------------
+    DeviceState* FindDeviceByObjectID(AudioObjectID inObjectID);
 
     // ---------------------------------------------------------------------------
     // IUnknown

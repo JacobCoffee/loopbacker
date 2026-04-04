@@ -3,17 +3,33 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <cstdint>
 
+// Number of virtual devices this plugin exposes
+static const uint32_t kMaxDevices = 3;
+
 // Object IDs
-static const AudioObjectID kPlugInObjectID       = kAudioObjectPlugInObject; // 1
-static const AudioObjectID kDeviceObjectID       = 2;
-static const AudioObjectID kInputStreamObjectID  = 3;
-static const AudioObjectID kOutputStreamObjectID = 4;
-static const AudioObjectID kVolumeControlObjectID = 5;
+// Plugin itself is always kAudioObjectPlugInObject (1).
+// Device N gets base ID (N+1)*10:
+//   Device 0: deviceID=10, inputStreamID=11, outputStreamID=12, volumeControlID=13
+//   Device 1: deviceID=20, inputStreamID=21, outputStreamID=22, volumeControlID=23
+//   Device 2: deviceID=30, inputStreamID=31, outputStreamID=32, volumeControlID=33
+
+struct VirtualDeviceInfo {
+    const char* name;
+    const char* uid;
+    AudioObjectID deviceID;
+    AudioObjectID inputStreamID;
+    AudioObjectID outputStreamID;
+    AudioObjectID volumeControlID;
+};
+
+static const VirtualDeviceInfo kDeviceInfos[kMaxDevices] = {
+    { "Loopbacker",   "LoopbackerDevice_UID",   10, 11, 12, 13 },
+    { "Loopbacker 2", "LoopbackerDevice_UID_2", 20, 21, 22, 23 },
+    { "Loopbacker 3", "LoopbackerDevice_UID_3", 30, 31, 32, 33 },
+};
 
 // Device metadata
-static const char* kDeviceName         = "Loopbacker";
 static const char* kDeviceManufacturer = "JacobCoffee";
-static const char* kDeviceUID          = "LoopbackerDevice_UID";
 static const char* kDeviceModelUID     = "LoopbackerDevice_ModelUID";
 
 // Audio format constants

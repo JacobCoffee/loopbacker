@@ -20,6 +20,7 @@ struct ContentView: View {
             // Start routing for saved state after a brief settle
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
+                syncOutputRouting(destinations: routingState.outputDestinations)
             }
         }
         .onChange(of: routingState.sources) { _, newSources in
@@ -56,6 +57,18 @@ struct ContentView: View {
                 if !source.deviceUID.isEmpty {
                     audioRouter.stopRouting(sourceDeviceUID: source.deviceUID)
                 }
+            }
+        }
+    }
+
+    /// Starts/stops output routing based on saved output destinations
+    private func syncOutputRouting(destinations: [OutputDestination]) {
+        for dest in destinations {
+            if dest.isEnabled && !dest.physicalOutputUID.isEmpty {
+                audioRouter.startOutputRouting(
+                    virtualDeviceUID: dest.virtualDeviceUID,
+                    physicalOutputUID: dest.physicalOutputUID
+                )
             }
         }
     }
@@ -166,8 +179,13 @@ struct ContentView: View {
 
                 Spacer(minLength: 80)
 
-                outputColumn
-                    .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+                VStack(alignment: .trailing, spacing: 20) {
+                    outputColumn
+                        .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+
+                    outputRoutingSection
+                        .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+                }
             }
             .padding(20)
 
@@ -262,6 +280,19 @@ struct ContentView: View {
                     OutputChannelView()
                 }
             }
+        }
+    }
+
+    // MARK: - Output routing section
+
+    private var outputRoutingSection: some View {
+        VStack(alignment: .trailing, spacing: 12) {
+            HStack {
+                Spacer()
+                sectionHeader(title: "Output Routing", icon: "arrow.right.circle")
+            }
+
+            OutputRoutingView()
         }
     }
 

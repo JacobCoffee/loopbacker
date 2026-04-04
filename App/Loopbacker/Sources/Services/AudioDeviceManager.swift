@@ -182,6 +182,14 @@ class AudioDeviceManager: ObservableObject {
         )
     }
 
+    // MARK: - Output device enumeration
+
+    /// Returns system devices that have output channels (for output routing picker).
+    /// Excludes Loopbacker virtual devices since those are the sources, not destinations.
+    var outputDevices: [SystemAudioDevice] {
+        systemDevices.filter { $0.isOutput && !$0.uid.contains("Loopbacker") && !$0.name.contains("Loopbacker") }
+    }
+
     // MARK: - Create AudioSource from a system device
 
     func createSource(from device: SystemAudioDevice) -> AudioSource {

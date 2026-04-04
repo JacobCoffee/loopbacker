@@ -79,15 +79,56 @@ LoopbackerDriver::LoopbackerDriver()
     : mInterface(&sInterface)
     , mRefCount(1)
     , mHost(nullptr)
-    , mSampleRate(kDefaultSampleRate)
-    , mIOIsRunning(0)
-    , mIOCycleCount(0)
-    , mVolume(1.0f)
-    , mMute(false)
-    , mRingBuffer(std::make_unique<RingBuffer>(kRingBufferFrames, kBytesPerFrame))
-    , mAnchorHostTime(0)
-    , mHostTicksPerFrame(0.0)
 {
+    for (uint32_t i = 0; i < kMaxDevices; ++i) {
+        mDevices[i].name             = kDeviceInfos[i].name;
+        mDevices[i].uid              = kDeviceInfos[i].uid;
+        mDevices[i].deviceID         = kDeviceInfos[i].deviceID;
+        mDevices[i].inputStreamID    = kDeviceInfos[i].inputStreamID;
+        mDevices[i].outputStreamID   = kDeviceInfos[i].outputStreamID;
+        mDevices[i].volumeControlID  = kDeviceInfos[i].volumeControlID;
+        mDevices[i].sampleRate       = kDefaultSampleRate;
+        mDevices[i].ioIsRunning.store(0, std::memory_order_relaxed);
+        mDevices[i].ioCycleCount     = 0;
+        mDevices[i].volume           = 1.0f;
+        mDevices[i].mute             = false;
+        mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames, kBytesPerFrame);
+        mDevices[i].anchorHostTime   = 0;
+        mDevices[i].hostTicksPerFrame = 0.0;
+    }
+}
+
+// =============================================================================
+// Helper: find DeviceState by any object ID (device, stream, or control)
+// =============================================================================
+
+DeviceState* LoopbackerDriver::FindDeviceByObjectID(AudioObjectID inObjectID)
+{
+    for (uint32_t i = 0; i < kMaxDevices; ++i) {
+        if (inObjectID == mDevices[i].deviceID ||
+            inObjectID == mDevices[i].inputStreamID ||
+            inObjectID == mDevices[i].outputStreamID ||
+            inObjectID == mDevices[i].volumeControlID) {
+            return &mDevices[i];
+        }
+    }
+    return nullptr;
+}
+
+// =============================================================================
+// Helper: classify object type within a device
+// =============================================================================
+
+enum class ObjectType { Plugin, Device, Stream, VolumeControl, Unknown };
+
+static ObjectType ClassifyObject(AudioObjectID inObjectID, DeviceState* dev)
+{
+    if (inObjectID == kAudioObjectPlugInObject) return ObjectType::Plugin;
+    if (dev == nullptr) return ObjectType::Unknown;
+    if (inObjectID == dev->deviceID) return ObjectType::Device;
+    if (inObjectID == dev->inputStreamID || inObjectID == dev->outputStreamID) return ObjectType::Stream;
+    if (inObjectID == dev->volumeControlID) return ObjectType::VolumeControl;
+    return ObjectType::Unknown;
 }
 
 // =============================================================================
@@ -175,7 +216,9 @@ OSStatus LoopbackerDriver::Initialize(AudioServerPlugInDriverRef inDriver,
 {
     auto* driver = AsDriver(inDriver);
     driver->mHost = inHost;
-    driver->mHostTicksPerFrame = ComputeHostTicksPerFrame(driver->mSampleRate);
+    for (uint32_t i = 0; i < kMaxDevices; ++i) {
+        driver->mDevices[i].hostTicksPerFrame = ComputeHostTicksPerFrame(driver->mDevices[i].sampleRate);
+    }
     return kAudioHardwareNoError;
 }
 
@@ -264,27 +307,36 @@ static AudioStreamRangedDescription MakeRangedDescription(Float64 sampleRate)
 // HasProperty
 // =============================================================================
 
-Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef /*inDriver*/,
+Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef inDriver,
                                       AudioObjectID inObjectID,
                                       pid_t /*inClientPID*/,
                                       const AudioObjectPropertyAddress* inAddress)
 {
-    switch (inObjectID) {
-        case kAudioObjectPlugInObject:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                case kAudioObjectPropertyClass:
-                case kAudioObjectPropertyOwner:
-                case kAudioObjectPropertyManufacturer:
-                case kAudioObjectPropertyOwnedObjects:
-                case kAudioPlugInPropertyDeviceList:
-                case kAudioPlugInPropertyTranslateUIDToDevice:
-                case kAudioPlugInPropertyResourceBundle:
-                    return true;
-            }
-            break;
+    // Plugin-level properties
+    if (inObjectID == kAudioObjectPlugInObject) {
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyManufacturer:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioPlugInPropertyDeviceList:
+            case kAudioPlugInPropertyTranslateUIDToDevice:
+            case kAudioPlugInPropertyResourceBundle:
+                return true;
+        }
+        return false;
+    }
 
-        case kDeviceObjectID:
+    // Find which device this object belongs to
+    auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inObjectID);
+    if (dev == nullptr) return false;
+
+    ObjectType type = ClassifyObject(inObjectID, dev);
+
+    switch (type) {
+        case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -317,8 +369,7 @@ Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef /*inDriver*/,
             }
             break;
 
-        case kInputStreamObjectID:
-        case kOutputStreamObjectID:
+        case ObjectType::Stream:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -336,7 +387,7 @@ Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef /*inDriver*/,
             }
             break;
 
-        case kVolumeControlObjectID:
+        case ObjectType::VolumeControl:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -350,6 +401,9 @@ Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef /*inDriver*/,
                     return true;
             }
             break;
+
+        default:
+            break;
     }
     return false;
 }
@@ -358,14 +412,18 @@ Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef /*inDriver*/,
 // IsPropertySettable
 // =============================================================================
 
-OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef /*inDriver*/,
+OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef inDriver,
                                               AudioObjectID inObjectID,
                                               pid_t /*inClientPID*/,
                                               const AudioObjectPropertyAddress* inAddress,
                                               Boolean* outIsSettable)
 {
-    switch (inObjectID) {
-        case kDeviceObjectID:
+    auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inObjectID);
+    ObjectType type = (inObjectID == kAudioObjectPlugInObject) ? ObjectType::Plugin : ClassifyObject(inObjectID, dev);
+
+    switch (type) {
+        case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioDevicePropertyNominalSampleRate:
                 case kAudioDevicePropertyBufferFrameSize:
@@ -374,8 +432,7 @@ OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef /*inDri
             }
             break;
 
-        case kInputStreamObjectID:
-        case kOutputStreamObjectID:
+        case ObjectType::Stream:
             switch (inAddress->mSelector) {
                 case kAudioStreamPropertyVirtualFormat:
                 case kAudioStreamPropertyPhysicalFormat:
@@ -384,7 +441,7 @@ OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef /*inDri
             }
             break;
 
-        case kVolumeControlObjectID:
+        case ObjectType::VolumeControl:
             switch (inAddress->mSelector) {
                 case kAudioLevelControlPropertyScalarValue:
                 case kAudioLevelControlPropertyDecibelValue:
@@ -392,6 +449,9 @@ OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef /*inDri
                     *outIsSettable = true;
                     return kAudioHardwareNoError;
             }
+            break;
+
+        default:
             break;
     }
 
@@ -411,33 +471,39 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                                                const void* /*inQualifierData*/,
                                                UInt32* outDataSize)
 {
-    switch (inObjectID) {
-        // ---- Plug-in object ----
-        case kAudioObjectPlugInObject:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                case kAudioObjectPropertyClass:
-                    *outDataSize = sizeof(AudioClassID);
-                    return kAudioHardwareNoError;
-                case kAudioObjectPropertyOwner:
-                    *outDataSize = sizeof(AudioObjectID);
-                    return kAudioHardwareNoError;
-                case kAudioObjectPropertyManufacturer:
-                case kAudioPlugInPropertyResourceBundle:
-                    *outDataSize = sizeof(CFStringRef);
-                    return kAudioHardwareNoError;
-                case kAudioObjectPropertyOwnedObjects:
-                case kAudioPlugInPropertyDeviceList:
-                    *outDataSize = sizeof(AudioObjectID);
-                    return kAudioHardwareNoError;
-                case kAudioPlugInPropertyTranslateUIDToDevice:
-                    *outDataSize = sizeof(AudioObjectID);
-                    return kAudioHardwareNoError;
-            }
-            break;
+    // ---- Plug-in object ----
+    if (inObjectID == kAudioObjectPlugInObject) {
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+                *outDataSize = sizeof(AudioClassID);
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwner:
+                *outDataSize = sizeof(AudioObjectID);
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyManufacturer:
+            case kAudioPlugInPropertyResourceBundle:
+                *outDataSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioPlugInPropertyDeviceList:
+                *outDataSize = kMaxDevices * sizeof(AudioObjectID);
+                return kAudioHardwareNoError;
+            case kAudioPlugInPropertyTranslateUIDToDevice:
+                *outDataSize = sizeof(AudioObjectID);
+                return kAudioHardwareNoError;
+        }
+        return kAudioHardwareUnknownPropertyError;
+    }
 
-        // ---- Device object ----
-        case kDeviceObjectID:
+    auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inObjectID);
+    if (dev == nullptr) return kAudioHardwareUnknownPropertyError;
+
+    ObjectType type = ClassifyObject(inObjectID, dev);
+
+    switch (type) {
+        case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -457,7 +523,7 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                     *outDataSize = sizeof(UInt32);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyRelatedDevices:
-                    *outDataSize = sizeof(AudioObjectID);
+                    *outDataSize = kMaxDevices * sizeof(AudioObjectID);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyDeviceIsAlive:
                 case kAudioDevicePropertyDeviceIsRunning:
@@ -505,9 +571,7 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
             }
             break;
 
-        // ---- Stream objects ----
-        case kInputStreamObjectID:
-        case kOutputStreamObjectID:
+        case ObjectType::Stream:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -534,8 +598,7 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
             }
             break;
 
-        // ---- Volume control ----
-        case kVolumeControlObjectID:
+        case ObjectType::VolumeControl:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -564,6 +627,9 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                     return kAudioHardwareNoError;
             }
             break;
+
+        default:
+            break;
     }
 
     return kAudioHardwareUnknownPropertyError;
@@ -585,68 +651,84 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
 {
     auto* driver = AsDriver(inDriver);
 
-    switch (inObjectID) {
-        // =====================================================================
-        // Plug-in object
-        // =====================================================================
-        case kAudioObjectPlugInObject:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                    WRITE_PROP(AudioClassID, kAudioObjectClassID);
+    // =====================================================================
+    // Plug-in object
+    // =====================================================================
+    if (inObjectID == kAudioObjectPlugInObject) {
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+                WRITE_PROP(AudioClassID, kAudioObjectClassID);
 
-                case kAudioObjectPropertyClass:
-                    WRITE_PROP(AudioClassID, kAudioPlugInClassID);
+            case kAudioObjectPropertyClass:
+                WRITE_PROP(AudioClassID, kAudioPlugInClassID);
 
-                case kAudioObjectPropertyOwner:
-                    WRITE_PROP(AudioObjectID, kAudioObjectUnknown);
+            case kAudioObjectPropertyOwner:
+                WRITE_PROP(AudioObjectID, kAudioObjectUnknown);
 
-                case kAudioObjectPropertyManufacturer: {
-                    if (inDataSize < sizeof(CFStringRef))
-                        return kAudioHardwareBadPropertySizeError;
-                    *outDataSize = sizeof(CFStringRef);
-                    *static_cast<CFStringRef*>(outData) =
-                        CFStringCreateWithCString(nullptr, kDeviceManufacturer, kCFStringEncodingUTF8);
-                    return kAudioHardwareNoError;
+            case kAudioObjectPropertyManufacturer: {
+                if (inDataSize < sizeof(CFStringRef))
+                    return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(CFStringRef);
+                *static_cast<CFStringRef*>(outData) =
+                    CFStringCreateWithCString(nullptr, kDeviceManufacturer, kCFStringEncodingUTF8);
+                return kAudioHardwareNoError;
+            }
+
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioPlugInPropertyDeviceList: {
+                UInt32 needed = kMaxDevices * sizeof(AudioObjectID);
+                if (inDataSize < needed)
+                    return kAudioHardwareBadPropertySizeError;
+                *outDataSize = needed;
+                auto* ids = static_cast<AudioObjectID*>(outData);
+                for (uint32_t i = 0; i < kMaxDevices; ++i) {
+                    ids[i] = driver->mDevices[i].deviceID;
                 }
+                return kAudioHardwareNoError;
+            }
 
-                case kAudioObjectPropertyOwnedObjects:
-                case kAudioPlugInPropertyDeviceList: {
-                    if (inDataSize < sizeof(AudioObjectID))
-                        return kAudioHardwareBadPropertySizeError;
-                    *outDataSize = sizeof(AudioObjectID);
-                    *static_cast<AudioObjectID*>(outData) = kDeviceObjectID;
-                    return kAudioHardwareNoError;
-                }
-
-                case kAudioPlugInPropertyTranslateUIDToDevice: {
-                    if (inQualifierDataSize < sizeof(CFStringRef) || inQualifierData == nullptr)
-                        return kAudioHardwareBadPropertySizeError;
-                    CFStringRef uid = *static_cast<const CFStringRef*>(inQualifierData);
-                    CFStringRef ourUID = CFStringCreateWithCString(nullptr, kDeviceUID, kCFStringEncodingUTF8);
-                    AudioObjectID result = kAudioObjectUnknown;
+            case kAudioPlugInPropertyTranslateUIDToDevice: {
+                if (inQualifierDataSize < sizeof(CFStringRef) || inQualifierData == nullptr)
+                    return kAudioHardwareBadPropertySizeError;
+                CFStringRef uid = *static_cast<const CFStringRef*>(inQualifierData);
+                AudioObjectID result = kAudioObjectUnknown;
+                for (uint32_t i = 0; i < kMaxDevices; ++i) {
+                    CFStringRef ourUID = CFStringCreateWithCString(nullptr, driver->mDevices[i].uid, kCFStringEncodingUTF8);
                     if (CFStringCompare(uid, ourUID, 0) == kCFCompareEqualTo) {
-                        result = kDeviceObjectID;
+                        result = driver->mDevices[i].deviceID;
                     }
                     CFRelease(ourUID);
-                    *outDataSize = sizeof(AudioObjectID);
-                    *static_cast<AudioObjectID*>(outData) = result;
-                    return kAudioHardwareNoError;
+                    if (result != kAudioObjectUnknown) break;
                 }
-
-                case kAudioPlugInPropertyResourceBundle: {
-                    if (inDataSize < sizeof(CFStringRef))
-                        return kAudioHardwareBadPropertySizeError;
-                    *outDataSize = sizeof(CFStringRef);
-                    *static_cast<CFStringRef*>(outData) = CFSTR("");
-                    return kAudioHardwareNoError;
-                }
+                *outDataSize = sizeof(AudioObjectID);
+                *static_cast<AudioObjectID*>(outData) = result;
+                return kAudioHardwareNoError;
             }
-            break;
 
+            case kAudioPlugInPropertyResourceBundle: {
+                if (inDataSize < sizeof(CFStringRef))
+                    return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(CFStringRef);
+                *static_cast<CFStringRef*>(outData) = CFSTR("");
+                return kAudioHardwareNoError;
+            }
+        }
+        return kAudioHardwareUnknownPropertyError;
+    }
+
+    // =====================================================================
+    // Find the device for this object ID
+    // =====================================================================
+    DeviceState* dev = driver->FindDeviceByObjectID(inObjectID);
+    if (dev == nullptr) return kAudioHardwareUnknownPropertyError;
+
+    ObjectType objType = ClassifyObject(inObjectID, dev);
+
+    switch (objType) {
         // =====================================================================
         // Device object
         // =====================================================================
-        case kDeviceObjectID:
+        case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                     WRITE_PROP(AudioClassID, kAudioObjectClassID);
@@ -662,7 +744,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(CFStringRef);
                     *static_cast<CFStringRef*>(outData) =
-                        CFStringCreateWithCString(nullptr, kDeviceName, kCFStringEncodingUTF8);
+                        CFStringCreateWithCString(nullptr, dev->name, kCFStringEncodingUTF8);
                     return kAudioHardwareNoError;
                 }
 
@@ -680,7 +762,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(CFStringRef);
                     *static_cast<CFStringRef*>(outData) =
-                        CFStringCreateWithCString(nullptr, kDeviceUID, kCFStringEncodingUTF8);
+                        CFStringCreateWithCString(nullptr, dev->uid, kCFStringEncodingUTF8);
                     return kAudioHardwareNoError;
                 }
 
@@ -697,10 +779,14 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, kAudioDeviceTransportTypeVirtual);
 
                 case kAudioDevicePropertyRelatedDevices: {
-                    if (inDataSize < sizeof(AudioObjectID))
+                    UInt32 needed = kMaxDevices * sizeof(AudioObjectID);
+                    if (inDataSize < needed)
                         return kAudioHardwareBadPropertySizeError;
-                    *outDataSize = sizeof(AudioObjectID);
-                    *static_cast<AudioObjectID*>(outData) = kDeviceObjectID;
+                    *outDataSize = needed;
+                    auto* ids = static_cast<AudioObjectID*>(outData);
+                    for (uint32_t i = 0; i < kMaxDevices; ++i) {
+                        ids[i] = driver->mDevices[i].deviceID;
+                    }
                     return kAudioHardwareNoError;
                 }
 
@@ -711,7 +797,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, 1);
 
                 case kAudioDevicePropertyDeviceIsRunning:
-                    WRITE_PROP(UInt32, driver->mIOIsRunning.load(std::memory_order_relaxed) > 0 ? 1 : 0);
+                    WRITE_PROP(UInt32, dev->ioIsRunning.load(std::memory_order_relaxed) > 0 ? 1 : 0);
 
                 case kAudioDevicePropertyDeviceCanBeDefaultDevice:
                     WRITE_PROP(UInt32, 1);
@@ -736,20 +822,20 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         if (inDataSize < sizeof(AudioObjectID))
                             return kAudioHardwareBadPropertySizeError;
                         *outDataSize = sizeof(AudioObjectID);
-                        *static_cast<AudioObjectID*>(outData) = kInputStreamObjectID;
+                        *static_cast<AudioObjectID*>(outData) = dev->inputStreamID;
                     } else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) {
                         if (inDataSize < sizeof(AudioObjectID))
                             return kAudioHardwareBadPropertySizeError;
                         *outDataSize = sizeof(AudioObjectID);
-                        *static_cast<AudioObjectID*>(outData) = kOutputStreamObjectID;
+                        *static_cast<AudioObjectID*>(outData) = dev->outputStreamID;
                     } else {
                         UInt32 needed = 2 * sizeof(AudioObjectID);
                         if (inDataSize < needed)
                             return kAudioHardwareBadPropertySizeError;
                         *outDataSize = needed;
                         auto* ids = static_cast<AudioObjectID*>(outData);
-                        ids[0] = kInputStreamObjectID;
-                        ids[1] = kOutputStreamObjectID;
+                        ids[0] = dev->inputStreamID;
+                        ids[1] = dev->outputStreamID;
                     }
                     return kAudioHardwareNoError;
                 }
@@ -758,7 +844,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     if (inDataSize < sizeof(AudioObjectID))
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(AudioObjectID);
-                    *static_cast<AudioObjectID*>(outData) = kVolumeControlObjectID;
+                    *static_cast<AudioObjectID*>(outData) = dev->volumeControlID;
                     return kAudioHardwareNoError;
                 }
 
@@ -768,9 +854,9 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = needed;
                     auto* ids = static_cast<AudioObjectID*>(outData);
-                    ids[0] = kInputStreamObjectID;
-                    ids[1] = kOutputStreamObjectID;
-                    ids[2] = kVolumeControlObjectID;
+                    ids[0] = dev->inputStreamID;
+                    ids[1] = dev->outputStreamID;
+                    ids[2] = dev->volumeControlID;
                     return kAudioHardwareNoError;
                 }
 
@@ -779,7 +865,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(Float64);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
-                    *static_cast<Float64*>(outData) = driver->mSampleRate;
+                    *static_cast<Float64*>(outData) = dev->sampleRate;
                     return kAudioHardwareNoError;
                 }
 
@@ -839,8 +925,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
         // =====================================================================
         // Stream objects
         // =====================================================================
-        case kInputStreamObjectID:
-        case kOutputStreamObjectID:
+        case ObjectType::Stream:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                     WRITE_PROP(AudioClassID, kAudioObjectClassID);
@@ -849,16 +934,16 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(AudioClassID, kAudioStreamClassID);
 
                 case kAudioObjectPropertyOwner:
-                    WRITE_PROP(AudioObjectID, kDeviceObjectID);
+                    WRITE_PROP(AudioObjectID, dev->deviceID);
 
                 case kAudioStreamPropertyIsActive:
                     WRITE_PROP(UInt32, 1);
 
                 case kAudioStreamPropertyDirection:
-                    WRITE_PROP(UInt32, (inObjectID == kInputStreamObjectID) ? 1 : 0);
+                    WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID) ? 1 : 0);
 
                 case kAudioStreamPropertyTerminalType:
-                    WRITE_PROP(UInt32, (inObjectID == kInputStreamObjectID)
+                    WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID)
                                ? kAudioStreamTerminalTypeMicrophone
                                : kAudioStreamTerminalTypeSpeaker);
 
@@ -875,7 +960,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     *outDataSize = sizeof(AudioStreamBasicDescription);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
                     *static_cast<AudioStreamBasicDescription*>(outData) =
-                        MakeStreamDescription(driver->mSampleRate);
+                        MakeStreamDescription(dev->sampleRate);
                     return kAudioHardwareNoError;
                 }
 
@@ -897,7 +982,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
         // =====================================================================
         // Volume control
         // =====================================================================
-        case kVolumeControlObjectID:
+        case ObjectType::VolumeControl:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                     WRITE_PROP(AudioClassID, kAudioLevelControlClassID);
@@ -906,7 +991,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(AudioClassID, kAudioVolumeControlClassID);
 
                 case kAudioObjectPropertyOwner:
-                    WRITE_PROP(AudioObjectID, kDeviceObjectID);
+                    WRITE_PROP(AudioObjectID, dev->deviceID);
 
                 case kAudioControlPropertyScope:
                     WRITE_PROP(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput);
@@ -919,7 +1004,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(Float32);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
-                    *static_cast<Float32*>(outData) = driver->mVolume;
+                    *static_cast<Float32*>(outData) = dev->volume;
                     return kAudioHardwareNoError;
                 }
 
@@ -928,7 +1013,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(Float32);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
-                    Float32 scalar = driver->mVolume;
+                    Float32 scalar = dev->volume;
                     Float32 dB = (scalar > 0.0f) ? (20.0f * log10f(scalar)) : -96.0f;
                     if (dB < -96.0f) dB = -96.0f;
                     *static_cast<Float32*>(outData) = dB;
@@ -950,10 +1035,13 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(UInt32);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
-                    *static_cast<UInt32*>(outData) = driver->mMute ? 1 : 0;
+                    *static_cast<UInt32*>(outData) = dev->mute ? 1 : 0;
                     return kAudioHardwareNoError;
                 }
             }
+            break;
+
+        default:
             break;
     }
 
@@ -976,9 +1064,14 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                                            const void* inData)
 {
     auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inObjectID);
+    if (dev == nullptr && inObjectID != kAudioObjectPlugInObject)
+        return kAudioHardwareUnknownPropertyError;
 
-    switch (inObjectID) {
-        case kDeviceObjectID:
+    ObjectType type = (inObjectID == kAudioObjectPlugInObject) ? ObjectType::Plugin : ClassifyObject(inObjectID, dev);
+
+    switch (type) {
+        case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioDevicePropertyBufferFrameSize: {
                     // We support a fixed buffer size only, so accept it but ignore the value
@@ -998,9 +1091,9 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                     {
                         std::lock_guard<std::mutex> lock(driver->mMutex);
-                        driver->mSampleRate = newRate;
-                        driver->mHostTicksPerFrame = ComputeHostTicksPerFrame(newRate);
-                        driver->mRingBuffer->reset();
+                        dev->sampleRate = newRate;
+                        dev->hostTicksPerFrame = ComputeHostTicksPerFrame(newRate);
+                        dev->ringBuffer->reset();
                     }
 
                     if (driver->mHost) {
@@ -1009,15 +1102,14 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                             kAudioObjectPropertyScopeGlobal,
                             kAudioObjectPropertyElementMain
                         };
-                        driver->mHost->PropertiesChanged(driver->mHost, kDeviceObjectID, 1, &addr);
+                        driver->mHost->PropertiesChanged(driver->mHost, dev->deviceID, 1, &addr);
                     }
                     return kAudioHardwareNoError;
                 }
             }
             break;
 
-        case kInputStreamObjectID:
-        case kOutputStreamObjectID:
+        case ObjectType::Stream:
             switch (inAddress->mSelector) {
                 case kAudioStreamPropertyVirtualFormat:
                 case kAudioStreamPropertyPhysicalFormat: {
@@ -1032,16 +1124,16 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioDeviceUnsupportedFormatError;
                     {
                         std::lock_guard<std::mutex> lock(driver->mMutex);
-                        driver->mSampleRate = fmt->mSampleRate;
-                        driver->mHostTicksPerFrame = ComputeHostTicksPerFrame(fmt->mSampleRate);
-                        driver->mRingBuffer->reset();
+                        dev->sampleRate = fmt->mSampleRate;
+                        dev->hostTicksPerFrame = ComputeHostTicksPerFrame(fmt->mSampleRate);
+                        dev->ringBuffer->reset();
                     }
                     return kAudioHardwareNoError;
                 }
             }
             break;
 
-        case kVolumeControlObjectID:
+        case ObjectType::VolumeControl:
             switch (inAddress->mSelector) {
                 case kAudioLevelControlPropertyScalarValue: {
                     if (inDataSize < sizeof(Float32))
@@ -1051,7 +1143,7 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                     if (val > 1.0f) val = 1.0f;
                     {
                         std::lock_guard<std::mutex> lock(driver->mMutex);
-                        driver->mVolume = val;
+                        dev->volume = val;
                     }
                     return kAudioHardwareNoError;
                 }
@@ -1065,7 +1157,7 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                     Float32 scalar = powf(10.0f, dB / 20.0f);
                     {
                         std::lock_guard<std::mutex> lock(driver->mMutex);
-                        driver->mVolume = scalar;
+                        dev->volume = scalar;
                     }
                     return kAudioHardwareNoError;
                 }
@@ -1076,11 +1168,14 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                     UInt32 val = *static_cast<const UInt32*>(inData);
                     {
                         std::lock_guard<std::mutex> lock(driver->mMutex);
-                        driver->mMute = (val != 0);
+                        dev->mute = (val != 0);
                     }
                     return kAudioHardwareNoError;
                 }
             }
+            break;
+
+        default:
             break;
     }
 
@@ -1092,48 +1187,56 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
 // =============================================================================
 
 OSStatus LoopbackerDriver::StartIO(AudioServerPlugInDriverRef inDriver,
-                                   AudioObjectID /*inDeviceObjectID*/,
+                                   AudioObjectID inDeviceObjectID,
                                    UInt32 /*inClientID*/)
 {
     auto* driver = AsDriver(inDriver);
-    UInt32 prev = driver->mIOIsRunning.fetch_add(1, std::memory_order_acq_rel);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
+
+    UInt32 prev = dev->ioIsRunning.fetch_add(1, std::memory_order_acq_rel);
     if (prev == 0) {
-        driver->mIOCycleCount = 0;
-        driver->mAnchorHostTime = mach_absolute_time();
-        driver->mRingBuffer->reset();
+        dev->ioCycleCount = 0;
+        dev->anchorHostTime = mach_absolute_time();
+        dev->ringBuffer->reset();
     }
     return kAudioHardwareNoError;
 }
 
 OSStatus LoopbackerDriver::StopIO(AudioServerPlugInDriverRef inDriver,
-                                  AudioObjectID /*inDeviceObjectID*/,
+                                  AudioObjectID inDeviceObjectID,
                                   UInt32 /*inClientID*/)
 {
     auto* driver = AsDriver(inDriver);
-    UInt32 prev = driver->mIOIsRunning.fetch_sub(1, std::memory_order_acq_rel);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
+
+    UInt32 prev = dev->ioIsRunning.fetch_sub(1, std::memory_order_acq_rel);
     if (prev == 1) {
-        driver->mRingBuffer->reset();
+        dev->ringBuffer->reset();
     }
     return kAudioHardwareNoError;
 }
 
 OSStatus LoopbackerDriver::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
-                                            AudioObjectID /*inDeviceObjectID*/,
+                                            AudioObjectID inDeviceObjectID,
                                             UInt32 /*inClientID*/,
                                             Float64* outSampleTime,
                                             UInt64* outHostTime,
                                             UInt64* outSeed)
 {
     auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
 
     UInt64 currentHostTime = mach_absolute_time();
-    Float64 ticksPerPeriod = driver->mHostTicksPerFrame * static_cast<Float64>(kDefaultIOBufferFrames);
+    Float64 ticksPerPeriod = dev->hostTicksPerFrame * static_cast<Float64>(kDefaultIOBufferFrames);
 
-    UInt64 hostElapsed = currentHostTime - driver->mAnchorHostTime;
+    UInt64 hostElapsed = currentHostTime - dev->anchorHostTime;
     UInt64 periodCount = static_cast<UInt64>(static_cast<Float64>(hostElapsed) / ticksPerPeriod);
 
     *outSampleTime = static_cast<Float64>(periodCount * kDefaultIOBufferFrames);
-    *outHostTime = driver->mAnchorHostTime +
+    *outHostTime = dev->anchorHostTime +
                    static_cast<UInt64>(static_cast<Float64>(periodCount) * ticksPerPeriod);
     *outSeed = 1;
 
@@ -1175,7 +1278,7 @@ OSStatus LoopbackerDriver::BeginIOOperation(AudioServerPlugInDriverRef /*inDrive
 }
 
 OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
-                                         AudioObjectID /*inDeviceObjectID*/,
+                                         AudioObjectID inDeviceObjectID,
                                          AudioObjectID /*inStreamObjectID*/,
                                          UInt32 /*inClientID*/,
                                          UInt32 inOperationID,
@@ -1185,17 +1288,19 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                                          void* /*ioSecondaryBuffer*/)
 {
     auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
 
     switch (inOperationID) {
         case kAudioServerPlugInIOOperationWriteMix: {
             auto* samples = static_cast<const float*>(ioMainBuffer);
-            driver->mRingBuffer->write(samples, inIOBufferFrameSize);
+            dev->ringBuffer->write(samples, inIOBufferFrameSize);
             break;
         }
 
         case kAudioServerPlugInIOOperationReadInput: {
             auto* samples = static_cast<float*>(ioMainBuffer);
-            uint32_t framesRead = driver->mRingBuffer->read(samples, inIOBufferFrameSize);
+            uint32_t framesRead = dev->ringBuffer->read(samples, inIOBufferFrameSize);
             if (framesRead < inIOBufferFrameSize) {
                 uint32_t remainingSamples = (inIOBufferFrameSize - framesRead) * kChannelCount;
                 memset(&samples[framesRead * kChannelCount], 0,

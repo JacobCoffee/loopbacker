@@ -41,6 +41,24 @@ private struct RoutingConfig: Codable {
     var sources: [AudioSource]
     var outputChannels: [AudioChannel]
     var routes: [AudioRoute]
+    var outputDestinations: [OutputDestination]
+
+    init(sources: [AudioSource], outputChannels: [AudioChannel], routes: [AudioRoute],
+         outputDestinations: [OutputDestination] = []) {
+        self.sources = sources
+        self.outputChannels = outputChannels
+        self.routes = routes
+        self.outputDestinations = outputDestinations
+    }
+
+    // Backward-compatible decoding: outputDestinations may not exist in old configs
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sources = try container.decode([AudioSource].self, forKey: .sources)
+        outputChannels = try container.decode([AudioChannel].self, forKey: .outputChannels)
+        routes = try container.decode([AudioRoute].self, forKey: .routes)
+        outputDestinations = (try? container.decode([OutputDestination].self, forKey: .outputDestinations)) ?? []
+    }
 }
 
 // MARK: - Routing state (the entire app model)
@@ -49,6 +67,7 @@ class RoutingState: ObservableObject {
     @Published var sources: [AudioSource]
     @Published var outputChannels: [AudioChannel]
     @Published var routes: [AudioRoute]
+    @Published var outputDestinations: [OutputDestination]
     /// Currently selected connector for route creation (first click)
     @Published var pendingConnector: ConnectorEnd?
 
@@ -58,11 +77,13 @@ class RoutingState: ObservableObject {
     init(
         sources: [AudioSource] = [],
         outputChannels: [AudioChannel] = [],
-        routes: [AudioRoute] = []
+        routes: [AudioRoute] = [],
+        outputDestinations: [OutputDestination] = []
     ) {
         self.sources = sources
         self.outputChannels = outputChannels
         self.routes = routes
+        self.outputDestinations = outputDestinations
     }
 
     // MARK: - Route management
@@ -124,6 +145,33 @@ class RoutingState: ObservableObject {
         save()
     }
 
+    // MARK: - Output destination management
+
+    func addOutputDestination(virtualDeviceUID: String, virtualDeviceName: String,
+                              physicalOutputUID: String = "", physicalOutputName: String = "None") {
+        let exists = outputDestinations.contains { $0.virtualDeviceUID == virtualDeviceUID }
+        guard !exists else { return }
+        let dest = OutputDestination(
+            virtualDeviceUID: virtualDeviceUID,
+            virtualDeviceName: virtualDeviceName,
+            physicalOutputUID: physicalOutputUID,
+            physicalOutputName: physicalOutputName
+        )
+        outputDestinations.append(dest)
+        save()
+    }
+
+    func removeOutputDestination(id: UUID) {
+        outputDestinations.removeAll { $0.id == id }
+        save()
+    }
+
+    func toggleOutputDestination(id: UUID) {
+        guard let idx = outputDestinations.firstIndex(where: { $0.id == id }) else { return }
+        outputDestinations[idx].isEnabled.toggle()
+        save()
+    }
+
     func handleConnectorTap(_ connector: ConnectorEnd) {
         guard let pending = pendingConnector else {
             pendingConnector = connector
@@ -161,7 +209,8 @@ class RoutingState: ObservableObject {
         let config = RoutingConfig(
             sources: sources,
             outputChannels: outputChannels,
-            routes: routes
+            routes: routes,
+            outputDestinations: outputDestinations
         )
         do {
             try FileManager.default.createDirectory(
@@ -183,7 +232,8 @@ class RoutingState: ObservableObject {
             return RoutingState(
                 sources: config.sources,
                 outputChannels: config.outputChannels,
-                routes: config.routes
+                routes: config.routes,
+                outputDestinations: config.outputDestinations
             )
         } catch {
             // No saved state or corrupt file — fall back to defaults

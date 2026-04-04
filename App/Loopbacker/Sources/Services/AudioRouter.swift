@@ -21,16 +21,18 @@ class AudioRouter: ObservableObject {
     // MARK: - Internal state
 
     private var activeRoutes: [String: RouteContext] = [:]
+    private var activeOutputRoutes: [String: RouteContext] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
 
-    /// Holds the CoreAudio resources for a single source -> Loopbacker route
+    /// Holds the CoreAudio resources for a single source -> destination route
     fileprivate class RouteContext {
         var inputUnit: AudioComponentInstance?
         var outputUnit: AudioComponentInstance?
-        var sourceDeviceUID: String
-        var sourceDeviceID: AudioObjectID
-        var loopbackerDeviceID: AudioObjectID
+        var captureDeviceUID: String
+        var captureDeviceID: AudioObjectID
+        var playbackDeviceID: AudioObjectID
+        var playbackDeviceUID: String
         var channelCount: UInt32
         var sampleRate: Float64
 
@@ -48,11 +50,12 @@ class AudioRouter: ObservableObject {
         var meterLevelsPtr: UnsafeMutablePointer<Float>?
         var meterChannelCount: Int = 0
 
-        init(sourceDeviceUID: String, sourceDeviceID: AudioObjectID, loopbackerDeviceID: AudioObjectID,
-             channelCount: UInt32, sampleRate: Float64) {
-            self.sourceDeviceUID = sourceDeviceUID
-            self.sourceDeviceID = sourceDeviceID
-            self.loopbackerDeviceID = loopbackerDeviceID
+        init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
+             playbackDeviceUID: String = "", channelCount: UInt32, sampleRate: Float64) {
+            self.captureDeviceUID = captureDeviceUID
+            self.captureDeviceID = captureDeviceID
+            self.playbackDeviceID = playbackDeviceID
+            self.playbackDeviceUID = playbackDeviceUID
             self.channelCount = channelCount
             self.sampleRate = sampleRate
             self.meterChannelCount = Int(channelCount)
@@ -159,19 +162,24 @@ class AudioRouter: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             let uids = Array(self.activeRoutes.keys)
+            let outputUIDs = Array(self.activeOutputRoutes.keys)
             for uid in uids {
                 self.stopRoutingInternal(sourceDeviceUID: uid)
+            }
+            for uid in outputUIDs {
+                self.stopOutputRoutingInternal(virtualDeviceUID: uid)
             }
             // Brief pause for audio system to settle
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 for uid in uids {
                     self.startRouting(sourceDeviceUID: uid)
                 }
+                // Output routes need to be restarted by the caller (RoutingState)
             }
         }
     }
 
-    // MARK: - Public API
+    // MARK: - Public API (input routing)
 
     /// Start routing audio from the given source device to the Loopbacker virtual device.
     func startRouting(sourceDeviceUID: String) {
@@ -195,6 +203,28 @@ class AudioRouter: ObservableObject {
             for uid in keys {
                 self.stopRoutingInternal(sourceDeviceUID: uid)
             }
+            let outputKeys = Array(self.activeOutputRoutes.keys)
+            for uid in outputKeys {
+                self.stopOutputRoutingInternal(virtualDeviceUID: uid)
+            }
+        }
+    }
+
+    // MARK: - Public API (output routing)
+
+    /// Start routing audio from a Loopbacker virtual device to a physical output device.
+    /// Captures from the virtual device's input side (looped-back audio) and plays to a physical output.
+    func startOutputRouting(virtualDeviceUID: String, physicalOutputUID: String) {
+        logger.info("startOutputRouting called: \(virtualDeviceUID) -> \(physicalOutputUID)")
+        queue.async { [weak self] in
+            self?.startOutputRoutingInternal(virtualDeviceUID: virtualDeviceUID, physicalOutputUID: physicalOutputUID)
+        }
+    }
+
+    /// Stop output routing for a specific virtual device.
+    func stopOutputRouting(virtualDeviceUID: String) {
+        queue.async { [weak self] in
+            self?.stopOutputRoutingInternal(virtualDeviceUID: virtualDeviceUID)
         }
     }
 
@@ -225,44 +255,59 @@ class AudioRouter: ObservableObject {
             newSourceLevels[uid] = channelLevels
         }
 
+        // Include output route meters
+        for (uid, ctx) in activeOutputRoutes {
+            guard let levels = ctx.meterLevelsPtr else { continue }
+            var channelLevels: [Int: Float] = [:]
+            for i in 0..<ctx.meterChannelCount {
+                let level = levels[i]
+                channelLevels[i + 1] = level
+                // Decay
+                levels[i] = level * 0.85
+                if levels[i] < 0.001 { levels[i] = 0.0 }
+            }
+            newSourceLevels["output:\(uid)"] = channelLevels
+        }
+
         DispatchQueue.main.async { [weak self] in
             self?.sourceMeterLevels = newSourceLevels
             self?.outputMeterLevels = newOutputLevels
         }
     }
 
-    // MARK: - Internal routing
+    // MARK: - Internal routing (input -> loopbacker)
 
     private func startRoutingInternal(sourceDeviceUID: String) {
         // Already routing this source
         guard activeRoutes[sourceDeviceUID] == nil else { return }
 
         // Find the source device ID
-        guard let sourceDeviceID = findDeviceByUID(sourceDeviceUID) else {
+        guard let captureDeviceID = findDeviceByUID(sourceDeviceUID) else {
             logger.error("Source device not found: \(sourceDeviceUID)")
             return
         }
 
         // Find the Loopbacker virtual device
-        guard let loopbackerDeviceID = findDeviceByUID("LoopbackerDevice_UID") else {
+        guard let playbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") else {
             logger.error("Loopbacker virtual device not found")
             return
         }
 
         // Get channel count from source device
-        let channelCount = getInputChannelCount(sourceDeviceID)
+        let channelCount = getInputChannelCount(captureDeviceID)
         guard channelCount > 0 else {
             logger.error("Source device has no input channels")
             return
         }
 
         // Get sample rate from the Loopbacker device
-        let sampleRate = getDeviceSampleRate(loopbackerDeviceID)
+        let sampleRate = getDeviceSampleRate(playbackDeviceID)
 
         let ctx = RouteContext(
-            sourceDeviceUID: sourceDeviceUID,
-            sourceDeviceID: sourceDeviceID,
-            loopbackerDeviceID: loopbackerDeviceID,
+            captureDeviceUID: sourceDeviceUID,
+            captureDeviceID: captureDeviceID,
+            playbackDeviceID: playbackDeviceID,
+            playbackDeviceUID: "LoopbackerDevice_UID",
             channelCount: UInt32(min(channelCount, 2)), // Clamp to stereo
             sampleRate: sampleRate
         )
@@ -321,6 +366,93 @@ class AudioRouter: ObservableObject {
         logger.info(" Stopped routing: \(sourceDeviceUID)")
     }
 
+    // MARK: - Internal output routing (virtual device -> physical output)
+
+    private func startOutputRoutingInternal(virtualDeviceUID: String, physicalOutputUID: String) {
+        logger.info("startOutputRoutingInternal: \(virtualDeviceUID) -> \(physicalOutputUID)")
+        // Stop existing output route for this virtual device first
+        stopOutputRoutingInternal(virtualDeviceUID: virtualDeviceUID)
+
+        guard !physicalOutputUID.isEmpty else { return }
+
+        // Find the virtual device (we capture from its input side)
+        guard let virtualDeviceID = findDeviceByUID(virtualDeviceUID) else {
+            logger.error("Virtual device not found: \(virtualDeviceUID)")
+            return
+        }
+
+        // Find the physical output device
+        guard let physicalOutputID = findDeviceByUID(physicalOutputUID) else {
+            logger.error("Physical output device not found: \(physicalOutputUID)")
+            return
+        }
+
+        let sampleRate = getDeviceSampleRate(virtualDeviceID)
+        let channelCount: UInt32 = 2 // Stereo
+
+        let ctx = RouteContext(
+            captureDeviceUID: virtualDeviceUID,
+            captureDeviceID: virtualDeviceID,
+            playbackDeviceID: physicalOutputID,
+            playbackDeviceUID: physicalOutputUID,
+            channelCount: channelCount,
+            sampleRate: sampleRate
+        )
+
+        // Create input AUHAL (captures from virtual device's input side)
+        guard setupInputUnit(ctx) else {
+            logger.error("Failed to set up input unit for output routing: \(virtualDeviceUID)")
+            return
+        }
+
+        // Create output AUHAL (sends to physical output device)
+        guard setupOutputUnit(ctx) else {
+            logger.error("Failed to set up output unit for output routing")
+            teardownUnit(&ctx.inputUnit)
+            return
+        }
+
+        // Start both units
+        if let inputUnit = ctx.inputUnit {
+            let status = AudioOutputUnitStart(inputUnit)
+            if status != noErr {
+                logger.info(" Failed to start output routing input unit: \(status)")
+                teardownUnit(&ctx.inputUnit)
+                teardownUnit(&ctx.outputUnit)
+                return
+            }
+        }
+
+        if let outputUnit = ctx.outputUnit {
+            let status = AudioOutputUnitStart(outputUnit)
+            if status != noErr {
+                logger.info(" Failed to start output routing output unit: \(status)")
+                if let inputUnit = ctx.inputUnit { AudioOutputUnitStop(inputUnit) }
+                teardownUnit(&ctx.inputUnit)
+                teardownUnit(&ctx.outputUnit)
+                return
+            }
+        }
+
+        activeOutputRoutes[virtualDeviceUID] = ctx
+        logger.info(" Started output routing: \(virtualDeviceUID) -> \(physicalOutputUID)")
+    }
+
+    private func stopOutputRoutingInternal(virtualDeviceUID: String) {
+        guard let ctx = activeOutputRoutes.removeValue(forKey: virtualDeviceUID) else { return }
+
+        if let inputUnit = ctx.inputUnit {
+            AudioOutputUnitStop(inputUnit)
+        }
+        if let outputUnit = ctx.outputUnit {
+            AudioOutputUnitStop(outputUnit)
+        }
+        teardownUnit(&ctx.inputUnit)
+        teardownUnit(&ctx.outputUnit)
+
+        logger.info(" Stopped output routing: \(virtualDeviceUID)")
+    }
+
     // MARK: - AUHAL setup
 
     private func setupInputUnit(_ ctx: RouteContext) -> Bool {
@@ -359,7 +491,7 @@ class AudioRouter: ObservableObject {
         guard status == noErr else { teardownUnit(&audioUnit); return false }
 
         // Set the input device
-        var deviceID = ctx.sourceDeviceID
+        var deviceID = ctx.captureDeviceID
         status = AudioUnitSetProperty(unit,
                                       kAudioOutputUnitProperty_CurrentDevice,
                                       kAudioUnitScope_Global,
@@ -435,8 +567,8 @@ class AudioRouter: ObservableObject {
         var status = AudioComponentInstanceNew(component, &audioUnit)
         guard status == noErr, let unit = audioUnit else { return false }
 
-        // Set the output device to Loopbacker
-        var deviceID = ctx.loopbackerDeviceID
+        // Set the output device
+        var deviceID = ctx.playbackDeviceID
         status = AudioUnitSetProperty(unit,
                                       kAudioOutputUnitProperty_CurrentDevice,
                                       kAudioUnitScope_Global,
@@ -506,7 +638,7 @@ class AudioRouter: ObservableObject {
 
     // MARK: - Device lookup helpers
 
-    private func findDeviceByUID(_ uid: String) -> AudioObjectID? {
+    func findDeviceByUID(_ uid: String) -> AudioObjectID? {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -546,6 +678,11 @@ class AudioRouter: ObservableObject {
             }
         }
         return nil
+    }
+
+    /// Find an output device by its UID
+    func findOutputDeviceByUID(_ uid: String) -> AudioObjectID? {
+        return findDeviceByUID(uid)
     }
 
     private func getInputChannelCount(_ deviceID: AudioObjectID) -> Int {
