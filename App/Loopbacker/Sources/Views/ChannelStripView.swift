@@ -164,9 +164,18 @@ struct ChannelStripView: View {
         .contentShape(Circle().inset(by: -4))
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.15)) {
-                // If clicking the same pending dot, cancel
                 if routingState.pendingConnector == connectorEnd {
+                    // Same dot again → cancel
                     routingState.cancelPendingConnection()
+                } else if let pending = routingState.pendingConnector {
+                    // Check if this route already exists → toggle it off
+                    let existingRoute = routingState.findRoute(from: pending, to: connectorEnd)
+                    if existingRoute != nil {
+                        routingState.removeRouteBetween(from: pending, to: connectorEnd)
+                        routingState.cancelPendingConnection()
+                    } else {
+                        routingState.handleConnectorTap(connectorEnd)
+                    }
                 } else {
                     routingState.handleConnectorTap(connectorEnd)
                 }
@@ -179,10 +188,11 @@ struct ChannelStripView: View {
                         routingState.removeRoutesFor(connector: connectorEnd)
                     }
                 } label: {
-                    Label("Disconnect", systemImage: "cable.connector.horizontal")
+                    Label("Disconnect All", systemImage: "xmark.circle")
                 }
             }
         }
+        .help(isConnected ? "Click to start a new route from this channel, right-click to disconnect all routes" : "Click to connect this channel to a source or output")
         .background(
             GeometryReader { geo in
                 Color.clear

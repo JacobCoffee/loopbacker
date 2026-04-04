@@ -37,7 +37,7 @@ enum ConnectorEnd: Equatable, Hashable {
 
 // MARK: - Persistable routing configuration
 
-private struct RoutingConfig: Codable {
+struct RoutingConfig: Codable {
     var sources: [AudioSource]
     var outputChannels: [AudioChannel]
     var routes: [AudioRoute]
@@ -113,6 +113,25 @@ class RoutingState: ObservableObject {
             routes.removeAll { $0.outputChannelId == ch }
         }
         save()
+    }
+
+    func findRoute(from a: ConnectorEnd, to b: ConnectorEnd) -> AudioRoute? {
+        let (src, out): (ConnectorEnd, ConnectorEnd)
+        switch (a, b) {
+        case (.source, .output): (src, out) = (a, b)
+        case (.output, .source): (src, out) = (b, a)
+        default: return nil
+        }
+        guard case .source(let sid, let sch) = src,
+              case .output(let och) = out else { return nil }
+        return routes.first { $0.sourceId == sid && $0.sourceChannelId == sch && $0.outputChannelId == och }
+    }
+
+    func removeRouteBetween(from a: ConnectorEnd, to b: ConnectorEnd) {
+        if let route = findRoute(from: a, to: b) {
+            routes.removeAll { $0.id == route.id }
+            save()
+        }
     }
 
     func removeSource(_ sourceId: UUID) {
@@ -254,6 +273,44 @@ class RoutingState: ObservableObject {
         }
     }
 
+    // MARK: - Mute / Solo
+
+    func muteSource(_ sourceId: UUID) {
+        guard let idx = sources.firstIndex(where: { $0.id == sourceId }) else { return }
+        sources[idx].isMuted.toggle()
+        save()
+    }
+
+    func soloSource(_ sourceId: UUID) {
+        for i in sources.indices {
+            sources[i].isMuted = sources[i].id != sourceId
+        }
+        save()
+    }
+
+    // MARK: - Export / Import
+
+    /// Encodes the current routing configuration to JSON data.
+    func exportConfig() -> Data {
+        let config = RoutingConfig(
+            sources: sources,
+            outputChannels: outputChannels,
+            routes: routes,
+            outputDestinations: outputDestinations
+        )
+        return (try? JSONEncoder().encode(config)) ?? Data()
+    }
+
+    /// Decodes and replaces the current routing state from JSON data.
+    func importConfig(_ data: Data) {
+        guard let config = try? JSONDecoder().decode(RoutingConfig.self, from: data) else { return }
+        sources = config.sources
+        outputChannels = config.outputChannels
+        routes = config.routes
+        outputDestinations = config.outputDestinations
+        save()
+    }
+
     // MARK: - Empty initial state (populated from real devices on launch)
 
     static func empty() -> RoutingState {
@@ -265,5 +322,67 @@ class RoutingState: ObservableObject {
             ],
             routes: []
         )
+    }
+}
+
+// MARK: - Preset Manager
+
+struct PresetManager {
+    private static let presetsDirectoryURL: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport
+            .appendingPathComponent("Loopbacker", isDirectory: true)
+            .appendingPathComponent("presets", isDirectory: true)
+    }()
+
+    /// Save a named preset from the given data.
+    static func save(name: String, data: Data) {
+        do {
+            try FileManager.default.createDirectory(
+                at: presetsDirectoryURL,
+                withIntermediateDirectories: true
+            )
+            let fileURL = presetsDirectoryURL.appendingPathComponent(sanitizedFileName(name))
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            print("Loopbacker: failed to save preset '\(name)': \(error)")
+        }
+    }
+
+    /// Load a named preset, returning its raw JSON data.
+    static func load(name: String) -> Data? {
+        let fileURL = presetsDirectoryURL.appendingPathComponent(sanitizedFileName(name))
+        return try? Data(contentsOf: fileURL)
+    }
+
+    /// List all saved preset names (without the .json extension).
+    static func list() -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: presetsDirectoryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: .skipsHiddenFiles
+        ) else { return [] }
+
+        return files
+            .filter { $0.pathExtension == "json" }
+            .sorted { a, b in
+                let aDate = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                return aDate > bDate
+            }
+            .map { $0.deletingPathExtension().lastPathComponent }
+    }
+
+    /// Delete a named preset.
+    static func delete(name: String) {
+        let fileURL = presetsDirectoryURL.appendingPathComponent(sanitizedFileName(name))
+        try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    private static func sanitizedFileName(_ name: String) -> String {
+        let safe = name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        return "\(safe).json"
     }
 }
