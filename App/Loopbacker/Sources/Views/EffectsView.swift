@@ -275,12 +275,10 @@ struct EffectsView: View {
                 if preset.isEnabled {
                     ScrollView(.vertical, showsIndicators: true) {
                         VStack(spacing: 0) {
-                            // Signal flow pipeline
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                pipelineRow
-                                    .padding(.horizontal, 32)
-                                    .padding(.top, 8)
-                            }
+                            // Signal flow pipeline (wrapping grid)
+                            pipelineGrid
+                                .padding(.horizontal, 24)
+                                .padding(.top, 8)
 
                             // Expanded detail panel (below the pipeline)
                             if let expanded = expandedEffect {
@@ -683,39 +681,51 @@ struct EffectsView: View {
 
     // MARK: - Pipeline row (Input -> blocks -> Output)
 
-    private var pipelineRow: some View {
-        HStack(spacing: 0) {
-            // Input terminal
-            terminalBlock(label: "INPUT", icon: "mic.fill", isInput: true)
+    /// All pipeline items: input terminal, stages, output terminal
+    private var allPipelineItems: [(id: String, kind: PipelineItemKind)] {
+        var items: [(id: String, kind: PipelineItemKind)] = []
+        items.append(("input", .terminal(label: "INPUT", icon: "mic.fill")))
+        for (i, stage) in stages.enumerated() {
+            items.append((stage.name, .effect(index: i)))
+        }
+        items.append(("output", .terminal(label: "OUTPUT", icon: "speaker.wave.2.fill")))
+        return items
+    }
 
-            // Cable from input
-            cableSegment(active: preset.isEnabled)
+    private enum PipelineItemKind {
+        case terminal(label: String, icon: String)
+        case effect(index: Int)
+    }
 
-            // Effect blocks with cables between them
-            ForEach(Array(stages.enumerated()), id: \.offset) { index, stage in
-                effectPipelineBlock(
-                    name: stage.name,
-                    icon: stage.icon,
-                    enabled: stage.enabled,
-                    toggle: stage.toggle,
-                    index: index
-                )
+    private var pipelineGrid: some View {
+        // Use a flexible grid: 5 columns, items wrap into rows
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 5)
 
-                if index < stages.count - 1 {
-                    cableSegment(active: stage.enabled && stages[index + 1].enabled)
+        return LazyVGrid(columns: columns, spacing: 14) {
+            ForEach(allPipelineItems, id: \.id) { item in
+                switch item.kind {
+                case .terminal(let label, let icon):
+                    terminalBlock(label: label, icon: icon, isInput: label == "INPUT")
+
+                case .effect(let index):
+                    let stage = stages[index]
+                    effectPipelineBlock(
+                        name: stage.name,
+                        icon: stage.icon,
+                        enabled: stage.enabled,
+                        toggle: stage.toggle,
+                        index: index
+                    )
                 }
             }
-
-            // Cable to output
-            cableSegment(active: stages.last?.enabled ?? false)
-
-            // Output terminal
-            terminalBlock(label: "OUTPUT", icon: "speaker.wave.2.fill", isInput: false)
         }
-        .padding(.vertical, 16)
+        .padding(.vertical, 12)
         .opacity(pipelineAppeared ? 1.0 : 0.0)
         .offset(y: pipelineAppeared ? 0 : 12)
     }
+
+    // Keep pipelineRow for reference but unused
+    private var pipelineRow: some View { EmptyView() }
 
     // MARK: - Terminal block (Input / Output)
 
