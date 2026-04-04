@@ -212,12 +212,21 @@ struct InteractiveEQView: View {
 
 // MARK: - Effects pipeline view (full-page, Audio Hijack-inspired)
 
+/// Preference key for capturing block center positions in the pipeline
+private struct BlockPositionKey: PreferenceKey {
+    static var defaultValue: [String: CGPoint] = [:]
+    static func reduce(value: inout [String: CGPoint], nextValue: () -> [String: CGPoint]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
 struct EffectsView: View {
     @EnvironmentObject var routingState: RoutingState
     @State private var expandedEffect: String?
     @State private var hoveredEffect: String?
     @State private var pipelineAppeared = false
     @State private var signalPhase: CGFloat = 0
+    @State private var blockPositions: [String: CGPoint] = [:]
 
     // Preset management state
     @State private var savedPresetNames: [String] = []
@@ -698,30 +707,180 @@ struct EffectsView: View {
     }
 
     private var pipelineGrid: some View {
-        // Use a flexible grid: 5 columns, items wrap into rows
-        let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 5)
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 5)
+        let items = allPipelineItems
 
-        return LazyVGrid(columns: columns, spacing: 14) {
-            ForEach(allPipelineItems, id: \.id) { item in
-                switch item.kind {
-                case .terminal(let label, let icon):
-                    terminalBlock(label: label, icon: icon, isInput: label == "INPUT")
+        return ZStack {
+            // Cable overlay — drawn behind blocks
+            GeometryReader { geo in
+                Canvas { context, size in
+                    // We need at least 2 blocks to draw cables
+                    guard blockPositions.count >= 2 else { return }
 
-                case .effect(let index):
-                    let stage = stages[index]
-                    effectPipelineBlock(
-                        name: stage.name,
-                        icon: stage.icon,
-                        enabled: stage.enabled,
-                        toggle: stage.toggle,
-                        index: index
-                    )
+                    // Build ordered list of centers
+                    var centers: [(point: CGPoint, active: Bool)] = []
+                    for item in items {
+                        if let pos = blockPositions[item.id] {
+                            let isActive: Bool
+                            switch item.kind {
+                            case .terminal: isActive = true
+                            case .effect(let idx): isActive = stages[idx].enabled
+                            }
+                            centers.append((pos, isActive))
+                        }
+                    }
+                    guard centers.count >= 2 else { return }
+
+                    // Draw cables between consecutive blocks
+                    for i in 0..<(centers.count - 1) {
+                        let from = centers[i].point
+                        let to = centers[i + 1].point
+                        let active = centers[i].active && centers[i + 1].active
+
+                        var cablePath = Path()
+
+                        if abs(to.y - from.y) < 20 {
+                            // Same row: simple horizontal line
+                            cablePath.move(to: CGPoint(x: from.x, y: from.y))
+                            cablePath.addLine(to: CGPoint(x: to.x, y: to.y))
+                        } else {
+                            // Different row: snake down with rounded corners
+                            let midX = from.x + 20
+                            let cornerR: CGFloat = 12
+
+                            cablePath.move(to: CGPoint(x: from.x, y: from.y))
+                            // Go right a bit
+                            cablePath.addLine(to: CGPoint(x: midX - cornerR, y: from.y))
+                            // Curve down
+                            cablePath.addQuadCurve(
+                                to: CGPoint(x: midX, y: from.y + cornerR),
+                                control: CGPoint(x: midX, y: from.y)
+                            )
+                            // Go down
+                            cablePath.addLine(to: CGPoint(x: midX, y: to.y - cornerR))
+                            // Curve left toward next block
+                            cablePath.addQuadCurve(
+                                to: CGPoint(x: midX - cornerR, y: to.y),
+                                control: CGPoint(x: midX, y: to.y)
+                            )
+                            // Go to destination
+                            cablePath.addLine(to: CGPoint(x: to.x, y: to.y))
+                        }
+
+                        // Cable glow (wider, faint)
+                        if active {
+                            context.stroke(
+                                cablePath,
+                                with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.15)),
+                                lineWidth: 6
+                            )
+                        }
+
+                        // Cable line
+                        let cableColor = active
+                            ? Color(red: 0, green: 0.83, blue: 0.67).opacity(0.5)
+                            : Color.gray.opacity(0.2)
+                        context.stroke(cablePath, with: .color(cableColor), lineWidth: 2)
+
+                        // Signal dots on active cables
+                        if active {
+                            let dotPositions: [CGFloat] = [signalPhase, (signalPhase + 0.33).truncatingRemainder(dividingBy: 1.0), (signalPhase + 0.66).truncatingRemainder(dividingBy: 1.0)]
+                            for dotPhase in dotPositions {
+                                let pt = pointAlongPath(from: from, to: to, t: dotPhase)
+                                let dotRect = CGRect(x: pt.x - 2.5, y: pt.y - 2.5, width: 5, height: 5)
+                                context.fill(
+                                    Path(ellipseIn: dotRect),
+                                    with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.8))
+                                )
+                                // Dot glow
+                                let glowRect = CGRect(x: pt.x - 5, y: pt.y - 5, width: 10, height: 10)
+                                context.fill(
+                                    Path(ellipseIn: glowRect),
+                                    with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.2))
+                                )
+                            }
+                        }
+                    }
                 }
             }
+
+            // Grid of blocks
+            LazyVGrid(columns: columns, spacing: 14) {
+                ForEach(items, id: \.id) { item in
+                    switch item.kind {
+                    case .terminal(let label, let icon):
+                        terminalBlock(label: label, icon: icon, isInput: label == "INPUT")
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: BlockPositionKey.self,
+                                        value: [item.id: CGPoint(
+                                            x: geo.frame(in: .named("pipeline")).midX,
+                                            y: geo.frame(in: .named("pipeline")).midY
+                                        )]
+                                    )
+                                }
+                            )
+
+                    case .effect(let index):
+                        let stage = stages[index]
+                        effectPipelineBlock(
+                            name: stage.name,
+                            icon: stage.icon,
+                            enabled: stage.enabled,
+                            toggle: stage.toggle,
+                            index: index
+                        )
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: BlockPositionKey.self,
+                                    value: [item.id: CGPoint(
+                                        x: geo.frame(in: .named("pipeline")).midX,
+                                        y: geo.frame(in: .named("pipeline")).midY
+                                    )]
+                                )
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        .coordinateSpace(name: "pipeline")
+        .onPreferenceChange(BlockPositionKey.self) { positions in
+            blockPositions = positions
         }
         .padding(.vertical, 12)
         .opacity(pipelineAppeared ? 1.0 : 0.0)
         .offset(y: pipelineAppeared ? 0 : 12)
+    }
+
+    /// Interpolate a point along a cable path (simplified: lerp for same row, multi-segment for row change)
+    private func pointAlongPath(from: CGPoint, to: CGPoint, t: CGFloat) -> CGPoint {
+        if abs(to.y - from.y) < 20 {
+            // Same row: simple lerp
+            return CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+        } else {
+            // Multi-segment: right, down, left
+            let midX = from.x + 20
+            let totalH = abs(to.y - from.y)
+            let segRight = midX - from.x
+            let segDown = totalH
+            let segLeft = midX - to.x
+            let totalLen = segRight + segDown + abs(segLeft)
+            let dist = t * totalLen
+
+            if dist < segRight {
+                let f = dist / segRight
+                return CGPoint(x: from.x + (midX - from.x) * f, y: from.y)
+            } else if dist < segRight + segDown {
+                let f = (dist - segRight) / segDown
+                return CGPoint(x: midX, y: from.y + (to.y - from.y) * f)
+            } else {
+                let f = (dist - segRight - segDown) / max(abs(segLeft), 1)
+                return CGPoint(x: midX + (to.x - midX) * f, y: to.y)
+            }
+        }
     }
 
     // Keep pipelineRow for reference but unused
