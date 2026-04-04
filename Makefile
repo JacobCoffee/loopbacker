@@ -32,6 +32,7 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp $(SWIFT_BIN) $(APP_CONTENTS)/MacOS/Loopbacker
 	cp App/Loopbacker/Resources/Info.plist $(APP_CONTENTS)/Info.plist
 	cp App/Loopbacker/Resources/AppIcon.icns $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/logo.png $(APP_CONTENTS)/Resources/
 	cp -R Driver/build/Loopbacker.driver $(APP_CONTENTS)/Resources/
 	codesign --force --deep --sign "Apple Development: Jacob Coffee (NBMD22TJZJ)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."

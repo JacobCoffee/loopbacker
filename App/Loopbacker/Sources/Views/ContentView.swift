@@ -125,21 +125,12 @@ struct ContentView: View {
 
     private var headerBar: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color(red: 0.39, green: 0.40, blue: 0.95).opacity(0.35),
-                                     Color(red: 0.39, green: 0.40, blue: 0.95).opacity(0.12)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
+            if let logoURL = Bundle.main.url(forResource: "logo", withExtension: "png"),
+               let nsImage = NSImage(contentsOf: logoURL) {
+                Image(nsImage: nsImage)
+                    .resizable()
                     .frame(width: 36, height: 36)
-
-                Image(systemName: "cable.connector.horizontal")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(Color(red: 0.51, green: 0.55, blue: 0.97))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
             }
 
             Text("Loopbacker")
