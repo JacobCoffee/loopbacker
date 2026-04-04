@@ -153,6 +153,9 @@ struct SourceCardView: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .tint(LoopbackerTheme.accent)
+                    .onChange(of: source.isPassThrough) { _, _ in
+                        routingState.save()
+                    }
             }
         }
         .padding(.horizontal, 12)
