@@ -1,46 +1,134 @@
 import SwiftUI
 
-/// Card-style view for routing a Loopbacker virtual device to a physical output.
+/// Card-style view for routing Loopbacker virtual devices to physical outputs.
+/// Users can add/remove virtual devices dynamically (Loopbacker 2 through 8).
 struct OutputRoutingView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
 
-    /// Available virtual devices for per-app routing (Loopbacker 2 and 3).
-    private let virtualDevices: [(uid: String, name: String)] = [
-        ("LoopbackerDevice_UID_2", "Loopbacker 2"),
-        ("LoopbackerDevice_UID_3", "Loopbacker 3"),
-    ]
+    /// All available virtual devices (indices 2-8, device 1 is the main loopback)
+    private static let allVirtualDevices: [(uid: String, name: String)] = (2...8).map { i in
+        ("LoopbackerDevice_UID_\(i)", "Loopbacker \(i)")
+    }
+
+    /// How many virtual output devices are currently shown
+    private var activeCount: Int {
+        routingState.outputDestinations.count
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(virtualDevices, id: \.uid) { vd in
-                outputCard(virtualDeviceUID: vd.uid, virtualDeviceName: vd.name)
+            // Header with +/- buttons
+            HStack {
+                Spacer()
+
+                if activeCount > 0 {
+                    Text("\(activeCount) device\(activeCount == 1 ? "" : "s")")
+                        .font(.system(size: 10))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                }
+
+                // Remove button
+                if activeCount > 0 {
+                    Button(action: removeLastDevice) {
+                        Image(systemName: "minus")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(LoopbackerTheme.textSecondary)
+                            .frame(width: 22, height: 22)
+                            .background(LoopbackerTheme.bgInset)
+                            .clipShape(Circle())
+                            .overlay(Circle().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove last output route")
+                }
+
+                // Add button
+                if activeCount < Self.allVirtualDevices.count {
+                    Button(action: addNextDevice) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(LoopbackerTheme.accent)
+                            .frame(width: 22, height: 22)
+                            .background(LoopbackerTheme.accent.opacity(0.1))
+                            .clipShape(Circle())
+                            .overlay(Circle().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Add output route (Loopbacker \(activeCount + 2))")
+                }
             }
+
+            // Device cards
+            ForEach(routingState.outputDestinations) { dest in
+                outputCard(dest: dest)
+            }
+
+            if activeCount == 0 {
+                HStack {
+                    Spacer()
+                    VStack(spacing: 6) {
+                        Image(systemName: "arrow.right.circle.dashed")
+                            .font(.system(size: 22))
+                            .foregroundColor(LoopbackerTheme.textMuted)
+                        Text("Click + to add an output route")
+                            .font(.system(size: 11))
+                            .foregroundColor(LoopbackerTheme.textMuted)
+                    }
+                    .padding(.vertical, 20)
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    // MARK: - Add/Remove
+
+    private func addNextDevice() {
+        let idx = activeCount
+        guard idx < Self.allVirtualDevices.count else { return }
+        let vd = Self.allVirtualDevices[idx]
+        withAnimation(.easeInOut(duration: 0.2)) {
+            routingState.addOutputDestination(
+                virtualDeviceUID: vd.uid,
+                virtualDeviceName: vd.name,
+                physicalOutputUID: "",
+                physicalOutputName: "None"
+            )
+        }
+    }
+
+    private func removeLastDevice() {
+        guard let last = routingState.outputDestinations.last else { return }
+        // Stop routing if active
+        audioRouter.stopOutputRouting(virtualDeviceUID: last.virtualDeviceUID)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            routingState.removeOutputDestination(id: last.id)
         }
     }
 
     // MARK: - Per-device card
 
     @ViewBuilder
-    private func outputCard(virtualDeviceUID: String, virtualDeviceName: String) -> some View {
-        let destIndex = routingState.outputDestinations.firstIndex(where: { $0.virtualDeviceUID == virtualDeviceUID })
+    private func outputCard(dest: OutputDestination) -> some View {
+        let isActive = dest.isEnabled && !dest.physicalOutputUID.isEmpty
 
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack(spacing: 10) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(LoopbackerTheme.accent.opacity(0.15))
+                        .fill(isActive ? LoopbackerTheme.accent.opacity(0.15) : LoopbackerTheme.bgInset)
                         .frame(width: 32, height: 32)
 
                     Image(systemName: "arrow.right.circle.fill")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(LoopbackerTheme.accent)
+                        .foregroundColor(isActive ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(virtualDeviceName)
+                    Text(dest.virtualDeviceName)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(LoopbackerTheme.textPrimary)
 
@@ -51,16 +139,12 @@ struct OutputRoutingView: View {
 
                 Spacer()
 
-                // Enable/disable toggle
-                if let idx = destIndex {
-                    enableToggle(destIndex: idx)
-                }
+                enableToggle(dest: dest)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
 
-            Divider()
-                .background(LoopbackerTheme.border)
+            Divider().background(LoopbackerTheme.border)
 
             // Output device picker
             HStack(spacing: 8) {
@@ -72,7 +156,7 @@ struct OutputRoutingView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(LoopbackerTheme.textSecondary)
 
-                outputPicker(virtualDeviceUID: virtualDeviceUID, virtualDeviceName: virtualDeviceName, destIndex: destIndex)
+                outputPicker(dest: dest)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -84,16 +168,12 @@ struct OutputRoutingView: View {
         .overlay(
             RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
                 .strokeBorder(
-                    isActiveRoute(virtualDeviceUID: virtualDeviceUID, destIndex: destIndex)
-                        ? LoopbackerTheme.borderActive
-                        : LoopbackerTheme.border,
-                    lineWidth: isActiveRoute(virtualDeviceUID: virtualDeviceUID, destIndex: destIndex) ? 1.5 : 0.5
+                    isActive ? LoopbackerTheme.borderActive : LoopbackerTheme.border,
+                    lineWidth: isActive ? 1.5 : 0.5
                 )
         )
         .shadow(
-            color: isActiveRoute(virtualDeviceUID: virtualDeviceUID, destIndex: destIndex)
-                ? LoopbackerTheme.accentGlow.opacity(0.15)
-                : Color.clear,
+            color: isActive ? LoopbackerTheme.accentGlow.opacity(0.15) : Color.clear,
             radius: 8
         )
     }
@@ -101,28 +181,19 @@ struct OutputRoutingView: View {
     // MARK: - Output device picker
 
     @ViewBuilder
-    private func outputPicker(virtualDeviceUID: String, virtualDeviceName: String, destIndex: Int?) -> some View {
-        let selectedUID = destIndex.map { routingState.outputDestinations[$0].physicalOutputUID } ?? ""
+    private func outputPicker(dest: OutputDestination) -> some View {
         let devices = audioDeviceManager.outputDevices
 
         Picker("", selection: Binding(
-            get: { selectedUID },
+            get: { dest.physicalOutputUID },
             set: { newUID in
                 let deviceName = devices.first(where: { $0.uid == newUID })?.name ?? "None"
-                updateOutputDestination(
-                    virtualDeviceUID: virtualDeviceUID,
-                    virtualDeviceName: virtualDeviceName,
-                    physicalOutputUID: newUID,
-                    physicalOutputName: deviceName
-                )
+                updateDestination(dest: dest, physicalOutputUID: newUID, physicalOutputName: deviceName)
             }
         )) {
-            Text("None")
-                .tag("")
-
+            Text("None").tag("")
             ForEach(devices) { device in
-                Text(device.name)
-                    .tag(device.uid)
+                Text(device.name).tag(device.uid)
             }
         }
         .pickerStyle(.menu)
@@ -132,16 +203,13 @@ struct OutputRoutingView: View {
 
     // MARK: - Enable toggle
 
-    private func enableToggle(destIndex: Int) -> some View {
-        let dest = routingState.outputDestinations[destIndex]
-        return Button(action: {
+    private func enableToggle(dest: OutputDestination) -> some View {
+        Button(action: {
             withAnimation(.easeInOut(duration: 0.2)) {
                 routingState.toggleOutputDestination(id: dest.id)
                 if dest.isEnabled {
-                    // Was enabled, now disabled -- stop
                     audioRouter.stopOutputRouting(virtualDeviceUID: dest.virtualDeviceUID)
                 } else {
-                    // Was disabled, now enabled -- start if has a physical output
                     if !dest.physicalOutputUID.isEmpty {
                         audioRouter.startOutputRouting(
                             virtualDeviceUID: dest.virtualDeviceUID,
@@ -164,15 +232,13 @@ struct OutputRoutingView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(
-                Capsule()
-                    .fill(dest.isEnabled ? LoopbackerTheme.accent.opacity(0.12) : LoopbackerTheme.bgInset)
+                Capsule().fill(dest.isEnabled ? LoopbackerTheme.accent.opacity(0.12) : LoopbackerTheme.bgInset)
             )
             .overlay(
-                Capsule()
-                    .strokeBorder(
-                        dest.isEnabled ? LoopbackerTheme.accent.opacity(0.3) : LoopbackerTheme.border,
-                        lineWidth: 0.5
-                    )
+                Capsule().strokeBorder(
+                    dest.isEnabled ? LoopbackerTheme.accent.opacity(0.3) : LoopbackerTheme.border,
+                    lineWidth: 0.5
+                )
             )
         }
         .buttonStyle(.plain)
@@ -180,42 +246,21 @@ struct OutputRoutingView: View {
 
     // MARK: - Helpers
 
-    private func isActiveRoute(virtualDeviceUID: String, destIndex: Int?) -> Bool {
-        guard let idx = destIndex else { return false }
-        let dest = routingState.outputDestinations[idx]
-        return dest.isEnabled && !dest.physicalOutputUID.isEmpty
-    }
+    private func updateDestination(dest: OutputDestination, physicalOutputUID: String, physicalOutputName: String) {
+        // Stop old route
+        if !dest.physicalOutputUID.isEmpty {
+            audioRouter.stopOutputRouting(virtualDeviceUID: dest.virtualDeviceUID)
+        }
 
-    private func updateOutputDestination(virtualDeviceUID: String, virtualDeviceName: String,
-                                         physicalOutputUID: String, physicalOutputName: String) {
-        if let idx = routingState.outputDestinations.firstIndex(where: { $0.virtualDeviceUID == virtualDeviceUID }) {
-            let oldDest = routingState.outputDestinations[idx]
-
-            // Stop old route if running
-            if !oldDest.physicalOutputUID.isEmpty {
-                audioRouter.stopOutputRouting(virtualDeviceUID: virtualDeviceUID)
-            }
-
+        if let idx = routingState.outputDestinations.firstIndex(where: { $0.id == dest.id }) {
             routingState.outputDestinations[idx].physicalOutputUID = physicalOutputUID
             routingState.outputDestinations[idx].physicalOutputName = physicalOutputName
             routingState.save()
+        }
 
-            // Start new route if enabled and has output
-            if routingState.outputDestinations[idx].isEnabled && !physicalOutputUID.isEmpty {
-                audioRouter.startOutputRouting(virtualDeviceUID: virtualDeviceUID, physicalOutputUID: physicalOutputUID)
-            }
-        } else {
-            // Create new destination entry
-            routingState.addOutputDestination(
-                virtualDeviceUID: virtualDeviceUID,
-                virtualDeviceName: virtualDeviceName,
-                physicalOutputUID: physicalOutputUID,
-                physicalOutputName: physicalOutputName
-            )
-            // Start routing if has output
-            if !physicalOutputUID.isEmpty {
-                audioRouter.startOutputRouting(virtualDeviceUID: virtualDeviceUID, physicalOutputUID: physicalOutputUID)
-            }
+        // Start new route
+        if !physicalOutputUID.isEmpty, dest.isEnabled {
+            audioRouter.startOutputRouting(virtualDeviceUID: dest.virtualDeviceUID, physicalOutputUID: physicalOutputUID)
         }
     }
 }

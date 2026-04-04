@@ -73,29 +73,42 @@ struct ContentView: View {
         }
     }
 
-    /// Push meter levels from AudioRouter into the source channel models
+    /// Push meter levels from AudioRouter into the source channel models.
+    /// Only updates when the new value differs meaningfully (> 0.01) to avoid
+    /// unnecessary SwiftUI redraws.
     private func updateSourceMeters(_ levels: [String: [Int: Float]]) {
         for i in routingState.sources.indices {
             let uid = routingState.sources[i].deviceUID
             guard let channelLevels = levels[uid] else {
-                // No levels -- zero out
+                // No levels -- zero out only if not already zero
                 for j in routingState.sources[i].channels.indices {
-                    routingState.sources[i].channels[j].meterLevel = 0.0
+                    if routingState.sources[i].channels[j].meterLevel > 0.01 {
+                        routingState.sources[i].channels[j].meterLevel = 0.0
+                    }
                 }
                 continue
             }
             for j in routingState.sources[i].channels.indices {
                 let chId = routingState.sources[i].channels[j].id
-                routingState.sources[i].channels[j].meterLevel = channelLevels[chId] ?? 0.0
+                let newLevel = channelLevels[chId] ?? 0.0
+                let oldLevel = routingState.sources[i].channels[j].meterLevel
+                if abs(newLevel - oldLevel) > 0.01 {
+                    routingState.sources[i].channels[j].meterLevel = newLevel
+                }
             }
         }
     }
 
-    /// Push meter levels from AudioRouter into the output channel models
+    /// Push meter levels from AudioRouter into the output channel models.
+    /// Only updates when the new value differs meaningfully (> 0.01).
     private func updateOutputMeters(_ levels: [Int: Float]) {
         for i in routingState.outputChannels.indices {
             let chId = routingState.outputChannels[i].id
-            routingState.outputChannels[i].meterLevel = levels[chId] ?? 0.0
+            let newLevel = levels[chId] ?? 0.0
+            let oldLevel = routingState.outputChannels[i].meterLevel
+            if abs(newLevel - oldLevel) > 0.01 {
+                routingState.outputChannels[i].meterLevel = newLevel
+            }
         }
     }
 
@@ -179,12 +192,14 @@ struct ContentView: View {
 
                 Spacer(minLength: 80)
 
-                VStack(alignment: .trailing, spacing: 20) {
-                    outputColumn
-                        .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .trailing, spacing: 20) {
+                        outputColumn
+                            .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
 
-                    outputRoutingSection
-                        .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+                        outputRoutingSection
+                            .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+                    }
                 }
             }
             .padding(20)
