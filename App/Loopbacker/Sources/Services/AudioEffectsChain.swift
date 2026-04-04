@@ -500,78 +500,74 @@ final class AudioEffectsChain {
         }
     }
 
-    // MARK: - Pitch Shift (simple two-tap crossfade)
+    // MARK: - Pitch Shift (low-latency two-tap crossfade)
 
     private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
         let ratio = pitchRatio
         let mix = pitchMix
         guard fabsf(ratio - 1.0) > 0.001 else { return }
 
-        // Two read taps into a circular buffer, crossfaded with a triangle window.
-        // Each tap reads at `ratio` speed. When a tap gets too far from the write
-        // head, it resets. The other tap covers during the crossfade.
-        let bufSize = pitchBufSize
         let mask = pitchBufMask
-        let maxDist = Float(bufSize / 2)  // max distance before reset
+        // Small grain = low latency. 512 samples = ~10ms at 48kHz
+        let grain: Float = 512
+        let halfGrain: Float = 256
 
         for c in 0..<channels {
             var wIdx = pitchWriteIdx[c]
             var rd0 = pitchReadPhase[c][0]
             var rd1 = pitchReadPhase[c][1]
 
-            // Initialize read positions on first use
+            // Initialize: place read heads close to write head
             if rd0 == 0 && rd1 == 0 && wIdx == 0 {
-                rd0 = 0
-                rd1 = Float(bufSize / 4)
+                rd0 = Float(pitchBufSize) - halfGrain
+                rd1 = Float(pitchBufSize) - grain
             }
 
             for i in 0..<frames {
                 let idx = i * channels + c
                 let x = buf[idx]
 
-                // Write to circular buffer
                 pitchBuf[c][wIdx] = x
 
-                // Read with linear interpolation
-                let i0a = Int(rd0) & mask, i0b = (i0a + 1) & mask
+                // Linear interpolation reads
+                let i0 = Int(rd0) & mask, i0n = (i0 + 1) & mask
                 let f0 = rd0 - floorf(rd0)
-                let v0 = pitchBuf[c][i0a] * (1.0 - f0) + pitchBuf[c][i0b] * f0
+                let v0 = pitchBuf[c][i0] * (1.0 - f0) + pitchBuf[c][i0n] * f0
 
-                let i1a = Int(rd1) & mask, i1b = (i1a + 1) & mask
+                let i1 = Int(rd1) & mask, i1n = (i1 + 1) & mask
                 let f1 = rd1 - floorf(rd1)
-                let v1 = pitchBuf[c][i1a] * (1.0 - f1) + pitchBuf[c][i1b] * f1
+                let v1 = pitchBuf[c][i1] * (1.0 - f1) + pitchBuf[c][i1n] * f1
 
-                // Advance read heads at pitch ratio
+                // Advance reads at pitch ratio
                 rd0 += ratio
                 rd1 += ratio
-                // Wrap
-                if rd0 >= Float(bufSize) { rd0 -= Float(bufSize) }
-                if rd1 >= Float(bufSize) { rd1 -= Float(bufSize) }
+                if rd0 >= Float(pitchBufSize) { rd0 -= Float(pitchBufSize) }
+                if rd0 < 0 { rd0 += Float(pitchBufSize) }
+                if rd1 >= Float(pitchBufSize) { rd1 -= Float(pitchBufSize) }
+                if rd1 < 0 { rd1 += Float(pitchBufSize) }
 
-                // Distance from write head for each tap
+                // How far behind write head is each read?
                 var d0 = Float(wIdx) - rd0
-                if d0 < 0 { d0 += Float(bufSize) }
+                if d0 < 0 { d0 += Float(pitchBufSize) }
+                if d0 > Float(pitchBufSize / 2) { d0 = Float(pitchBufSize) - d0 }
                 var d1 = Float(wIdx) - rd1
-                if d1 < 0 { d1 += Float(bufSize) }
+                if d1 < 0 { d1 += Float(pitchBufSize) }
+                if d1 > Float(pitchBufSize / 2) { d1 = Float(pitchBufSize) - d1 }
 
-                // Reset tap if it gets too close or too far from write head
-                if d0 > maxDist || d0 < 2 {
-                    rd0 = Float((wIdx - bufSize / 4 + bufSize) & mask)
+                // Reset heads that drift out of the grain window
+                if d0 > grain || d0 < 1 {
+                    rd0 = Float(wIdx) - halfGrain
+                    if rd0 < 0 { rd0 += Float(pitchBufSize) }
                 }
-                if d1 > maxDist || d1 < 2 {
-                    rd1 = Float((wIdx - bufSize / 2 + bufSize) & mask)
+                if d1 > grain || d1 < 1 {
+                    rd1 = Float(wIdx) - grain
+                    if rd1 < 0 { rd1 += Float(pitchBufSize) }
                 }
 
-                // Crossfade based on distance — each tap is loudest when
-                // it's in the middle of its usable range
-                // Normalize distances to 0..1 range
-                let n0 = d0 / maxDist
-                let n1 = d1 / maxDist
-                // Hann-shaped weight: peaks at 0.5, zero at 0 and 1
-                let w0 = sinf(Float.pi * n0)
-                let w1 = sinf(Float.pi * n1)
+                // Crossfade: sine window peaks when head is mid-grain
+                let w0 = sinf(Float.pi * min(d0 / grain, 1.0))
+                let w1 = sinf(Float.pi * min(d1 / grain, 1.0))
                 let wSum = max(w0 + w1, 0.001)
-
                 let shifted = (v0 * w0 + v1 * w1) / wSum
 
                 buf[idx] = (1.0 - mix) * x + mix * shifted
