@@ -714,90 +714,116 @@ struct EffectsView: View {
             // Cable overlay — drawn behind blocks
             GeometryReader { geo in
                 Canvas { context, size in
-                    // We need at least 2 blocks to draw cables
                     guard blockPositions.count >= 2 else { return }
 
-                    // Build ordered list of centers
-                    var centers: [(point: CGPoint, active: Bool)] = []
+                    let accentColor = Color(red: 0, green: 0.83, blue: 0.67)
+                    let bypassColor = Color.gray
+
+                    // Build ordered list: (center, isActive)
+                    // Terminals are always active; effects check their enabled state
+                    struct Node { var point: CGPoint; var active: Bool }
+                    var nodes: [Node] = []
                     for item in items {
-                        if let pos = blockPositions[item.id] {
-                            let isActive: Bool
-                            switch item.kind {
-                            case .terminal: isActive = true
-                            case .effect(let idx): isActive = stages[idx].enabled
-                            }
-                            centers.append((pos, isActive))
+                        guard let pos = blockPositions[item.id] else { continue }
+                        let active: Bool
+                        switch item.kind {
+                        case .terminal: active = true
+                        case .effect(let idx): active = stages[idx].enabled
                         }
+                        nodes.append(Node(point: pos, active: active))
                     }
-                    guard centers.count >= 2 else { return }
+                    guard nodes.count >= 2 else { return }
 
-                    // Draw cables between consecutive blocks
-                    for i in 0..<(centers.count - 1) {
-                        let from = centers[i].point
-                        let to = centers[i + 1].point
-                        let active = centers[i].active && centers[i + 1].active
+                    // For each segment, determine if the DESTINATION block is bypassed.
+                    // If so, draw a bypass arc over it; otherwise straight through.
+                    for i in 0..<(nodes.count - 1) {
+                        let from = nodes[i].point
+                        let to = nodes[i + 1].point
+                        let destActive = nodes[i + 1].active
+                        let sameRow = abs(to.y - from.y) < 20
 
-                        var cablePath = Path()
+                        if sameRow && !destActive {
+                            // --- BYPASS ARC: signal routes above the bypassed block ---
+                            let arcHeight: CGFloat = 32  // how far above to arc
 
-                        if abs(to.y - from.y) < 20 {
-                            // Same row: simple horizontal line
-                            cablePath.move(to: CGPoint(x: from.x, y: from.y))
-                            cablePath.addLine(to: CGPoint(x: to.x, y: to.y))
-                        } else {
-                            // Different row: snake down with rounded corners
-                            let midX = from.x + 20
-                            let cornerR: CGFloat = 12
-
-                            cablePath.move(to: CGPoint(x: from.x, y: from.y))
-                            // Go right a bit
-                            cablePath.addLine(to: CGPoint(x: midX - cornerR, y: from.y))
-                            // Curve down
-                            cablePath.addQuadCurve(
-                                to: CGPoint(x: midX, y: from.y + cornerR),
-                                control: CGPoint(x: midX, y: from.y)
-                            )
-                            // Go down
-                            cablePath.addLine(to: CGPoint(x: midX, y: to.y - cornerR))
-                            // Curve left toward next block
-                            cablePath.addQuadCurve(
-                                to: CGPoint(x: midX - cornerR, y: to.y),
-                                control: CGPoint(x: midX, y: to.y)
-                            )
-                            // Go to destination
-                            cablePath.addLine(to: CGPoint(x: to.x, y: to.y))
-                        }
-
-                        // Cable glow (wider, faint)
-                        if active {
+                            // Faint dashed line through the block (shows it's connected but bypassed)
+                            var throughPath = Path()
+                            throughPath.move(to: from)
+                            throughPath.addLine(to: to)
                             context.stroke(
-                                cablePath,
-                                with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.15)),
-                                lineWidth: 6
+                                throughPath,
+                                with: .color(bypassColor.opacity(0.15)),
+                                style: StrokeStyle(lineWidth: 1, dash: [4, 4])
                             )
-                        }
 
-                        // Cable line
-                        let cableColor = active
-                            ? Color(red: 0, green: 0.83, blue: 0.67).opacity(0.5)
-                            : Color.gray.opacity(0.2)
-                        context.stroke(cablePath, with: .color(cableColor), lineWidth: 2)
+                            // Active bypass arc above
+                            var arcPath = Path()
+                            let midX = (from.x + to.x) / 2
+                            let topY = min(from.y, to.y) - arcHeight
+                            arcPath.move(to: from)
+                            arcPath.addCurve(
+                                to: to,
+                                control1: CGPoint(x: midX - (to.x - from.x) * 0.15, y: topY),
+                                control2: CGPoint(x: midX + (to.x - from.x) * 0.15, y: topY)
+                            )
 
-                        // Signal dots on active cables
-                        if active {
-                            let dotPositions: [CGFloat] = [signalPhase, (signalPhase + 0.33).truncatingRemainder(dividingBy: 1.0), (signalPhase + 0.66).truncatingRemainder(dividingBy: 1.0)]
-                            for dotPhase in dotPositions {
-                                let pt = pointAlongPath(from: from, to: to, t: dotPhase)
+                            // Glow
+                            context.stroke(arcPath, with: .color(accentColor.opacity(0.12)), lineWidth: 5)
+                            // Cable
+                            context.stroke(arcPath, with: .color(accentColor.opacity(0.5)), lineWidth: 2)
+
+                            // Signal dots along the arc
+                            let dotPhases: [CGFloat] = [signalPhase, (signalPhase + 0.5).truncatingRemainder(dividingBy: 1.0)]
+                            for dp in dotPhases {
+                                // Approximate arc position with bezier interpolation
+                                let t = dp
+                                let c1 = CGPoint(x: midX - (to.x - from.x) * 0.15, y: topY)
+                                let c2 = CGPoint(x: midX + (to.x - from.x) * 0.15, y: topY)
+                                let pt = cubicBezier(from, c1, c2, to, t: t)
                                 let dotRect = CGRect(x: pt.x - 2.5, y: pt.y - 2.5, width: 5, height: 5)
-                                context.fill(
-                                    Path(ellipseIn: dotRect),
-                                    with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.8))
-                                )
-                                // Dot glow
+                                context.fill(Path(ellipseIn: dotRect), with: .color(accentColor.opacity(0.8)))
                                 let glowRect = CGRect(x: pt.x - 5, y: pt.y - 5, width: 10, height: 10)
-                                context.fill(
-                                    Path(ellipseIn: glowRect),
-                                    with: .color(Color(red: 0, green: 0.83, blue: 0.67).opacity(0.2))
+                                context.fill(Path(ellipseIn: glowRect), with: .color(accentColor.opacity(0.2)))
+                            }
+
+                        } else {
+                            // --- NORMAL CABLE: straight or snaking between rows ---
+                            var cablePath = Path()
+
+                            if sameRow {
+                                cablePath.move(to: from)
+                                cablePath.addLine(to: to)
+                            } else {
+                                // Snake down between rows
+                                let midX = from.x + 20
+                                let cornerR: CGFloat = 12
+                                cablePath.move(to: from)
+                                cablePath.addLine(to: CGPoint(x: midX - cornerR, y: from.y))
+                                cablePath.addQuadCurve(
+                                    to: CGPoint(x: midX, y: from.y + cornerR),
+                                    control: CGPoint(x: midX, y: from.y)
                                 )
+                                cablePath.addLine(to: CGPoint(x: midX, y: to.y - cornerR))
+                                cablePath.addQuadCurve(
+                                    to: CGPoint(x: midX - cornerR, y: to.y),
+                                    control: CGPoint(x: midX, y: to.y)
+                                )
+                                cablePath.addLine(to: to)
+                            }
+
+                            // Glow
+                            context.stroke(cablePath, with: .color(accentColor.opacity(0.15)), lineWidth: 6)
+                            // Cable
+                            context.stroke(cablePath, with: .color(accentColor.opacity(0.5)), lineWidth: 2)
+
+                            // Signal dots
+                            let dotPhases: [CGFloat] = [signalPhase, (signalPhase + 0.33).truncatingRemainder(dividingBy: 1.0), (signalPhase + 0.66).truncatingRemainder(dividingBy: 1.0)]
+                            for dp in dotPhases {
+                                let pt = pointAlongPath(from: from, to: to, t: dp)
+                                let dotRect = CGRect(x: pt.x - 2.5, y: pt.y - 2.5, width: 5, height: 5)
+                                context.fill(Path(ellipseIn: dotRect), with: .color(accentColor.opacity(0.8)))
+                                let glowRect = CGRect(x: pt.x - 5, y: pt.y - 5, width: 10, height: 10)
+                                context.fill(Path(ellipseIn: glowRect), with: .color(accentColor.opacity(0.2)))
                             }
                         }
                     }
@@ -881,6 +907,17 @@ struct EffectsView: View {
                 return CGPoint(x: midX + (to.x - midX) * f, y: to.y)
             }
         }
+    }
+
+    /// Cubic bezier interpolation for bypass arc dot positions
+    private func cubicBezier(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, t: CGFloat) -> CGPoint {
+        let mt = 1 - t
+        let mt2 = mt * mt
+        let t2 = t * t
+        return CGPoint(
+            x: mt2 * mt * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t2 * t * p3.x,
+            y: mt2 * mt * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t2 * t * p3.y
+        )
     }
 
     // Keep pipelineRow for reference but unused
