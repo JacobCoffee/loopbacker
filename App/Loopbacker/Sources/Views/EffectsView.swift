@@ -716,8 +716,7 @@ struct EffectsView: View {
                 Canvas { context, size in
                     guard blockPositions.count >= 2 else { return }
 
-                    let accentColor = Color(red: 0, green: 0.83, blue: 0.67)
-                    let bypassColor = Color.gray
+                    let teal = Color(red: 0, green: 0.83, blue: 0.67)
 
                     // Build ordered nodes
                     struct Node { var point: CGPoint; var active: Bool }
@@ -733,98 +732,48 @@ struct EffectsView: View {
                     }
                     guard nodes.count >= 2 else { return }
 
-                    // Find groups of consecutive bypassed blocks on the same row.
-                    // Draw a single bypass arc from the last active block before them
-                    // to the first active block after them. Draw normal cables for
-                    // active-to-active segments.
-
-                    var i = 0
-                    while i < nodes.count - 1 {
+                    // Draw one cable per segment. Active = solid teal with glow + dots.
+                    // Bypassed destination = dashed, dimmer, no dots.
+                    for i in 0..<(nodes.count - 1) {
                         let from = nodes[i].point
                         let to = nodes[i + 1].point
+                        let bothActive = nodes[i].active && nodes[i + 1].active
                         let sameRow = abs(to.y - from.y) < 20
 
-                        // Check if next block is bypassed (and same row) — collect the run
-                        if sameRow && !nodes[i + 1].active {
-                            // Find the end of the bypassed run
-                            var skipEnd = i + 1
-                            while skipEnd + 1 < nodes.count
-                                    && !nodes[skipEnd + 1].active  // next is also bypassed
-                                    && abs(nodes[skipEnd + 1].point.y - from.y) < 20 {  // same row
-                                skipEnd += 1
-                            }
-                            // Arc from current node to the node after the bypassed run
-                            let arcTo = skipEnd + 1 < nodes.count ? nodes[skipEnd + 1].point : nodes[skipEnd].point
-                            let arcSameRow = abs(arcTo.y - from.y) < 20
-
-                            // Dashed lines through each bypassed segment
-                            for j in i..<(skipEnd + 1) {
-                                let segTo = j + 1 < nodes.count ? nodes[j + 1].point : nodes[j].point
-                                if abs(segTo.y - nodes[j].point.y) < 20 {
-                                    var dash = Path()
-                                    dash.move(to: nodes[j].point)
-                                    dash.addLine(to: segTo)
-                                    context.stroke(dash, with: .color(bypassColor.opacity(0.12)),
-                                                   style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                                }
-                            }
-
-                            if arcSameRow {
-                                // Single arc over all bypassed blocks
-                                let arcHeight: CGFloat = 28
-                                let topY = min(from.y, arcTo.y) - arcHeight
-                                let midX = (from.x + arcTo.x) / 2
-                                var arcPath = Path()
-                                arcPath.move(to: from)
-                                arcPath.addCurve(to: arcTo,
-                                    control1: CGPoint(x: midX - (arcTo.x - from.x) * 0.1, y: topY),
-                                    control2: CGPoint(x: midX + (arcTo.x - from.x) * 0.1, y: topY))
-                                context.stroke(arcPath, with: .color(accentColor.opacity(0.12)), lineWidth: 5)
-                                context.stroke(arcPath, with: .color(accentColor.opacity(0.5)), lineWidth: 2)
-
-                                // Signal dots on arc
-                                let c1 = CGPoint(x: midX - (arcTo.x - from.x) * 0.1, y: topY)
-                                let c2 = CGPoint(x: midX + (arcTo.x - from.x) * 0.1, y: topY)
-                                for dp in [signalPhase, (signalPhase + 0.5).truncatingRemainder(dividingBy: 1.0)] {
-                                    let pt = cubicBezier(from, c1, c2, arcTo, t: dp)
-                                    context.fill(Path(ellipseIn: CGRect(x: pt.x - 2, y: pt.y - 2, width: 4, height: 4)),
-                                                 with: .color(accentColor.opacity(0.8)))
-                                }
-                            }
-
-                            i = skipEnd + 1
-                            continue
-                        }
-
-                        // --- Normal active cable ---
                         var cablePath = Path()
                         if sameRow {
                             cablePath.move(to: from)
                             cablePath.addLine(to: to)
                         } else {
+                            // Snake between rows
                             let midX = from.x + 20
-                            let cornerR: CGFloat = 12
+                            let r: CGFloat = 12
                             cablePath.move(to: from)
-                            cablePath.addLine(to: CGPoint(x: midX - cornerR, y: from.y))
-                            cablePath.addQuadCurve(to: CGPoint(x: midX, y: from.y + cornerR),
+                            cablePath.addLine(to: CGPoint(x: midX - r, y: from.y))
+                            cablePath.addQuadCurve(to: CGPoint(x: midX, y: from.y + r),
                                                    control: CGPoint(x: midX, y: from.y))
-                            cablePath.addLine(to: CGPoint(x: midX, y: to.y - cornerR))
-                            cablePath.addQuadCurve(to: CGPoint(x: midX - cornerR, y: to.y),
+                            cablePath.addLine(to: CGPoint(x: midX, y: to.y - r))
+                            cablePath.addQuadCurve(to: CGPoint(x: midX - r, y: to.y),
                                                    control: CGPoint(x: midX, y: to.y))
                             cablePath.addLine(to: to)
                         }
 
-                        context.stroke(cablePath, with: .color(accentColor.opacity(0.15)), lineWidth: 6)
-                        context.stroke(cablePath, with: .color(accentColor.opacity(0.5)), lineWidth: 2)
-
-                        for dp in [signalPhase, (signalPhase + 0.33).truncatingRemainder(dividingBy: 1.0),
-                                   (signalPhase + 0.66).truncatingRemainder(dividingBy: 1.0)] {
-                            let pt = pointAlongPath(from: from, to: to, t: dp)
-                            context.fill(Path(ellipseIn: CGRect(x: pt.x - 2, y: pt.y - 2, width: 4, height: 4)),
-                                         with: .color(accentColor.opacity(0.8)))
+                        if bothActive {
+                            // Solid cable with glow
+                            context.stroke(cablePath, with: .color(teal.opacity(0.12)), lineWidth: 6)
+                            context.stroke(cablePath, with: .color(teal.opacity(0.5)), lineWidth: 2)
+                            // Signal dots
+                            for dp in [signalPhase, (signalPhase + 0.33).truncatingRemainder(dividingBy: 1.0),
+                                       (signalPhase + 0.66).truncatingRemainder(dividingBy: 1.0)] {
+                                let pt = pointAlongPath(from: from, to: to, t: dp)
+                                context.fill(Path(ellipseIn: CGRect(x: pt.x - 2, y: pt.y - 2, width: 4, height: 4)),
+                                             with: .color(teal.opacity(0.8)))
+                            }
+                        } else {
+                            // Dashed cable, dimmer
+                            context.stroke(cablePath, with: .color(teal.opacity(0.18)),
+                                           style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
                         }
-
-                        i += 1
                     }
                 }
             }
