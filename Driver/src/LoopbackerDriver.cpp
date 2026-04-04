@@ -805,10 +805,26 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, dev->ioIsRunning.load(std::memory_order_relaxed) > 0 ? 1 : 0);
 
                 case kAudioDevicePropertyDeviceCanBeDefaultDevice:
-                    WRITE_PROP(UInt32, 1);
+                {
+                    // Device 0 ("Loopbacker") can be default for both input and output.
+                    // Devices 1-7 can only be default for output (prevents cluttering mic lists).
+                    UInt32 canBeDefault = 1;
+                    if (dev->deviceID != kDeviceInfos[0].deviceID &&
+                        inAddress->mScope == kAudioObjectPropertyScopeInput) {
+                        canBeDefault = 0;
+                    }
+                    WRITE_PROP(UInt32, canBeDefault);
+                }
 
                 case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-                    WRITE_PROP(UInt32, 1);
+                {
+                    UInt32 canBeDefault = 1;
+                    if (dev->deviceID != kDeviceInfos[0].deviceID &&
+                        inAddress->mScope == kAudioObjectPropertyScopeInput) {
+                        canBeDefault = 0;
+                    }
+                    WRITE_PROP(UInt32, canBeDefault);
+                }
 
                 case kAudioDevicePropertyLatency:
                     // Report the ring buffer depth as latency -- this is the honest
