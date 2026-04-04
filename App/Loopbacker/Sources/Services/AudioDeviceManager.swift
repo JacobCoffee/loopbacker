@@ -33,11 +33,18 @@ class AudioDeviceManager: ObservableObject {
 
     // MARK: - Device enumeration via CoreAudio C API
 
+    /// Background queue for device enumeration -- CoreAudio property queries
+    /// can block and should not run on the main thread.
+    private static let enumerationQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.deviceenum", qos: .userInitiated)
+
     func enumerateDevices() {
-        let devices = fetchDevices()
-        DispatchQueue.main.async {
-            self.systemDevices = devices
-            self.loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
+        Self.enumerationQueue.async { [weak self] in
+            guard let self else { return }
+            let devices = self.fetchDevices()
+            DispatchQueue.main.async {
+                self.systemDevices = devices
+                self.loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
+            }
         }
     }
 

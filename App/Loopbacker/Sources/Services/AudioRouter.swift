@@ -80,19 +80,26 @@ class AudioRouter: ObservableObject {
         }
 
         func writeToRing(_ data: UnsafePointer<Float>, frames: UInt32) {
+            guard let ring = ringBuffer else { return }
             let mask = ringBufferFrames - 1
             let chCount = channelCount
             for i in 0..<frames {
                 let ringIdx = Int((writePos + i) & mask) * Int(chCount)
                 let srcIdx = Int(i) * Int(chCount)
                 for ch in 0..<Int(chCount) {
-                    ringBuffer?[ringIdx + ch] = data[srcIdx + ch]
+                    ring[ringIdx + ch] = data[srcIdx + ch]
                 }
             }
             writePos = writePos &+ frames
         }
 
         func readFromRing(_ data: UnsafeMutablePointer<Float>, frames: UInt32) -> UInt32 {
+            guard let ring = ringBuffer else {
+                // No ring buffer -- fill with silence
+                let totalSamples = Int(frames * channelCount)
+                for j in 0..<totalSamples { data[j] = 0.0 }
+                return 0
+            }
             let mask = ringBufferFrames - 1
             let chCount = channelCount
             let available = writePos &- readPos
@@ -102,7 +109,7 @@ class AudioRouter: ObservableObject {
                 let ringIdx = Int((readPos + i) & mask) * Int(chCount)
                 let dstIdx = Int(i) * Int(chCount)
                 for ch in 0..<Int(chCount) {
-                    data[dstIdx + ch] = ringBuffer?[ringIdx + ch] ?? 0.0
+                    data[dstIdx + ch] = ring[ringIdx + ch]
                 }
             }
             readPos = readPos &+ toRead
@@ -123,15 +130,18 @@ class AudioRouter: ObservableObject {
             guard chCount > 0 && frames > 0, let levels = meterLevelsPtr else { return }
 
             for ch in 0..<chCount {
-                var sumSquares: Float = 0.0
+                // Peak detection (more responsive than RMS for meters)
+                var peak: Float = 0.0
                 for i in 0..<Int(frames) {
-                    let sample = buffer[i * chCount + ch]
-                    sumSquares += sample * sample
+                    let s = fabsf(buffer[i * chCount + ch])
+                    if s > peak { peak = s }
                 }
-                let rms = sqrtf(sumSquares / Float(frames))
-                let smoothing: Float = 0.3
+                // Map dB to 0..1: -60dB=0, 0dB=1
+                let db = peak > 0.00001 ? 20.0 * log10f(peak) : -100.0
+                let normalized = max(0.0, min(1.0, (db + 60.0) / 60.0))
+                // Fast attack, slow release
                 let prev = levels[ch]
-                levels[ch] = min(max(rms, prev * (1.0 - smoothing)), 1.0)
+                levels[ch] = normalized > prev ? normalized : prev * 0.93 + normalized * 0.07
             }
         }
     }
@@ -154,7 +164,21 @@ class AudioRouter: ObservableObject {
 
     deinit {
         meterTimer?.invalidate()
-        stopAll()
+        // stopAll is synchronous here to ensure callbacks are torn down
+        // before the AudioRouter is deallocated.
+        let semaphore = DispatchSemaphore(value: 0)
+        queue.async { [self] in
+            let keys = Array(self.activeRoutes.keys)
+            for uid in keys {
+                self.stopRoutingInternal(sourceDeviceUID: uid)
+            }
+            let outputKeys = Array(self.activeOutputRoutes.keys)
+            for uid in outputKeys {
+                self.stopOutputRoutingInternal(virtualDeviceUID: uid)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
     }
 
     /// Tear down and re-create all active routes (after sleep/screen lock kills audio units)
@@ -169,12 +193,31 @@ class AudioRouter: ObservableObject {
             for uid in outputUIDs {
                 self.stopOutputRoutingInternal(virtualDeviceUID: uid)
             }
-            // Brief pause for audio system to settle
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                for uid in uids {
+            // Retry with bounded attempts instead of a fixed 0.5s delay.
+            // The audio system may take a variable amount of time to settle after wake.
+            self.retryRoutingAfterWake(sourceUIDs: uids, attempt: 0, maxAttempts: 3)
+        }
+    }
+
+    /// Retry starting routes after wake with bounded attempts at 0.2s intervals.
+    private func retryRoutingAfterWake(sourceUIDs: [String], attempt: Int, maxAttempts: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self else { return }
+            var failedUIDs: [String] = []
+            for uid in sourceUIDs {
+                // Check if the device is available before trying to start
+                if self.findDeviceByUID(uid) != nil {
                     self.startRouting(sourceDeviceUID: uid)
+                } else {
+                    failedUIDs.append(uid)
                 }
-                // Output routes need to be restarted by the caller (RoutingState)
+            }
+            // Retry remaining UIDs if we haven't exhausted attempts
+            if !failedUIDs.isEmpty && attempt + 1 < maxAttempts {
+                logger.info("Wake retry \(attempt + 1)/\(maxAttempts): \(failedUIDs.count) device(s) not yet available")
+                self.retryRoutingAfterWake(sourceUIDs: failedUIDs, attempt: attempt + 1, maxAttempts: maxAttempts)
+            } else if !failedUIDs.isEmpty {
+                logger.warning("Wake retry exhausted: \(failedUIDs.count) device(s) still unavailable")
             }
         }
     }
@@ -237,6 +280,19 @@ class AudioRouter: ObservableObject {
     }
 
     private func updatePublishedMeters() {
+        // Skip publishing when there are no active routes -- avoids allocating
+        // fresh dictionaries at 30 Hz for nothing.
+        if activeRoutes.isEmpty && activeOutputRoutes.isEmpty {
+            // Only clear if we previously had levels (avoid redundant publishes)
+            if !sourceMeterLevels.isEmpty || !outputMeterLevels.isEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    self?.sourceMeterLevels = [:]
+                    self?.outputMeterLevels = [:]
+                }
+            }
+            return
+        }
+
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevels: [Int: Float] = [:]
 
@@ -354,14 +410,22 @@ class AudioRouter: ObservableObject {
     private func stopRoutingInternal(sourceDeviceUID: String) {
         guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
 
+        // Stop callbacks first, then dispose, then release the retained references.
+        // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
         if let inputUnit = ctx.inputUnit {
             AudioOutputUnitStop(inputUnit)
         }
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        let hadInput = ctx.inputUnit != nil
+        let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
         teardownUnit(&ctx.outputUnit)
+
+        // Balance the passRetained calls made during setup
+        if hadInput { Unmanaged.passUnretained(ctx).release() }
+        if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
         logger.info(" Stopped routing: \(sourceDeviceUID)")
     }
@@ -447,8 +511,14 @@ class AudioRouter: ObservableObject {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        let hadInput = ctx.inputUnit != nil
+        let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
         teardownUnit(&ctx.outputUnit)
+
+        // Balance the passRetained calls made during setup
+        if hadInput { Unmanaged.passUnretained(ctx).release() }
+        if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
         logger.info(" Stopped output routing: \(virtualDeviceUID)")
     }
@@ -530,8 +600,30 @@ class AudioRouter: ObservableObject {
                                       UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
         guard status == noErr else { teardownUnit(&audioUnit); return false }
 
-        // Set input callback -- called when audio data is available from the input device
-        let contextPtr = Unmanaged.passUnretained(ctx).toOpaque()
+        // Query actual buffer size back -- the device may not have accepted our request
+        var actualBufferFrames: UInt32 = 0
+        var bufSizeSize = UInt32(MemoryLayout<UInt32>.size)
+        let queryStatus = AudioUnitGetProperty(unit,
+                                               kAudioDevicePropertyBufferFrameSize,
+                                               kAudioUnitScope_Global,
+                                               0,
+                                               &actualBufferFrames,
+                                               &bufSizeSize)
+        if queryStatus == noErr && actualBufferFrames > 0 {
+            // Resize render buffer to match actual IO size if needed
+            let needed = actualBufferFrames * ctx.channelCount
+            if actualBufferFrames > ctx.renderBufferFrames {
+                ctx.renderBuffer?.deallocate()
+                ctx.renderBufferFrames = actualBufferFrames
+                ctx.renderBuffer = UnsafeMutablePointer<Float>.allocate(capacity: Int(needed))
+                ctx.renderBuffer?.initialize(repeating: 0.0, count: Int(needed))
+            }
+        }
+
+        // Set input callback -- called when audio data is available from the input device.
+        // Use passRetained to prevent the RouteContext from being deallocated while
+        // callbacks are still active. The matching release happens in teardown.
+        let contextPtr = Unmanaged.passRetained(ctx).toOpaque()
         var callbackStruct = AURenderCallbackStruct(
             inputProc: inputRenderCallback,
             inputProcRefCon: contextPtr
@@ -543,10 +635,18 @@ class AudioRouter: ObservableObject {
                                       0,
                                       &callbackStruct,
                                       UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-        guard status == noErr else { teardownUnit(&audioUnit); return false }
+        guard status == noErr else {
+            Unmanaged<AudioRouter.RouteContext>.fromOpaque(contextPtr).release()
+            teardownUnit(&audioUnit)
+            return false
+        }
 
         status = AudioUnitInitialize(unit)
-        guard status == noErr else { teardownUnit(&audioUnit); return false }
+        guard status == noErr else {
+            Unmanaged<AudioRouter.RouteContext>.fromOpaque(contextPtr).release()
+            teardownUnit(&audioUnit)
+            return false
+        }
 
         ctx.inputUnit = unit
         return true
@@ -607,8 +707,9 @@ class AudioRouter: ObservableObject {
                                       UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
         guard status == noErr else { teardownUnit(&audioUnit); return false }
 
-        // Set render callback -- called when the output device needs audio data
-        let contextPtr = Unmanaged.passUnretained(ctx).toOpaque()
+        // Set render callback -- called when the output device needs audio data.
+        // Use passRetained for safe callback lifetime. Release happens in teardown.
+        let contextPtr = Unmanaged.passRetained(ctx).toOpaque()
         var callbackStruct = AURenderCallbackStruct(
             inputProc: outputRenderCallback,
             inputProcRefCon: contextPtr
@@ -620,10 +721,18 @@ class AudioRouter: ObservableObject {
                                       0,
                                       &callbackStruct,
                                       UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-        guard status == noErr else { teardownUnit(&audioUnit); return false }
+        guard status == noErr else {
+            Unmanaged<AudioRouter.RouteContext>.fromOpaque(contextPtr).release()
+            teardownUnit(&audioUnit)
+            return false
+        }
 
         status = AudioUnitInitialize(unit)
-        guard status == noErr else { teardownUnit(&audioUnit); return false }
+        guard status == noErr else {
+            Unmanaged<AudioRouter.RouteContext>.fromOpaque(contextPtr).release()
+            teardownUnit(&audioUnit)
+            return false
+        }
 
         ctx.outputUnit = unit
         return true
@@ -743,6 +852,12 @@ private func inputRenderCallback(
 ) -> OSStatus {
     let ctx = Unmanaged<AudioRouter.RouteContext>.fromOpaque(inRefCon).takeUnretainedValue()
     guard let inputUnit = ctx.inputUnit, let renderBuf = ctx.renderBuffer else { return noErr }
+
+    // Guard: if inNumberFrames exceeds our pre-allocated render buffer,
+    // return silence rather than overflowing.
+    if inNumberFrames > ctx.renderBufferFrames {
+        return noErr
+    }
 
     // Use pre-allocated buffer (no malloc in real-time thread!)
     let channelCount = ctx.channelCount

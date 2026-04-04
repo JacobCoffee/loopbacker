@@ -32,8 +32,13 @@ class DriverInstaller: ObservableObject {
             return
         }
 
+        // Sanitize the driver source path to prevent shell injection.
+        // Replace single quotes with the AppleScript-safe escaped form,
+        // then wrap in single quotes for the shell command.
+        let escapedSource = driverSource.replacingOccurrences(of: "'", with: "'\\''")
+
         let script = """
-        do shell script "cp -R '\(driverSource)' /Library/Audio/Plug-Ins/HAL/ && \
+        do shell script "cp -R '\(escapedSource)' /Library/Audio/Plug-Ins/HAL/ && \
         codesign --force --sign - /Library/Audio/Plug-Ins/HAL/Loopbacker.driver && \
         killall -9 coreaudiod" with administrator privileges
         """
