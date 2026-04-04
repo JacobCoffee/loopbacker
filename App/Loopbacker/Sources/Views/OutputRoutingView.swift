@@ -160,6 +160,29 @@ struct OutputRoutingView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+
+            // Meter bar
+            if isActive {
+                let level = outputRouteMeterLevel(dest)
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 9))
+                        .foregroundColor(level > 0.01 ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
+
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(LoopbackerTheme.bgInset)
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(LoopbackerTheme.accent)
+                                .frame(width: geo.size.width * CGFloat(level))
+                        }
+                    }
+                    .frame(height: 4)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
@@ -244,6 +267,11 @@ struct OutputRoutingView: View {
         }
         .buttonStyle(.plain)
         .tooltip(dest.isEnabled ? "Disable output routing for this virtual device" : "Enable output routing for this virtual device")
+    }
+
+    private func outputRouteMeterLevel(_ dest: OutputDestination) -> Float {
+        let levels = audioRouter.sourceMeterLevels["output:\(dest.virtualDeviceUID)"] ?? [:]
+        return levels.values.max() ?? 0
     }
 
     // MARK: - Helpers

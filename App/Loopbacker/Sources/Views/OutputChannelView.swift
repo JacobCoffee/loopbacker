@@ -87,7 +87,7 @@ struct OutputChannelView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(LoopbackerTheme.textPrimary)
 
-                Text("Output Device")
+                Text("Virtual mic input for Discord, Zoom, etc.")
                     .font(.system(size: 10, weight: .regular))
                     .foregroundColor(LoopbackerTheme.textSecondary)
             }
