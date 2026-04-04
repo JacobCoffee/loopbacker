@@ -104,15 +104,15 @@ LoopbackerDriver::LoopbackerDriver()
 
 DeviceState* LoopbackerDriver::FindDeviceByObjectID(AudioObjectID inObjectID)
 {
-    for (uint32_t i = 0; i < kMaxDevices; ++i) {
-        if (inObjectID == mDevices[i].deviceID ||
-            inObjectID == mDevices[i].inputStreamID ||
-            inObjectID == mDevices[i].outputStreamID ||
-            inObjectID == mDevices[i].volumeControlID) {
-            return &mDevices[i];
-        }
-    }
-    return nullptr;
+    // Device IDs are laid out as (N+1)*10 + offset, where offset 0..3 maps to
+    // deviceID, inputStreamID, outputStreamID, volumeControlID respectively.
+    // So objectID / 10 gives (N+1), and (objectID / 10) - 1 gives the device index.
+    // The offset within the group (objectID % 10) must be 0..3.
+    if (inObjectID < 10) return nullptr;
+    uint32_t group = inObjectID / 10;
+    uint32_t offset = inObjectID % 10;
+    if (group == 0 || group > kMaxDevices || offset > 3) return nullptr;
+    return &mDevices[group - 1];
 }
 
 // =============================================================================
@@ -137,10 +137,15 @@ static ObjectType ClassifyObject(AudioObjectID inObjectID, DeviceState* dev)
 
 static Float64 ComputeHostTicksPerFrame(Float64 sampleRate)
 {
-    mach_timebase_info_data_t timebase;
-    mach_timebase_info(&timebase);
-    Float64 hostTicksPerSecond = (1000000000.0 * static_cast<Float64>(timebase.denom))
-                                / static_cast<Float64>(timebase.numer);
+    // Cache mach_timebase_info -- it never changes after boot and the syscall
+    // is unnecessary overhead when called repeatedly (e.g. on every sample-rate change).
+    static mach_timebase_info_data_t sTimebase = [] {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        return tb;
+    }();
+    Float64 hostTicksPerSecond = (1000000000.0 * static_cast<Float64>(sTimebase.denom))
+                                / static_cast<Float64>(sTimebase.numer);
     return hostTicksPerSecond / sampleRate;
 }
 
@@ -806,13 +811,17 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, 1);
 
                 case kAudioDevicePropertyLatency:
-                    WRITE_PROP(UInt32, 0);
+                    // Report the ring buffer depth as latency -- this is the honest
+                    // round-trip buffering delay through the virtual loopback device.
+                    WRITE_PROP(UInt32, kRingBufferFrames);
 
                 case kAudioDevicePropertySafetyOffset:
-                    WRITE_PROP(UInt32, 0);
+                    // Safety offset tells CoreAudio how far ahead/behind to read/write
+                    // to avoid glitches. One IO buffer period is the minimum safe value.
+                    WRITE_PROP(UInt32, kDefaultIOBufferFrames);
 
                 case kAudioDevicePropertyZeroTimeStampPeriod:
-                    WRITE_PROP(UInt32, dev->ioBufferFrames);
+                    WRITE_PROP(UInt32, kDefaultIOBufferFrames);
 
                 case kAudioDevicePropertyIsHidden:
                     WRITE_PROP(UInt32, 0);
@@ -908,15 +917,15 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                 }
 
                 case kAudioDevicePropertyBufferFrameSize:
-                    WRITE_PROP(UInt32, dev->ioBufferFrames);
+                    WRITE_PROP(UInt32, kDefaultIOBufferFrames);
 
                 case kAudioDevicePropertyBufferFrameSizeRange: {
                     if (inDataSize < sizeof(AudioValueRange))
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(AudioValueRange);
                     auto* range = static_cast<AudioValueRange*>(outData);
-                    range->mMinimum = 16;
-                    range->mMaximum = 4096;
+                    range->mMinimum = kDefaultIOBufferFrames;
+                    range->mMaximum = kDefaultIOBufferFrames;
                     return kAudioHardwareNoError;
                 }
             }
@@ -1074,22 +1083,7 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
         case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioDevicePropertyBufferFrameSize: {
-                    if (inDataSize < sizeof(UInt32))
-                        return kAudioHardwareBadPropertySizeError;
-                    UInt32 newSize = *static_cast<const UInt32*>(inData);
-                    // Clamp to supported range
-                    if (newSize < 16) newSize = 16;
-                    if (newSize > 4096) newSize = 4096;
-                    {
-                        std::lock_guard<std::mutex> lock(driver->mMutex);
-                        dev->ioBufferFrames = newSize;
-                        dev->timestampSeed++;
-                        // Re-anchor on buffer size change if IO is running
-                        if (dev->ioIsRunning.load(std::memory_order_relaxed) > 0) {
-                            dev->anchorHostTime = mach_absolute_time();
-                            dev->ioCycleCount = 0;
-                        }
-                    }
+                    // We support a fixed buffer size only, so accept it but ignore the value
                     return kAudioHardwareNoError;
                 }
 
@@ -1109,12 +1103,6 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                         dev->sampleRate = newRate;
                         dev->hostTicksPerFrame = ComputeHostTicksPerFrame(newRate);
                         dev->ringBuffer->reset();
-                        dev->timestampSeed++;
-                        // Re-anchor on rate change if IO is running
-                        if (dev->ioIsRunning.load(std::memory_order_relaxed) > 0) {
-                            dev->anchorHostTime = mach_absolute_time();
-                            dev->ioCycleCount = 0;
-                        }
                     }
 
                     if (driver->mHost) {
@@ -1219,7 +1207,6 @@ OSStatus LoopbackerDriver::StartIO(AudioServerPlugInDriverRef inDriver,
     if (prev == 0) {
         dev->ioCycleCount = 0;
         dev->anchorHostTime = mach_absolute_time();
-        dev->timestampSeed++;
         dev->ringBuffer->reset();
     }
     return kAudioHardwareNoError;
@@ -1252,16 +1239,15 @@ OSStatus LoopbackerDriver::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
     if (dev == nullptr) return kAudioHardwareBadDeviceError;
 
     UInt64 currentHostTime = mach_absolute_time();
-    UInt32 bufferFrames = dev->ioBufferFrames;
-    Float64 ticksPerPeriod = dev->hostTicksPerFrame * static_cast<Float64>(bufferFrames);
+    Float64 ticksPerPeriod = dev->hostTicksPerFrame * static_cast<Float64>(kDefaultIOBufferFrames);
 
     UInt64 hostElapsed = currentHostTime - dev->anchorHostTime;
     UInt64 periodCount = static_cast<UInt64>(static_cast<Float64>(hostElapsed) / ticksPerPeriod);
 
-    *outSampleTime = static_cast<Float64>(periodCount * bufferFrames);
+    *outSampleTime = static_cast<Float64>(periodCount * kDefaultIOBufferFrames);
     *outHostTime = dev->anchorHostTime +
                    static_cast<UInt64>(static_cast<Float64>(periodCount) * ticksPerPeriod);
-    *outSeed = dev->timestampSeed;
+    *outSeed = 1;
 
     return kAudioHardwareNoError;
 }

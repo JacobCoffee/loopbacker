@@ -28,8 +28,6 @@ struct DeviceState {
 
     UInt64  anchorHostTime;                // mach_absolute_time at IO start
     Float64 hostTicksPerFrame;             // host ticks per sample frame
-    UInt32  ioBufferFrames;                // actual IO buffer size (set by client)
-    UInt64  timestampSeed;                 // incremented on discontinuities
 
     DeviceState()
         : name(nullptr)
@@ -45,8 +43,6 @@ struct DeviceState {
         , mute(false)
         , anchorHostTime(0)
         , hostTicksPerFrame(0.0)
-        , ioBufferFrames(kDefaultIOBufferFrames)
-        , timestampSeed(1)
     {
     }
 };
