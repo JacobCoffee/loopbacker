@@ -243,6 +243,18 @@ struct EffectsView: View {
             ("De-Esser", "s.circle", preset.deEsserEnabled, {
                 routingState.effectsPreset.deEsserEnabled.toggle(); routingState.save()
             }),
+            ("Chorus", "waveform.path", preset.chorusEnabled, {
+                routingState.effectsPreset.chorusEnabled.toggle(); routingState.save()
+            }),
+            ("Pitch Shift", "arrow.up.arrow.down", preset.pitchShiftEnabled, {
+                routingState.effectsPreset.pitchShiftEnabled.toggle(); routingState.save()
+            }),
+            ("Reverb", "waveform.path.ecg.rectangle", preset.reverbEnabled, {
+                routingState.effectsPreset.reverbEnabled.toggle(); routingState.save()
+            }),
+            ("Delay", "repeat", preset.delayEnabled, {
+                routingState.effectsPreset.delayEnabled.toggle(); routingState.save()
+            }),
             ("Limiter", "gauge.with.dots.needle.67percent", preset.limiterEnabled, {
                 routingState.effectsPreset.limiterEnabled.toggle(); routingState.save()
             }),
@@ -1035,6 +1047,21 @@ struct EffectsView: View {
                 routingState.effectsPreset.deEsserFrequencyHz = defaults.deEsserFrequencyHz
                 routingState.effectsPreset.deEsserReductionDB = defaults.deEsserReductionDB
                 routingState.effectsPreset.deEsserRatio = defaults.deEsserRatio
+            case "Chorus":
+                routingState.effectsPreset.chorusRate = defaults.chorusRate
+                routingState.effectsPreset.chorusDepth = defaults.chorusDepth
+                routingState.effectsPreset.chorusMix = defaults.chorusMix
+            case "Pitch Shift":
+                routingState.effectsPreset.pitchSemitones = defaults.pitchSemitones
+                routingState.effectsPreset.pitchMix = defaults.pitchMix
+            case "Reverb":
+                routingState.effectsPreset.reverbRoomSize = defaults.reverbRoomSize
+                routingState.effectsPreset.reverbDamping = defaults.reverbDamping
+                routingState.effectsPreset.reverbMix = defaults.reverbMix
+            case "Delay":
+                routingState.effectsPreset.delayTimeMs = defaults.delayTimeMs
+                routingState.effectsPreset.delayFeedback = defaults.delayFeedback
+                routingState.effectsPreset.delayMix = defaults.delayMix
             case "Limiter":
                 routingState.effectsPreset.limiterCeilingDB = defaults.limiterCeilingDB
                 routingState.effectsPreset.limiterReleaseMs = defaults.limiterReleaseMs
@@ -1179,6 +1206,57 @@ struct EffectsView: View {
                     routingState.save()
                 },
             ]
+        case "Chorus":
+            return [
+                QuickPreset(name: "Subtle") {
+                    routingState.effectsPreset.chorusRate = 1.0; routingState.effectsPreset.chorusDepth = 2; routingState.effectsPreset.chorusMix = 0.2; routingState.save()
+                },
+                QuickPreset(name: "Thick") {
+                    routingState.effectsPreset.chorusRate = 0.8; routingState.effectsPreset.chorusDepth = 5; routingState.effectsPreset.chorusMix = 0.5; routingState.save()
+                },
+                QuickPreset(name: "Vibrato") {
+                    routingState.effectsPreset.chorusRate = 5.0; routingState.effectsPreset.chorusDepth = 1; routingState.effectsPreset.chorusMix = 0.8; routingState.save()
+                },
+            ]
+        case "Pitch Shift":
+            return [
+                QuickPreset(name: "Down Octave") {
+                    routingState.effectsPreset.pitchSemitones = -12; routingState.save()
+                },
+                QuickPreset(name: "Up Fifth") {
+                    routingState.effectsPreset.pitchSemitones = 7; routingState.save()
+                },
+                QuickPreset(name: "Chipmunk") {
+                    routingState.effectsPreset.pitchSemitones = 12; routingState.save()
+                },
+                QuickPreset(name: "None") {
+                    routingState.effectsPreset.pitchSemitones = 0; routingState.save()
+                },
+            ]
+        case "Reverb":
+            return [
+                QuickPreset(name: "Small Room") {
+                    routingState.effectsPreset.reverbRoomSize = 0.3; routingState.effectsPreset.reverbDamping = 0.6; routingState.effectsPreset.reverbMix = 0.12; routingState.save()
+                },
+                QuickPreset(name: "Hall") {
+                    routingState.effectsPreset.reverbRoomSize = 0.8; routingState.effectsPreset.reverbDamping = 0.3; routingState.effectsPreset.reverbMix = 0.2; routingState.save()
+                },
+                QuickPreset(name: "Subtle") {
+                    routingState.effectsPreset.reverbRoomSize = 0.4; routingState.effectsPreset.reverbDamping = 0.5; routingState.effectsPreset.reverbMix = 0.08; routingState.save()
+                },
+            ]
+        case "Delay":
+            return [
+                QuickPreset(name: "Slapback") {
+                    routingState.effectsPreset.delayTimeMs = 80; routingState.effectsPreset.delayFeedback = 0.1; routingState.effectsPreset.delayMix = 0.3; routingState.save()
+                },
+                QuickPreset(name: "Quarter") {
+                    routingState.effectsPreset.delayTimeMs = 500; routingState.effectsPreset.delayFeedback = 0.3; routingState.effectsPreset.delayMix = 0.25; routingState.save()
+                },
+                QuickPreset(name: "Long Echo") {
+                    routingState.effectsPreset.delayTimeMs = 750; routingState.effectsPreset.delayFeedback = 0.5; routingState.effectsPreset.delayMix = 0.2; routingState.save()
+                },
+            ]
         case "Limiter":
             return [
                 QuickPreset(name: "Safe") {
@@ -1205,6 +1283,10 @@ struct EffectsView: View {
         case "EQ": return "Shape tonal balance with parametric bands"
         case "Compressor": return "Tames dynamic range for consistent levels"
         case "De-Esser": return "Reduces harsh sibilance in vocals"
+        case "Chorus": return "Thickens voice with modulated detuning"
+        case "Pitch Shift": return "Shift voice pitch up or down in semitones"
+        case "Reverb": return "Adds room/hall spatial ambience"
+        case "Delay": return "Echo effect with adjustable feedback"
         case "Limiter": return "Prevents clipping with a hard ceiling"
         default: return ""
         }
@@ -1217,6 +1299,10 @@ struct EffectsView: View {
         case "EQ": eqDetailControls
         case "Compressor": compressorDetailControls
         case "De-Esser": deEsserDetailControls
+        case "Chorus": chorusDetailControls
+        case "Pitch Shift": pitchShiftDetailControls
+        case "Reverb": reverbDetailControls
+        case "Delay": delayDetailControls
         case "Limiter": limiterDetailControls
         default: EmptyView()
         }
@@ -1398,6 +1484,48 @@ struct EffectsView: View {
     }
 
     // MARK: - Limiter detail controls
+
+    private var chorusDetailControls: some View {
+        VStack(spacing: 14) {
+            parameterRow("Rate", value: $routingState.effectsPreset.chorusRate, range: 0.1...5.0, unit: "Hz",
+                          description: "LFO speed -- how fast the modulation sweeps")
+            parameterRow("Depth", value: $routingState.effectsPreset.chorusDepth, range: 0...10, unit: "ms",
+                          description: "Modulation depth -- wider = more detuning")
+            parameterRow("Mix", value: $routingState.effectsPreset.chorusMix, range: 0...1, unit: "",
+                          description: "Wet/dry balance")
+        }
+    }
+
+    private var pitchShiftDetailControls: some View {
+        VStack(spacing: 14) {
+            parameterRow("Semitones", value: $routingState.effectsPreset.pitchSemitones, range: -12...12, unit: "st",
+                          description: "Pitch shift amount (-12 = octave down, +12 = octave up)")
+            parameterRow("Mix", value: $routingState.effectsPreset.pitchMix, range: 0...1, unit: "",
+                          description: "Blend shifted signal with original")
+        }
+    }
+
+    private var reverbDetailControls: some View {
+        VStack(spacing: 14) {
+            parameterRow("Room Size", value: $routingState.effectsPreset.reverbRoomSize, range: 0...1, unit: "",
+                          description: "Size of the virtual space (0 = tiny, 1 = cathedral)")
+            parameterRow("Damping", value: $routingState.effectsPreset.reverbDamping, range: 0...1, unit: "",
+                          description: "High-frequency absorption (higher = warmer)")
+            parameterRow("Mix", value: $routingState.effectsPreset.reverbMix, range: 0...1, unit: "",
+                          description: "Wet/dry balance (keep low for voice)")
+        }
+    }
+
+    private var delayDetailControls: some View {
+        VStack(spacing: 14) {
+            parameterRow("Time", value: $routingState.effectsPreset.delayTimeMs, range: 10...1000, unit: "ms",
+                          description: "Delay time between echoes")
+            parameterRow("Feedback", value: $routingState.effectsPreset.delayFeedback, range: 0...0.9, unit: "",
+                          description: "How many times the echo repeats (0.9 = long tail)")
+            parameterRow("Mix", value: $routingState.effectsPreset.delayMix, range: 0...1, unit: "",
+                          description: "Wet/dry balance")
+        }
+    }
 
     private var limiterDetailControls: some View {
         VStack(spacing: 14) {

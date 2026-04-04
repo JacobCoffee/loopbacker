@@ -54,6 +54,29 @@ struct EffectsPreset: Codable, Equatable {
     var deEsserReductionDB: Float = -6.0
     var deEsserRatio: Float = 3.0
 
+    // Chorus
+    var chorusEnabled: Bool = false
+    var chorusRate: Float = 1.5       // LFO Hz, 0.1...5
+    var chorusDepth: Float = 3.0      // modulation depth ms, 0...10
+    var chorusMix: Float = 0.3        // 0...1
+
+    // Pitch Shift
+    var pitchShiftEnabled: Bool = false
+    var pitchSemitones: Float = 0.0   // -12...12
+    var pitchMix: Float = 1.0         // 0...1
+
+    // Reverb (Freeverb)
+    var reverbEnabled: Bool = false
+    var reverbRoomSize: Float = 0.5   // 0...1
+    var reverbDamping: Float = 0.5    // 0...1
+    var reverbMix: Float = 0.15       // 0...1
+
+    // Delay
+    var delayEnabled: Bool = false
+    var delayTimeMs: Float = 250.0    // 10...1000
+    var delayFeedback: Float = 0.3    // 0...0.9
+    var delayMix: Float = 0.25        // 0...1
+
     // Limiter
     var limiterEnabled: Bool = true
     var limiterCeilingDB: Float = -1.5

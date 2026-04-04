@@ -5,7 +5,7 @@ private let fxLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category:
 
 /// Real-time safe audio effects chain for broadcast voice processing.
 ///
-/// Signal flow: Gate → EQ → Compressor → De-Esser → Limiter
+/// Signal flow: Gate → EQ → Compressor → De-Esser → Chorus → Pitch Shift → Reverb → Delay → Limiter
 ///
 /// All processing operates in-place on interleaved Float32 buffers.
 /// No allocations, no locks, no ObjC calls in the process path.
@@ -55,6 +55,30 @@ final class AudioEffectsChain {
     private var deBpA1: Float = 0
     private var deBpA2: Float = 0
 
+    // Chorus
+    private(set) var chorusEnabled: Bool = false
+    private var chorusRate: Float = 1.5
+    private var chorusDepthSamples: Float = 0.0
+    private var chorusMix: Float = 0.3
+    private var chorusCenterDelay: Float = 0.0
+
+    // Pitch Shift
+    private(set) var pitchShiftEnabled: Bool = false
+    private var pitchRatio: Float = 1.0
+    private var pitchMix: Float = 1.0
+
+    // Reverb (Freeverb)
+    private(set) var reverbEnabled: Bool = false
+    private var reverbFeedback: Float = 0.84
+    private var reverbDamp: Float = 0.2
+    private var reverbMix: Float = 0.15
+
+    // Delay
+    private(set) var delayEnabled: Bool = false
+    private var delaySamples: Int = 0
+    private var delayFeedback: Float = 0.3
+    private var delayMix: Float = 0.25
+
     // Limiter
     private(set) var limiterEnabled: Bool = true
     private var limiterCeilingLin: Float = 0.0
@@ -79,6 +103,42 @@ final class AudioEffectsChain {
     private var deBpZ2: [Float]
     // De-esser envelope per channel
     private var deEnv: [Float]
+
+    // Chorus state per channel
+    private var chorusLine: [[Float]]  // [ch][sample]
+    private let chorusLineSize = 2048
+    private var chorusWriteIdx: [Int]
+    private var chorusLFOPhase: [Float]
+
+    // Pitch shift state per channel
+    private var pitchBuf: [[Float]]  // [ch][sample]
+    private let pitchBufSize = 4096
+    private let pitchBufMask = 4095
+    private let pitchGrainSize = 1024
+    private var pitchWriteIdx: [Int]
+    private var pitchReadPhase: [[Float]]  // [ch][2 heads]
+    private var pitchCrossfade: [Float]
+
+    // Reverb state (Freeverb: 8 combs + 4 allpasses per channel)
+    private let combCount = 8
+    private let allpassCount = 4
+    // Comb sizes scaled for 48kHz (original Freeverb tunings * 48000/44100)
+    private let combSizes = [1214, 1293, 1389, 1474, 1547, 1622, 1694, 1759]
+    private let allpassSizes = [605, 480, 371, 245]
+    private var combBufs: [[[Float]]]  // [ch][comb][sample]
+    private var combIdx: [[Int]]       // [ch][comb]
+    private var combFilterStore: [[Float]]  // [ch][comb]
+    private var apBufs: [[[Float]]]    // [ch][ap][sample]
+    private var apIdx: [[Int]]         // [ch][ap]
+    // DC blocker state for reverb
+    private var dcPrevX: [Float]
+    private var dcPrevY: [Float]
+
+    // Delay state per channel
+    private var delayLine: [[Float]]   // [ch][sample]
+    private let delayLineSize = 65536  // power of 2, ~1.36s at 48kHz
+    private let delayLineMask = 65535
+    private var delayWriteIdx: [Int]
 
     // Limiter state per channel
     private var limiterEnv: [Float]
@@ -108,6 +168,40 @@ final class AudioEffectsChain {
         deBpZ1 = [Float](repeating: 0, count: maxCh)
         deBpZ2 = [Float](repeating: 0, count: maxCh)
         deEnv = [Float](repeating: 0, count: maxCh)
+
+        // Chorus (use literal sizes to avoid capturing self)
+        chorusLine = [[Float](repeating: 0, count: 2048), [Float](repeating: 0, count: 2048)]
+        chorusWriteIdx = [0, 0]
+        chorusLFOPhase = [0.0, 0.25]  // ch1 offset 90 degrees for stereo width
+
+        // Pitch shift
+        pitchBuf = [[Float](repeating: 0, count: 4096), [Float](repeating: 0, count: 4096)]
+        pitchWriteIdx = [0, 0]
+        pitchReadPhase = [[0, 0], [0, 0]]
+        pitchCrossfade = [0, 0]
+
+        // Reverb (Freeverb) — sizes scaled for 48kHz
+        let stereoSpread = 23
+        let cSizes = [1214, 1293, 1389, 1474, 1547, 1622, 1694, 1759]
+        let aSizes = [605, 480, 371, 245]
+        combBufs = [
+            cSizes.map { [Float](repeating: 0, count: $0) },
+            cSizes.map { [Float](repeating: 0, count: $0 + stereoSpread) }
+        ]
+        combIdx = [[Int](repeating: 0, count: 8), [Int](repeating: 0, count: 8)]
+        combFilterStore = [[Float](repeating: 0, count: 8), [Float](repeating: 0, count: 8)]
+        apBufs = [
+            aSizes.map { [Float](repeating: 0, count: $0) },
+            aSizes.map { [Float](repeating: 0, count: $0 + stereoSpread) }
+        ]
+        apIdx = [[Int](repeating: 0, count: 4), [Int](repeating: 0, count: 4)]
+        dcPrevX = [0, 0]
+        dcPrevY = [0, 0]
+
+        // Delay (65536 = power of 2 for bitmask)
+        delayLine = [[Float](repeating: 0, count: 65536), [Float](repeating: 0, count: 65536)]
+        delayWriteIdx = [0, 0]
+
         limiterEnv = [Float](repeating: 0, count: maxCh)
 
         // Apply defaults
@@ -151,6 +245,30 @@ final class AudioEffectsChain {
         deBpB0 = bpCoeffs.b0; deBpB1 = bpCoeffs.b1; deBpB2 = bpCoeffs.b2
         deBpA1 = bpCoeffs.a1; deBpA2 = bpCoeffs.a2
 
+        // Chorus
+        chorusEnabled = p.chorusEnabled
+        chorusRate = p.chorusRate
+        chorusDepthSamples = p.chorusDepth * sampleRate / 1000.0
+        chorusMix = p.chorusMix
+        chorusCenterDelay = 7.0 * sampleRate / 1000.0  // 7ms center delay
+
+        // Pitch Shift
+        pitchShiftEnabled = p.pitchShiftEnabled
+        pitchRatio = powf(2.0, p.pitchSemitones / 12.0)
+        pitchMix = p.pitchMix
+
+        // Reverb
+        reverbEnabled = p.reverbEnabled
+        reverbFeedback = p.reverbRoomSize * 0.28 + 0.7  // maps 0..1 to 0.7..0.98
+        reverbDamp = p.reverbDamping * 0.4               // maps 0..1 to 0..0.4
+        reverbMix = p.reverbMix
+
+        // Delay
+        delayEnabled = p.delayEnabled
+        delaySamples = min(Int(p.delayTimeMs * sampleRate / 1000.0), delayLineSize - 1)
+        delayFeedback = min(p.delayFeedback, 0.9)
+        delayMix = p.delayMix
+
         // Limiter
         limiterEnabled = p.limiterEnabled
         limiterCeilingLin = dBToLinear(p.limiterCeilingDB)
@@ -170,6 +288,12 @@ final class AudioEffectsChain {
         if eqEnabled { processEQ(buffer, frames: n, channels: ch) }
         if compressorEnabled { processCompressor(buffer, frames: n, channels: ch) }
         if deEsserEnabled { processDeEsser(buffer, frames: n, channels: ch) }
+        // Creative effects
+        if chorusEnabled { processChorus(buffer, frames: n, channels: ch) }
+        if pitchShiftEnabled { processPitchShift(buffer, frames: n, channels: ch) }
+        if reverbEnabled { processReverb(buffer, frames: n, channels: ch) }
+        if delayEnabled { processDelay(buffer, frames: n, channels: ch) }
+        // Safety limiter always last
         if limiterEnabled { processLimiter(buffer, frames: n, channels: ch) }
     }
 
@@ -328,6 +452,216 @@ final class AudioEffectsChain {
             deBpZ1[c] = z1
             deBpZ2[c] = z2
             deEnv[c] = env
+        }
+    }
+
+    // MARK: - Chorus (modulated delay line)
+
+    private func processChorus(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+        let rate = chorusRate
+        let depth = chorusDepthSamples
+        let center = chorusCenterDelay
+        let mix = chorusMix
+        let sr = sampleRate
+        let lineLen = Float(chorusLineSize)
+
+        for c in 0..<channels {
+            var phase = chorusLFOPhase[c]
+            var wIdx = chorusWriteIdx[c]
+
+            for i in 0..<frames {
+                let idx = i * channels + c
+                let x = buf[idx]
+
+                // Write to delay line
+                chorusLine[c][wIdx] = x
+                wIdx = (wIdx + 1) % chorusLineSize
+
+                // LFO modulates read position
+                let lfo = sinf(phase * 2.0 * Float.pi)
+                phase += rate / sr
+                if phase >= 1.0 { phase -= 1.0 }
+
+                let delaySmp = center + depth * lfo
+                var readPos = Float(wIdx) - delaySmp
+                if readPos < 0 { readPos += lineLen }
+
+                // Linear interpolation
+                let idx0 = Int(readPos) % chorusLineSize
+                let idx1 = (idx0 + 1) % chorusLineSize
+                let frac = readPos - floorf(readPos)
+                let delayed = chorusLine[c][idx0] * (1.0 - frac) + chorusLine[c][idx1] * frac
+
+                buf[idx] = (1.0 - mix) * x + mix * delayed
+            }
+
+            chorusLFOPhase[c] = phase
+            chorusWriteIdx[c] = wIdx
+        }
+    }
+
+    // MARK: - Pitch Shift (dual-head overlap-add)
+
+    private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+        let ratio = pitchRatio
+        let mix = pitchMix
+        guard fabsf(ratio - 1.0) > 0.001 else { return }  // skip if no shift
+
+        let grain = Float(pitchGrainSize)
+        let halfGrain = grain * 0.5
+
+        for c in 0..<channels {
+            var wIdx = pitchWriteIdx[c]
+            var rPhase0 = pitchReadPhase[c][0]
+            var rPhase1 = pitchReadPhase[c][1]
+
+            // Initialize read phases if needed
+            if rPhase0 == 0 && rPhase1 == 0 {
+                rPhase0 = Float(wIdx)
+                rPhase1 = Float(wIdx) - halfGrain
+                if rPhase1 < 0 { rPhase1 += Float(pitchBufSize) }
+            }
+
+            for i in 0..<frames {
+                let idx = i * channels + c
+                let x = buf[idx]
+
+                // Write input
+                pitchBuf[c][wIdx] = x
+                wIdx = (wIdx + 1) & pitchBufMask
+
+                // Read from head 0
+                let ri0 = Int(rPhase0) & pitchBufMask
+                let ri0n = (ri0 + 1) & pitchBufMask
+                let frac0 = rPhase0 - floorf(rPhase0)
+                let val0 = pitchBuf[c][ri0] * (1.0 - frac0) + pitchBuf[c][ri0n] * frac0
+
+                // Read from head 1
+                let ri1 = Int(rPhase1) & pitchBufMask
+                let ri1n = (ri1 + 1) & pitchBufMask
+                let frac1 = rPhase1 - floorf(rPhase1)
+                let val1 = pitchBuf[c][ri1] * (1.0 - frac1) + pitchBuf[c][ri1n] * frac1
+
+                // Advance read positions at pitch ratio
+                rPhase0 += ratio
+                rPhase1 += ratio
+
+                // Wrap phases
+                while rPhase0 >= Float(pitchBufSize) { rPhase0 -= Float(pitchBufSize) }
+                while rPhase0 < 0 { rPhase0 += Float(pitchBufSize) }
+                while rPhase1 >= Float(pitchBufSize) { rPhase1 -= Float(pitchBufSize) }
+                while rPhase1 < 0 { rPhase1 += Float(pitchBufSize) }
+
+                // Distance from write head (how far behind we are)
+                var dist0 = Float(wIdx) - rPhase0
+                if dist0 < 0 { dist0 += Float(pitchBufSize) }
+                var dist1 = Float(wIdx) - rPhase1
+                if dist1 < 0 { dist1 += Float(pitchBufSize) }
+
+                // Reset heads that get too far from write position
+                if dist0 > grain || dist0 < 1 {
+                    rPhase0 = Float(wIdx) - halfGrain
+                    if rPhase0 < 0 { rPhase0 += Float(pitchBufSize) }
+                }
+                if dist1 > grain || dist1 < 1 {
+                    rPhase1 = Float(wIdx) - grain
+                    if rPhase1 < 0 { rPhase1 += Float(pitchBufSize) }
+                }
+
+                // Crossfade: Hann window based on distance within grain
+                let w0 = 0.5 * (1.0 - cosf(Float.pi * dist0 / grain))
+                let w1 = 0.5 * (1.0 - cosf(Float.pi * dist1 / grain))
+                let wSum = max(w0 + w1, 0.001)
+                let shifted = (val0 * w0 + val1 * w1) / wSum
+
+                buf[idx] = (1.0 - mix) * x + mix * shifted
+            }
+
+            pitchWriteIdx[c] = wIdx
+            pitchReadPhase[c][0] = rPhase0
+            pitchReadPhase[c][1] = rPhase1
+        }
+    }
+
+    // MARK: - Reverb (Freeverb: 8 combs + 4 allpasses)
+
+    private func processReverb(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+        let feedback = reverbFeedback
+        let damp = reverbDamp
+        let damp1 = 1.0 - damp
+        let mix = reverbMix
+
+        for c in 0..<channels {
+            for i in 0..<frames {
+                let idx = i * channels + c
+                let input = buf[idx]
+
+                // Sum 8 parallel comb filters
+                var combSum: Float = 0
+                for k in 0..<combCount {
+                    let bufSize = combBufs[c][k].count
+                    let ci = combIdx[c][k]
+                    let readVal = combBufs[c][k][ci]
+
+                    // One-pole lowpass in feedback (damping)
+                    let filtered = readVal * damp1 + combFilterStore[c][k] * damp
+                    combFilterStore[c][k] = filtered
+
+                    combBufs[c][k][ci] = input + filtered * feedback
+                    combIdx[c][k] = (ci + 1) % bufSize
+                    combSum += readVal
+                }
+
+                // 4 series allpass filters
+                var apOut = combSum
+                for k in 0..<allpassCount {
+                    let bufSize = apBufs[c][k].count
+                    let ai = apIdx[c][k]
+                    let bufOut = apBufs[c][k][ai]
+                    apBufs[c][k][ai] = apOut + bufOut * 0.5
+                    apOut = bufOut - apOut
+                    apIdx[c][k] = (ai + 1) % bufSize
+                }
+
+                // DC blocker (prevent low-frequency buildup)
+                let prevX = dcPrevX[c]
+                let prevY = dcPrevY[c]
+                let dcOut = apOut - prevX + 0.9999 * prevY
+                dcPrevX[c] = apOut
+                dcPrevY[c] = dcOut
+
+                buf[idx] = (1.0 - mix) * input + mix * dcOut
+            }
+        }
+    }
+
+    // MARK: - Delay (circular buffer with feedback)
+
+    private func processDelay(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+        let dSamples = delaySamples
+        let fb = delayFeedback
+        let mix = delayMix
+
+        for c in 0..<channels {
+            var wIdx = delayWriteIdx[c]
+
+            for i in 0..<frames {
+                let idx = i * channels + c
+                let x = buf[idx]
+
+                let rIdx = (wIdx - dSamples + delayLineSize) & delayLineMask
+                let delayed = delayLine[c][rIdx]
+
+                // Write input + feedback (soft-clip to prevent runaway)
+                var fbSample = x + fb * delayed
+                if fabsf(fbSample) > 2.0 { fbSample = tanhf(fbSample) }
+                delayLine[c][wIdx] = fbSample
+
+                wIdx = (wIdx + 1) & delayLineMask
+                buf[idx] = (1.0 - mix) * x + mix * delayed
+            }
+
+            delayWriteIdx[c] = wIdx
         }
     }
 
