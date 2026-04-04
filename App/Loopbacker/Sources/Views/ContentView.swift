@@ -37,6 +37,19 @@ struct ContentView: View {
         }
     }
 
+    /// Force NSWindow appearance so NSColor(name:) adaptive theme colors resolve correctly
+    private func applyAppearance(_ value: String) {
+        let nsAppearance: NSAppearance?
+        switch value {
+        case "light": nsAppearance = NSAppearance(named: .aqua)
+        case "dark": nsAppearance = NSAppearance(named: .darkAqua)
+        default: nsAppearance = nil
+        }
+        for window in NSApplication.shared.windows {
+            window.appearance = nsAppearance
+        }
+    }
+
     private var appearanceTooltip: String {
         switch appearanceOverride {
         case "light": return "Light mode (click for dark)"
@@ -53,7 +66,12 @@ struct ContentView: View {
         }
         .background(LoopbackerTheme.bgDeep)
         .preferredColorScheme(colorSchemeOverride)
+        .onChange(of: appearanceOverride) { _, newValue in
+            applyAppearance(newValue)
+        }
         .onAppear {
+            // Apply initial appearance override
+            applyAppearance(appearanceOverride)
             audioDeviceManager.populateInitialSources(into: routingState)
             // Apply saved effects preset to the audio router
             audioRouter.currentEffectsPreset = routingState.effectsPreset

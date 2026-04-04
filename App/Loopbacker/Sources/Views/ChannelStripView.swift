@@ -1,28 +1,59 @@
 import SwiftUI
+import AppKit
 
-// MARK: - Design tokens
+// MARK: - Design tokens (adaptive light/dark)
 
 enum LoopbackerTheme {
-    static let bgDeep = Color(red: 0.08, green: 0.08, blue: 0.14)       // #141423
-    static let bgSurface = Color(red: 0.13, green: 0.13, blue: 0.20)    // #212133
-    static let bgCard = Color(red: 0.16, green: 0.16, blue: 0.24)       // #28283D
-    static let bgCardHover = Color(red: 0.19, green: 0.19, blue: 0.28)  // #303047
-    static let bgInset = Color(red: 0.10, green: 0.10, blue: 0.16)      // #1A1A29
+    /// Whether the current theme is dark (reads the user's appearance toggle)
+    static var isDark: Bool {
+        let override = UserDefaults.standard.string(forKey: "appearanceOverride") ?? "system"
+        switch override {
+        case "light": return false
+        case "dark": return true
+        default: return NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        }
+    }
 
-    static let accent = Color(red: 0.0, green: 0.83, blue: 0.67)        // #00D4AA
-    static let accentDim = Color(red: 0.0, green: 0.50, blue: 0.40)     // #008066
-    static let accentGlow = Color(red: 0.0, green: 0.83, blue: 0.67).opacity(0.3)
+    // Backgrounds
+    static var bgDeep: Color { isDark
+        ? Color(red: 0.08, green: 0.08, blue: 0.14)
+        : Color(red: 0.94, green: 0.94, blue: 0.96) }
+    static var bgSurface: Color { isDark
+        ? Color(red: 0.13, green: 0.13, blue: 0.20)
+        : Color(red: 0.97, green: 0.97, blue: 0.98) }
+    static var bgCard: Color { isDark
+        ? Color(red: 0.16, green: 0.16, blue: 0.24)
+        : Color.white }
+    static var bgCardHover: Color { isDark
+        ? Color(red: 0.19, green: 0.19, blue: 0.28)
+        : Color(red: 0.96, green: 0.97, blue: 0.98) }
+    static var bgInset: Color { isDark
+        ? Color(red: 0.10, green: 0.10, blue: 0.16)
+        : Color(red: 0.91, green: 0.92, blue: 0.94) }
 
-    static let textPrimary = Color.white
-    static let textSecondary = Color(white: 0.55)
-    static let textMuted = Color(white: 0.35)
+    // Accent (darker in light mode for contrast)
+    static var accent: Color { isDark
+        ? Color(red: 0.0, green: 0.83, blue: 0.67)
+        : Color(red: 0.0, green: 0.60, blue: 0.46) }
+    static var accentDim: Color { isDark
+        ? Color(red: 0.0, green: 0.50, blue: 0.40)
+        : Color(red: 0.0, green: 0.40, blue: 0.30) }
+    static var accentGlow: Color { accent.opacity(0.3) }
 
-    static let border = Color(white: 0.15)
-    static let borderActive = Color(red: 0.0, green: 0.83, blue: 0.67).opacity(0.5)
+    // Text
+    static var textPrimary: Color { isDark ? .white : Color(red: 0.10, green: 0.10, blue: 0.15) }
+    static var textSecondary: Color { isDark ? Color(white: 0.55) : Color(white: 0.40) }
+    static var textMuted: Color { isDark ? Color(white: 0.35) : Color(white: 0.60) }
 
+    // Borders
+    static var border: Color { isDark ? Color(white: 0.15) : Color(white: 0.82) }
+    static var borderActive: Color { accent.opacity(0.5) }
+
+    // Status
     static let danger = Color(red: 0.95, green: 0.30, blue: 0.35)
     static let warning = Color(red: 0.95, green: 0.75, blue: 0.20)
 
+    // Layout
     static let connectorRadius: CGFloat = 5
     static let cardCornerRadius: CGFloat = 10
     static let stripHeight: CGFloat = 24
