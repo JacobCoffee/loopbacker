@@ -812,7 +812,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, 0);
 
                 case kAudioDevicePropertyZeroTimeStampPeriod:
-                    WRITE_PROP(UInt32, kDefaultIOBufferFrames);
+                    WRITE_PROP(UInt32, dev->ioBufferFrames);
 
                 case kAudioDevicePropertyIsHidden:
                     WRITE_PROP(UInt32, 0);
@@ -908,15 +908,15 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                 }
 
                 case kAudioDevicePropertyBufferFrameSize:
-                    WRITE_PROP(UInt32, kDefaultIOBufferFrames);
+                    WRITE_PROP(UInt32, dev->ioBufferFrames);
 
                 case kAudioDevicePropertyBufferFrameSizeRange: {
                     if (inDataSize < sizeof(AudioValueRange))
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = sizeof(AudioValueRange);
                     auto* range = static_cast<AudioValueRange*>(outData);
-                    range->mMinimum = kDefaultIOBufferFrames;
-                    range->mMaximum = kDefaultIOBufferFrames;
+                    range->mMinimum = 16;
+                    range->mMaximum = 4096;
                     return kAudioHardwareNoError;
                 }
             }
@@ -1074,7 +1074,22 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
         case ObjectType::Device:
             switch (inAddress->mSelector) {
                 case kAudioDevicePropertyBufferFrameSize: {
-                    // We support a fixed buffer size only, so accept it but ignore the value
+                    if (inDataSize < sizeof(UInt32))
+                        return kAudioHardwareBadPropertySizeError;
+                    UInt32 newSize = *static_cast<const UInt32*>(inData);
+                    // Clamp to supported range
+                    if (newSize < 16) newSize = 16;
+                    if (newSize > 4096) newSize = 4096;
+                    {
+                        std::lock_guard<std::mutex> lock(driver->mMutex);
+                        dev->ioBufferFrames = newSize;
+                        dev->timestampSeed++;
+                        // Re-anchor on buffer size change if IO is running
+                        if (dev->ioIsRunning.load(std::memory_order_relaxed) > 0) {
+                            dev->anchorHostTime = mach_absolute_time();
+                            dev->ioCycleCount = 0;
+                        }
+                    }
                     return kAudioHardwareNoError;
                 }
 
@@ -1094,6 +1109,12 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                         dev->sampleRate = newRate;
                         dev->hostTicksPerFrame = ComputeHostTicksPerFrame(newRate);
                         dev->ringBuffer->reset();
+                        dev->timestampSeed++;
+                        // Re-anchor on rate change if IO is running
+                        if (dev->ioIsRunning.load(std::memory_order_relaxed) > 0) {
+                            dev->anchorHostTime = mach_absolute_time();
+                            dev->ioCycleCount = 0;
+                        }
                     }
 
                     if (driver->mHost) {
@@ -1198,6 +1219,7 @@ OSStatus LoopbackerDriver::StartIO(AudioServerPlugInDriverRef inDriver,
     if (prev == 0) {
         dev->ioCycleCount = 0;
         dev->anchorHostTime = mach_absolute_time();
+        dev->timestampSeed++;
         dev->ringBuffer->reset();
     }
     return kAudioHardwareNoError;
@@ -1230,15 +1252,16 @@ OSStatus LoopbackerDriver::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
     if (dev == nullptr) return kAudioHardwareBadDeviceError;
 
     UInt64 currentHostTime = mach_absolute_time();
-    Float64 ticksPerPeriod = dev->hostTicksPerFrame * static_cast<Float64>(kDefaultIOBufferFrames);
+    UInt32 bufferFrames = dev->ioBufferFrames;
+    Float64 ticksPerPeriod = dev->hostTicksPerFrame * static_cast<Float64>(bufferFrames);
 
     UInt64 hostElapsed = currentHostTime - dev->anchorHostTime;
     UInt64 periodCount = static_cast<UInt64>(static_cast<Float64>(hostElapsed) / ticksPerPeriod);
 
-    *outSampleTime = static_cast<Float64>(periodCount * kDefaultIOBufferFrames);
+    *outSampleTime = static_cast<Float64>(periodCount * bufferFrames);
     *outHostTime = dev->anchorHostTime +
                    static_cast<UInt64>(static_cast<Float64>(periodCount) * ticksPerPeriod);
-    *outSeed = 1;
+    *outSeed = dev->timestampSeed;
 
     return kAudioHardwareNoError;
 }

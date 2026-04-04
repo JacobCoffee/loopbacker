@@ -27,12 +27,21 @@ public:
 
         uint32_t available = capacity() - (wr - rd);
         uint32_t toWrite = (frames < available) ? frames : available;
+        if (toWrite == 0) return 0;
 
-        for (uint32_t i = 0; i < toWrite; ++i) {
-            uint32_t idx = (wr + i) & mMask;
-            std::memcpy(&mBuffer[idx * mBytesPerFrame / sizeof(float)],
-                        &data[i * mBytesPerFrame / sizeof(float)],
-                        mBytesPerFrame);
+        const uint32_t samplesPerFrame = mBytesPerFrame / sizeof(float);
+        uint32_t startIdx = wr & mMask;
+        uint32_t firstChunk = capacity() - startIdx;
+        if (firstChunk > toWrite) firstChunk = toWrite;
+        uint32_t secondChunk = toWrite - firstChunk;
+
+        std::memcpy(&mBuffer[startIdx * samplesPerFrame],
+                    data,
+                    firstChunk * mBytesPerFrame);
+        if (secondChunk > 0) {
+            std::memcpy(&mBuffer[0],
+                        &data[firstChunk * samplesPerFrame],
+                        secondChunk * mBytesPerFrame);
         }
 
         mWritePos.store(wr + toWrite, std::memory_order_release);
@@ -47,12 +56,21 @@ public:
 
         uint32_t available = wr - rd;
         uint32_t toRead = (frames < available) ? frames : available;
+        if (toRead == 0) return 0;
 
-        for (uint32_t i = 0; i < toRead; ++i) {
-            uint32_t idx = (rd + i) & mMask;
-            std::memcpy(&data[i * mBytesPerFrame / sizeof(float)],
-                        &mBuffer[idx * mBytesPerFrame / sizeof(float)],
-                        mBytesPerFrame);
+        const uint32_t samplesPerFrame = mBytesPerFrame / sizeof(float);
+        uint32_t startIdx = rd & mMask;
+        uint32_t firstChunk = capacity() - startIdx;
+        if (firstChunk > toRead) firstChunk = toRead;
+        uint32_t secondChunk = toRead - firstChunk;
+
+        std::memcpy(data,
+                    &mBuffer[startIdx * samplesPerFrame],
+                    firstChunk * mBytesPerFrame);
+        if (secondChunk > 0) {
+            std::memcpy(&data[firstChunk * samplesPerFrame],
+                        &mBuffer[0],
+                        secondChunk * mBytesPerFrame);
         }
 
         mReadPos.store(rd + toRead, std::memory_order_release);

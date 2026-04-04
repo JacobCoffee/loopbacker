@@ -47,7 +47,7 @@ static const uint32_t kNumSampleRates = 3;
 static const Float64 kDefaultSampleRate = 48000.0;
 
 // Ring buffer
-static const uint32_t kRingBufferFrames = 2048; // must be power of 2 (~42ms at 48kHz)
+static const uint32_t kRingBufferFrames = 512; // must be power of 2 (~10.7ms at 48kHz)
 
 // IO
 static const uint32_t kDefaultIOBufferFrames = 256;
