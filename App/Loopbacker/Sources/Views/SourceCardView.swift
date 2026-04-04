@@ -24,7 +24,7 @@ struct SourceCardView: View {
                     ChannelStripView(
                         channel: channel,
                         side: .source,
-                        isSourceEnabled: source.isEnabled,
+                        isSourceEnabled: source.isEnabled && !source.isMuted,
                         connectorEnd: .source(sourceId: source.id, channelId: channel.id)
                     )
                 }
@@ -72,19 +72,31 @@ struct SourceCardView: View {
             // Device icon
             ZStack {
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(source.isEnabled ? LoopbackerTheme.accent.opacity(0.15) : LoopbackerTheme.bgInset)
+                    .fill(source.isEnabled && !source.isMuted ? LoopbackerTheme.accent.opacity(0.15) : LoopbackerTheme.bgInset)
                     .frame(width: 32, height: 32)
 
                 Image(systemName: source.icon)
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(source.isEnabled ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
+                    .foregroundColor(source.isEnabled && !source.isMuted ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
             }
 
             // Device name
             VStack(alignment: .leading, spacing: 1) {
-                Text(source.name)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(source.isEnabled ? LoopbackerTheme.textPrimary : LoopbackerTheme.textMuted)
+                HStack(spacing: 4) {
+                    Text(source.name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(source.isEnabled ? LoopbackerTheme.textPrimary : LoopbackerTheme.textMuted)
+
+                    if source.isMuted {
+                        Text("MUTED")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundColor(LoopbackerTheme.warning)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(LoopbackerTheme.warning.opacity(0.15))
+                            .clipShape(Capsule())
+                    }
+                }
 
                 Text("\(source.channels.count) channel\(source.channels.count == 1 ? "" : "s")")
                     .font(.system(size: 10, weight: .regular))
@@ -133,6 +145,7 @@ struct SourceCardView: View {
             )
         }
         .buttonStyle(.plain)
+        .help(source.isEnabled ? "Disable this audio source (stops routing)" : "Enable this audio source (starts routing)")
     }
 
     // MARK: - Options section
@@ -142,6 +155,7 @@ struct SourceCardView: View {
             Divider()
                 .background(LoopbackerTheme.border)
 
+            // Pass-Through toggle
             HStack {
                 Text("Pass-Thru")
                     .font(.system(size: 11))
@@ -156,6 +170,74 @@ struct SourceCardView: View {
                     .onChange(of: source.isPassThrough) { _, _ in
                         routingState.save()
                     }
+                    .help("Pass audio through without processing (monitor mode)")
+            }
+
+            // Mute toggle
+            HStack {
+                Text("Mute")
+                    .font(.system(size: 11))
+                    .foregroundColor(LoopbackerTheme.textSecondary)
+
+                Spacer()
+
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        routingState.muteSource(source.id)
+                    }
+                }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: source.isMuted ? "speaker.slash.fill" : "speaker.wave.1")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(source.isMuted ? "MUTED" : "UNMUTED")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(source.isMuted ? LoopbackerTheme.warning : LoopbackerTheme.textSecondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(source.isMuted ? LoopbackerTheme.warning.opacity(0.12) : LoopbackerTheme.bgInset)
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(
+                            source.isMuted ? LoopbackerTheme.warning.opacity(0.3) : LoopbackerTheme.border,
+                            lineWidth: 0.5
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(source.isMuted ? "Unmute this source to resume audio routing" : "Mute this source (silences output without disconnecting routes)")
+            }
+
+            // Solo button
+            HStack {
+                Text("Solo")
+                    .font(.system(size: 11))
+                    .foregroundColor(LoopbackerTheme.textSecondary)
+
+                Spacer()
+
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        routingState.soloSource(source.id)
+                    }
+                }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "headphones")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("SOLO")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(LoopbackerTheme.accent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(LoopbackerTheme.accent.opacity(0.12)))
+                    .overlay(
+                        Capsule().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Mute all other sources and listen to only this one")
             }
         }
         .padding(.horizontal, 12)
@@ -181,5 +263,6 @@ struct SourceCardView: View {
                 showOptions.toggle()
             }
         }
+        .help(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
     }
 }

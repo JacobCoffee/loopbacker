@@ -38,6 +38,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
     var channels: [AudioChannel]
     var isEnabled: Bool
     var isPassThrough: Bool
+    var isMuted: Bool
     /// The CoreAudio device UID for this source (used by AudioRouter)
     var deviceUID: String
 
@@ -48,6 +49,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         channels: [AudioChannel],
         isEnabled: Bool = true,
         isPassThrough: Bool = false,
+        isMuted: Bool = false,
         deviceUID: String = ""
     ) {
         self.id = id
@@ -56,7 +58,25 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.channels = channels
         self.isEnabled = isEnabled
         self.isPassThrough = isPassThrough
+        self.isMuted = isMuted
         self.deviceUID = deviceUID
+    }
+
+    // Backward-compatible decoding: isMuted may not exist in old configs
+    enum CodingKeys: String, CodingKey {
+        case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        icon = try container.decode(String.self, forKey: .icon)
+        channels = try container.decode([AudioChannel].self, forKey: .channels)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        isPassThrough = try container.decode(Bool.self, forKey: .isPassThrough)
+        isMuted = (try? container.decode(Bool.self, forKey: .isMuted)) ?? false
+        deviceUID = try container.decode(String.self, forKey: .deviceUID)
     }
 }
 
