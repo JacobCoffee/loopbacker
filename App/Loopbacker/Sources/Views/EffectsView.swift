@@ -249,7 +249,7 @@ struct EffectsView: View {
             ("Pitch Shift", "arrow.up.arrow.down", preset.pitchShiftEnabled, {
                 routingState.effectsPreset.pitchShiftEnabled.toggle(); routingState.save()
             }),
-            ("Reverb", "waveform.path.ecg.rectangle", preset.reverbEnabled, {
+            ("Reverb", "drop.halffull", preset.reverbEnabled, {
                 routingState.effectsPreset.reverbEnabled.toggle(); routingState.save()
             }),
             ("Delay", "repeat", preset.delayEnabled, {

@@ -56,8 +56,8 @@ struct EffectsPreset: Codable, Equatable {
 
     // Chorus
     var chorusEnabled: Bool = false
-    var chorusRate: Float = 1.5       // LFO Hz, 0.1...5
-    var chorusDepth: Float = 3.0      // modulation depth ms, 0...10
+    var chorusRate: Float = 0.8       // LFO Hz, 0.1...5 (slow = natural)
+    var chorusDepth: Float = 1.5      // modulation depth ms, 0...10 (subtle)
     var chorusMix: Float = 0.3        // 0...1
 
     // Pitch Shift
