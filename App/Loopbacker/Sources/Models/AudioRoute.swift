@@ -194,6 +194,12 @@ class RoutingState: ObservableObject {
         pendingConnector = nil
     }
 
+    /// Remove all routes but keep sources intact
+    func disconnectAll() {
+        routes.removeAll()
+        save()
+    }
+
     // MARK: - Persistence
 
     private static let configDirectoryURL: URL = {
@@ -205,23 +211,30 @@ class RoutingState: ObservableObject {
         configDirectoryURL.appendingPathComponent("config.json")
     }()
 
+    /// Serial background queue for config persistence -- avoids blocking
+    /// the main thread with file I/O during rapid state changes.
+    private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.save", qos: .utility)
+
     func save() {
+        // Snapshot the config on the calling thread (main), then write on background.
         let config = RoutingConfig(
             sources: sources,
             outputChannels: outputChannels,
             routes: routes,
             outputDestinations: outputDestinations
         )
-        do {
-            try FileManager.default.createDirectory(
-                at: Self.configDirectoryURL,
-                withIntermediateDirectories: true
-            )
-            let data = try JSONEncoder().encode(config)
-            try data.write(to: Self.configFileURL, options: .atomic)
-        } catch {
-            // Non-fatal: best-effort persistence
-            print("Loopbacker: failed to save config: \(error)")
+        Self.saveQueue.async {
+            do {
+                try FileManager.default.createDirectory(
+                    at: Self.configDirectoryURL,
+                    withIntermediateDirectories: true
+                )
+                let data = try JSONEncoder().encode(config)
+                try data.write(to: Self.configFileURL, options: .atomic)
+            } catch {
+                // Non-fatal: best-effort persistence
+                print("Loopbacker: failed to save config: \(error)")
+            }
         }
     }
 
