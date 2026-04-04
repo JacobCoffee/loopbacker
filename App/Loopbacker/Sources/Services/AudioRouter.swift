@@ -18,6 +18,9 @@ class AudioRouter: ObservableObject {
     /// Output channel meter levels: [channelId: level]
     @Published var outputMeterLevels: [Int: Float] = [:]
 
+    /// Current effects preset — applied to new routes and propagated to existing ones
+    var currentEffectsPreset = EffectsPreset()
+
     // MARK: - Internal state
 
     private var activeRoutes: [String: RouteContext] = [:]
@@ -46,6 +49,9 @@ class AudioRouter: ObservableObject {
         var renderBuffer: UnsafeMutablePointer<Float>?
         var renderBufferFrames: UInt32 = 1024
 
+        // Audio effects chain (broadcast voice processing)
+        var effectsChain: AudioEffectsChain?
+
         // Meter levels -- C buffer for thread safety (written from RT thread, read from main)
         var meterLevelsPtr: UnsafeMutablePointer<Float>?
         var meterChannelCount: Int = 0
@@ -71,6 +77,9 @@ class AudioRouter: ObservableObject {
             let renderSamples = Int(renderBufferFrames * channelCount)
             renderBuffer = UnsafeMutablePointer<Float>.allocate(capacity: renderSamples)
             renderBuffer?.initialize(repeating: 0.0, count: renderSamples)
+
+            // Initialize effects chain for this route
+            effectsChain = AudioEffectsChain(sampleRate: Float(sampleRate))
         }
 
         deinit {
@@ -280,6 +289,7 @@ class AudioRouter: ObservableObject {
             let ctx = RouteContext(captureDeviceUID: sourceDeviceUID, captureDeviceID: captureID,
                                   playbackDeviceID: outputID, playbackDeviceUID: outputDeviceUID,
                                   channelCount: chCount, sampleRate: rate)
+            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
             guard self.setupInputUnit(ctx) else { return }
             guard self.setupOutputUnit(ctx) else { self.teardownUnit(&ctx.inputUnit); return }
             if let u = ctx.inputUnit { AudioOutputUnitStart(u) }
@@ -292,6 +302,21 @@ class AudioRouter: ObservableObject {
     func stopOutputRouting(virtualDeviceUID: String) {
         queue.async { [weak self] in
             self?.stopOutputRoutingInternal(virtualDeviceUID: virtualDeviceUID)
+        }
+    }
+
+    // MARK: - Effects
+
+    /// Update the effects preset on all active route contexts.
+    func updateEffectsPreset(_ preset: EffectsPreset) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            for (_, ctx) in self.activeRoutes {
+                ctx.effectsChain?.updatePreset(preset)
+            }
+            for (_, ctx) in self.activeOutputRoutes {
+                ctx.effectsChain?.updatePreset(preset)
+            }
         }
     }
 
@@ -391,6 +416,7 @@ class AudioRouter: ObservableObject {
             channelCount: UInt32(min(channelCount, 2)), // Clamp to stereo
             sampleRate: sampleRate
         )
+        ctx.effectsChain?.updatePreset(currentEffectsPreset)
 
         // Create input AUHAL (captures from source device)
         guard setupInputUnit(ctx) else {
@@ -486,6 +512,7 @@ class AudioRouter: ObservableObject {
             channelCount: channelCount,
             sampleRate: sampleRate
         )
+        ctx.effectsChain?.updatePreset(currentEffectsPreset)
 
         // Create input AUHAL (captures from virtual device's input side)
         guard setupInputUnit(ctx) else {
@@ -1007,7 +1034,10 @@ private func inputRenderCallback(
     let status = AudioUnitRender(inputUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
     guard status == noErr else { return status }
 
-    // Compute meter levels
+    // Apply effects chain (Gate → EQ → Compressor → De-Esser → Limiter)
+    ctx.effectsChain?.process(renderBuf, frames: inNumberFrames, channels: channelCount)
+
+    // Compute meter levels (post-effects)
     ctx.computeRMS(from: renderBuf, frames: inNumberFrames)
 
     // Write captured audio into the ring buffer

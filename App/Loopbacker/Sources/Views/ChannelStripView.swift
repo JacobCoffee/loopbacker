@@ -1,32 +1,78 @@
 import SwiftUI
+import AppKit
 
-// MARK: - Design tokens
+// MARK: - Design tokens (adaptive light/dark)
 
 enum LoopbackerTheme {
-    static let bgDeep = Color(red: 0.08, green: 0.08, blue: 0.14)       // #141423
-    static let bgSurface = Color(red: 0.13, green: 0.13, blue: 0.20)    // #212133
-    static let bgCard = Color(red: 0.16, green: 0.16, blue: 0.24)       // #28283D
-    static let bgCardHover = Color(red: 0.19, green: 0.19, blue: 0.28)  // #303047
-    static let bgInset = Color(red: 0.10, green: 0.10, blue: 0.16)      // #1A1A29
+    // Backgrounds
+    static let bgDeep = adaptive(
+        light: NSColor(red: 0.94, green: 0.94, blue: 0.96, alpha: 1),   // #F0F0F5
+        dark:  NSColor(red: 0.08, green: 0.08, blue: 0.14, alpha: 1))   // #141423
 
-    static let accent = Color(red: 0.0, green: 0.83, blue: 0.67)        // #00D4AA
-    static let accentDim = Color(red: 0.0, green: 0.50, blue: 0.40)     // #008066
-    static let accentGlow = Color(red: 0.0, green: 0.83, blue: 0.67).opacity(0.3)
+    static let bgSurface = adaptive(
+        light: NSColor(red: 0.97, green: 0.97, blue: 0.98, alpha: 1),   // #F8F8FA
+        dark:  NSColor(red: 0.13, green: 0.13, blue: 0.20, alpha: 1))   // #212133
 
-    static let textPrimary = Color.white
-    static let textSecondary = Color(white: 0.55)
-    static let textMuted = Color(white: 0.35)
+    static let bgCard = adaptive(
+        light: NSColor(red: 1.0,  green: 1.0,  blue: 1.0,  alpha: 1),   // #FFFFFF
+        dark:  NSColor(red: 0.16, green: 0.16, blue: 0.24, alpha: 1))   // #28283D
 
-    static let border = Color(white: 0.15)
-    static let borderActive = Color(red: 0.0, green: 0.83, blue: 0.67).opacity(0.5)
+    static let bgCardHover = adaptive(
+        light: NSColor(red: 0.96, green: 0.97, blue: 0.98, alpha: 1),   // #F5F8FA
+        dark:  NSColor(red: 0.19, green: 0.19, blue: 0.28, alpha: 1))   // #303047
 
+    static let bgInset = adaptive(
+        light: NSColor(red: 0.91, green: 0.92, blue: 0.94, alpha: 1),   // #E8EBF0
+        dark:  NSColor(red: 0.10, green: 0.10, blue: 0.16, alpha: 1))   // #1A1A29
+
+    // Accent (slightly darker in light mode for contrast)
+    static let accent = adaptive(
+        light: NSColor(red: 0.0,  green: 0.65, blue: 0.50, alpha: 1),   // #00A680
+        dark:  NSColor(red: 0.0,  green: 0.83, blue: 0.67, alpha: 1))   // #00D4AA
+
+    static let accentDim = adaptive(
+        light: NSColor(red: 0.0,  green: 0.45, blue: 0.35, alpha: 1),
+        dark:  NSColor(red: 0.0,  green: 0.50, blue: 0.40, alpha: 1))   // #008066
+
+    static var accentGlow: Color { accent.opacity(0.3) }
+
+    // Text
+    static let textPrimary = adaptive(
+        light: NSColor(red: 0.10, green: 0.10, blue: 0.15, alpha: 1),   // near-black
+        dark:  NSColor(white: 1.0, alpha: 1))
+
+    static let textSecondary = adaptive(
+        light: NSColor(white: 0.40, alpha: 1),
+        dark:  NSColor(white: 0.55, alpha: 1))
+
+    static let textMuted = adaptive(
+        light: NSColor(white: 0.60, alpha: 1),
+        dark:  NSColor(white: 0.35, alpha: 1))
+
+    // Borders
+    static let border = adaptive(
+        light: NSColor(white: 0.82, alpha: 1),
+        dark:  NSColor(white: 0.15, alpha: 1))
+
+    static var borderActive: Color { accent.opacity(0.5) }
+
+    // Status colors
     static let danger = Color(red: 0.95, green: 0.30, blue: 0.35)
     static let warning = Color(red: 0.95, green: 0.75, blue: 0.20)
 
+    // Layout constants
     static let connectorRadius: CGFloat = 5
     static let cardCornerRadius: CGFloat = 10
     static let stripHeight: CGFloat = 24
     static let stripCornerRadius: CGFloat = 4
+
+    // MARK: - Helper
+
+    private static func adaptive(light: NSColor, dark: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        })
+    }
 }
 
 // MARK: - Channel strip (meter bar + label + connector dot)

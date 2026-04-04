@@ -42,22 +42,25 @@ struct RoutingConfig: Codable {
     var outputChannels: [AudioChannel]
     var routes: [AudioRoute]
     var outputDestinations: [OutputDestination]
+    var effectsPreset: EffectsPreset
 
     init(sources: [AudioSource], outputChannels: [AudioChannel], routes: [AudioRoute],
-         outputDestinations: [OutputDestination] = []) {
+         outputDestinations: [OutputDestination] = [], effectsPreset: EffectsPreset = EffectsPreset()) {
         self.sources = sources
         self.outputChannels = outputChannels
         self.routes = routes
         self.outputDestinations = outputDestinations
+        self.effectsPreset = effectsPreset
     }
 
-    // Backward-compatible decoding: outputDestinations may not exist in old configs
+    // Backward-compatible decoding: outputDestinations/effectsPreset may not exist in old configs
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sources = try container.decode([AudioSource].self, forKey: .sources)
         outputChannels = try container.decode([AudioChannel].self, forKey: .outputChannels)
         routes = try container.decode([AudioRoute].self, forKey: .routes)
         outputDestinations = (try? container.decode([OutputDestination].self, forKey: .outputDestinations)) ?? []
+        effectsPreset = (try? container.decode(EffectsPreset.self, forKey: .effectsPreset)) ?? EffectsPreset()
     }
 }
 
@@ -68,6 +71,7 @@ class RoutingState: ObservableObject {
     @Published var outputChannels: [AudioChannel]
     @Published var routes: [AudioRoute]
     @Published var outputDestinations: [OutputDestination]
+    @Published var effectsPreset: EffectsPreset
     /// Currently selected connector for route creation (first click)
     @Published var pendingConnector: ConnectorEnd?
 
@@ -78,12 +82,14 @@ class RoutingState: ObservableObject {
         sources: [AudioSource] = [],
         outputChannels: [AudioChannel] = [],
         routes: [AudioRoute] = [],
-        outputDestinations: [OutputDestination] = []
+        outputDestinations: [OutputDestination] = [],
+        effectsPreset: EffectsPreset = EffectsPreset()
     ) {
         self.sources = sources
         self.outputChannels = outputChannels
         self.routes = routes
         self.outputDestinations = outputDestinations
+        self.effectsPreset = effectsPreset
     }
 
     // MARK: - Route management
@@ -240,7 +246,8 @@ class RoutingState: ObservableObject {
             sources: sources,
             outputChannels: outputChannels,
             routes: routes,
-            outputDestinations: outputDestinations
+            outputDestinations: outputDestinations,
+            effectsPreset: effectsPreset
         )
         Self.saveQueue.async {
             do {
@@ -265,7 +272,8 @@ class RoutingState: ObservableObject {
                 sources: config.sources,
                 outputChannels: config.outputChannels,
                 routes: config.routes,
-                outputDestinations: config.outputDestinations
+                outputDestinations: config.outputDestinations,
+                effectsPreset: config.effectsPreset
             )
         } catch {
             // No saved state or corrupt file — fall back to defaults
@@ -296,7 +304,8 @@ class RoutingState: ObservableObject {
             sources: sources,
             outputChannels: outputChannels,
             routes: routes,
-            outputDestinations: outputDestinations
+            outputDestinations: outputDestinations,
+            effectsPreset: effectsPreset
         )
         return (try? JSONEncoder().encode(config)) ?? Data()
     }
@@ -308,6 +317,7 @@ class RoutingState: ObservableObject {
         outputChannels = config.outputChannels
         routes = config.routes
         outputDestinations = config.outputDestinations
+        effectsPreset = config.effectsPreset
         save()
     }
 

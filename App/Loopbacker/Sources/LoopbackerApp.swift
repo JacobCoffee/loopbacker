@@ -15,8 +15,8 @@ struct LoopbackerApp: App {
                 .environmentObject(audioDeviceManager)
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
-                .frame(minWidth: 800, minHeight: 600)
-                .preferredColorScheme(.dark)
+                .frame(minWidth: 800, minHeight: 500)
+                // Follows system appearance (light/dark)
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1000, height: 700)
@@ -42,11 +42,11 @@ struct MenuBarPanel: View {
     @EnvironmentObject var driverInstaller: DriverInstaller
     @EnvironmentObject var audioRouter: AudioRouter
 
-    private let bg = Color(red: 0.08, green: 0.08, blue: 0.14)
-    private let card = Color(red: 0.14, green: 0.14, blue: 0.22)
-    private let border = Color(white: 0.18)
-    private let accent = Color(red: 0.0, green: 0.83, blue: 0.67)
-    private let textDim = Color(white: 0.5)
+    private var bg: Color { LoopbackerTheme.bgDeep }
+    private var card: Color { LoopbackerTheme.bgCard }
+    private var border: Color { LoopbackerTheme.border }
+    private var accent: Color { LoopbackerTheme.accent }
+    private var textDim: Color { LoopbackerTheme.textSecondary }
     private let danger = Color(red: 0.95, green: 0.30, blue: 0.35)
 
     var body: some View {
@@ -59,7 +59,7 @@ struct MenuBarPanel: View {
 
                 Text("Loopbacker")
                     .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
+                    .foregroundColor(LoopbackerTheme.textPrimary)
 
                 Spacer()
 
@@ -89,7 +89,7 @@ struct MenuBarPanel: View {
 
                         Text(source.name)
                             .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white)
+                            .foregroundColor(LoopbackerTheme.textPrimary)
 
                         Spacer()
 
@@ -195,7 +195,7 @@ struct MenuBarPanel: View {
                 .foregroundColor(textDim)
             Text(value)
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(.white)
+                .foregroundColor(LoopbackerTheme.textPrimary)
             if !label.isEmpty {
                 Text(label)
                     .font(.system(size: 9))
@@ -249,9 +249,9 @@ private struct MiniMeter: View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 2)
-                    .fill(Color(white: 0.15))
+                    .fill(LoopbackerTheme.bgInset)
                 RoundedRectangle(cornerRadius: 2)
-                    .fill(Color(red: 0.0, green: 0.83, blue: 0.67))
+                    .fill(LoopbackerTheme.accent)
                     .frame(width: geo.size.width * CGFloat(level))
             }
         }

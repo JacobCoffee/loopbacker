@@ -1,22 +1,63 @@
 import SwiftUI
 
+enum AppTab: String, CaseIterable {
+    case routing = "Routing"
+    case effects = "Effects"
+
+    var icon: String {
+        switch self {
+        case .routing: return "point.3.connected.trianglepath.dotted"
+        case .effects: return "waveform.badge.magnifyingglass"
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @State private var showSourcePicker = false
     @State private var connectorPositions: [ConnectorEnd: CGRect] = [:]
+    @State private var selectedTab: AppTab = .routing
+    @AppStorage("appearanceOverride") private var appearanceOverride: String = "system"
+
+    private var colorSchemeOverride: ColorScheme? {
+        switch appearanceOverride {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
+    }
+
+    private var appearanceIcon: String {
+        switch appearanceOverride {
+        case "light": return "sun.max.fill"
+        case "dark": return "moon.fill"
+        default: return "circle.lefthalf.filled"
+        }
+    }
+
+    private var appearanceTooltip: String {
+        switch appearanceOverride {
+        case "light": return "Light mode (click for dark)"
+        case "dark": return "Dark mode (click for auto)"
+        default: return "Auto appearance (click for light)"
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             headerBar
-            routingArea
-                .coordinateSpace(name: "routing")
+            tabContent
             ToolbarView()
         }
         .background(LoopbackerTheme.bgDeep)
+        .preferredColorScheme(colorSchemeOverride)
         .onAppear {
             audioDeviceManager.populateInitialSources(into: routingState)
+            // Apply saved effects preset to the audio router
+            audioRouter.currentEffectsPreset = routingState.effectsPreset
+            audioRouter.updateEffectsPreset(routingState.effectsPreset)
             // Start routing for saved state after a brief settle
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
@@ -42,6 +83,10 @@ struct ContentView: View {
         }
         .onReceive(audioRouter.$outputMeterLevels) { levels in
             updateOutputMeters(levels)
+        }
+        .onChange(of: routingState.effectsPreset) { _, newPreset in
+            audioRouter.currentEffectsPreset = newPreset
+            audioRouter.updateEffectsPreset(newPreset)
         }
     }
 
@@ -121,7 +166,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Header bar
+    // MARK: - Header bar with integrated tab switcher
 
     private var headerBar: some View {
         HStack(spacing: 12) {
@@ -136,6 +181,10 @@ struct ContentView: View {
             Text("Loopbacker")
                 .font(.system(size: 18, weight: .bold))
                 .foregroundColor(LoopbackerTheme.textPrimary)
+
+            // Tab switcher -- integrated into header
+            tabSwitcher
+                .padding(.leading, 8)
 
             Spacer()
 
@@ -154,6 +203,28 @@ struct ContentView: View {
                 .clipShape(Capsule())
                 .transition(.opacity)
             }
+
+            // Appearance toggle
+            Button(action: {
+                switch appearanceOverride {
+                case "system": appearanceOverride = "light"
+                case "light": appearanceOverride = "dark"
+                default: appearanceOverride = "system"
+                }
+            }) {
+                Image(systemName: appearanceIcon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(LoopbackerTheme.textMuted)
+                    .frame(width: 28, height: 28)
+                    .background(LoopbackerTheme.bgCard)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(LoopbackerTheme.border, lineWidth: 0.5)
+                    )
+            }
+            .buttonStyle(.plain)
+            .tooltip(appearanceTooltip)
 
             HStack(spacing: 4) {
                 Image(systemName: "waveform")
@@ -176,6 +247,70 @@ struct ContentView: View {
             Rectangle().fill(LoopbackerTheme.border).frame(height: 0.5),
             alignment: .bottom
         )
+    }
+
+    // MARK: - Tab switcher
+
+    private var tabSwitcher: some View {
+        HStack(spacing: 2) {
+            ForEach(AppTab.allCases, id: \.self) { tab in
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        selectedTab = tab
+                    }
+                }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(tab.rawValue.uppercased())
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .tracking(1.0)
+                    }
+                    .foregroundColor(selectedTab == tab ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .contentShape(RoundedRectangle(cornerRadius: 6))
+                    .background(
+                        ZStack {
+                            if selectedTab == tab {
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(LoopbackerTheme.accent.opacity(0.1))
+                                RoundedRectangle(cornerRadius: 6)
+                                    .strokeBorder(LoopbackerTheme.accent.opacity(0.25), lineWidth: 0.5)
+                            } else {
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(Color.clear)
+                            }
+                        }
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(LoopbackerTheme.bgInset)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(LoopbackerTheme.border, lineWidth: 0.5)
+        )
+    }
+
+    // MARK: - Tab content
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .routing:
+            routingArea
+                .coordinateSpace(name: "routing")
+                .transition(.opacity)
+        case .effects:
+            EffectsView()
+                .transition(.opacity)
+        }
     }
 
     // MARK: - Main routing area
