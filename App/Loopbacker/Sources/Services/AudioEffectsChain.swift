@@ -259,7 +259,7 @@ final class AudioEffectsChain {
 
         // Reverb
         reverbEnabled = p.reverbEnabled
-        reverbFeedback = p.reverbRoomSize * 0.28 + 0.7  // maps 0..1 to 0.7..0.98
+        reverbFeedback = p.reverbRoomSize * 0.3 + 0.5   // maps 0..1 to 0.5..0.8 (less metallic)
         reverbDamp = p.reverbDamping * 0.4               // maps 0..1 to 0..0.4
         reverbMix = p.reverbMix
 
@@ -500,86 +500,87 @@ final class AudioEffectsChain {
         }
     }
 
-    // MARK: - Pitch Shift (smooth grain-based overlap-add)
+    // MARK: - Pitch Shift (simple two-tap crossfade)
 
     private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
         let ratio = pitchRatio
         let mix = pitchMix
-        guard fabsf(ratio - 1.0) > 0.001 else { return }  // skip if no shift
+        guard fabsf(ratio - 1.0) > 0.001 else { return }
 
-        // Use large grains for voice (2048 samples = ~42ms at 48kHz)
-        let grainF = Float(2048)
-        let halfGrain = grainF * 0.5
-        let bufF = Float(pitchBufSize)
+        // Two read taps into a circular buffer, crossfaded with a triangle window.
+        // Each tap reads at `ratio` speed. When a tap gets too far from the write
+        // head, it resets. The other tap covers during the crossfade.
+        let bufSize = pitchBufSize
+        let mask = pitchBufMask
+        let maxDist = Float(bufSize / 2)  // max distance before reset
 
         for c in 0..<channels {
             var wIdx = pitchWriteIdx[c]
-            var phase0 = pitchReadPhase[c][0]
-            var phase1 = pitchReadPhase[c][1]
-            var xfade = pitchCrossfade[c]
+            var rd0 = pitchReadPhase[c][0]
+            var rd1 = pitchReadPhase[c][1]
 
-            // Initialize on first use
-            if phase0 == 0 && phase1 == 0 && wIdx == 0 {
-                phase0 = 0
-                phase1 = halfGrain
+            // Initialize read positions on first use
+            if rd0 == 0 && rd1 == 0 && wIdx == 0 {
+                rd0 = 0
+                rd1 = Float(bufSize / 4)
             }
 
             for i in 0..<frames {
                 let idx = i * channels + c
                 let x = buf[idx]
 
-                // Write input to circular buffer
+                // Write to circular buffer
                 pitchBuf[c][wIdx] = x
 
-                // Read from two heads with linear interpolation
-                func readInterp(_ phase: Float) -> Float {
-                    let p = phase < 0 ? phase + bufF : (phase >= bufF ? phase - bufF : phase)
-                    let i0 = Int(p) & pitchBufMask
-                    let i1 = (i0 + 1) & pitchBufMask
-                    let f = p - floorf(p)
-                    return pitchBuf[c][i0] * (1.0 - f) + pitchBuf[c][i1] * f
+                // Read with linear interpolation
+                let i0a = Int(rd0) & mask, i0b = (i0a + 1) & mask
+                let f0 = rd0 - floorf(rd0)
+                let v0 = pitchBuf[c][i0a] * (1.0 - f0) + pitchBuf[c][i0b] * f0
+
+                let i1a = Int(rd1) & mask, i1b = (i1a + 1) & mask
+                let f1 = rd1 - floorf(rd1)
+                let v1 = pitchBuf[c][i1a] * (1.0 - f1) + pitchBuf[c][i1b] * f1
+
+                // Advance read heads at pitch ratio
+                rd0 += ratio
+                rd1 += ratio
+                // Wrap
+                if rd0 >= Float(bufSize) { rd0 -= Float(bufSize) }
+                if rd1 >= Float(bufSize) { rd1 -= Float(bufSize) }
+
+                // Distance from write head for each tap
+                var d0 = Float(wIdx) - rd0
+                if d0 < 0 { d0 += Float(bufSize) }
+                var d1 = Float(wIdx) - rd1
+                if d1 < 0 { d1 += Float(bufSize) }
+
+                // Reset tap if it gets too close or too far from write head
+                if d0 > maxDist || d0 < 2 {
+                    rd0 = Float((wIdx - bufSize / 4 + bufSize) & mask)
+                }
+                if d1 > maxDist || d1 < 2 {
+                    rd1 = Float((wIdx - bufSize / 2 + bufSize) & mask)
                 }
 
-                let val0 = readInterp(Float(wIdx) - phase0)
-                let val1 = readInterp(Float(wIdx) - phase1)
+                // Crossfade based on distance — each tap is loudest when
+                // it's in the middle of its usable range
+                // Normalize distances to 0..1 range
+                let n0 = d0 / maxDist
+                let n1 = d1 / maxDist
+                // Hann-shaped weight: peaks at 0.5, zero at 0 and 1
+                let w0 = sinf(Float.pi * n0)
+                let w1 = sinf(Float.pi * n1)
+                let wSum = max(w0 + w1, 0.001)
 
-                // Advance read positions (phase = how far behind the write head)
-                // When ratio > 1 (pitch up), read heads move slower (less behind)
-                // When ratio < 1 (pitch down), read heads move faster (more behind)
-                let advance = 1.0 - ratio  // how much the distance changes per sample
-                phase0 -= advance
-                phase1 -= advance
-
-                // Crossfade counter advances with each sample
-                xfade += 1.0 / grainF
-
-                // When a head completes its grain, reset it
-                if xfade >= 1.0 {
-                    xfade -= 1.0
-                    // Reset the head that's fading out to start a new grain
-                    phase0 = halfGrain  // restart halfway behind write
-                }
-                if phase0 < 0 || phase0 > grainF {
-                    phase0 = halfGrain
-                }
-                if phase1 < 0 || phase1 > grainF {
-                    phase1 = grainF
-                }
-
-                // Hann crossfade: head 0 fades in then out over one grain,
-                // head 1 is offset by half a grain
-                let w0 = 0.5 * (1.0 - cosf(2.0 * Float.pi * xfade))
-                let w1 = 1.0 - w0
-                let shifted = val0 * w0 + val1 * w1
+                let shifted = (v0 * w0 + v1 * w1) / wSum
 
                 buf[idx] = (1.0 - mix) * x + mix * shifted
-                wIdx = (wIdx + 1) & pitchBufMask
+                wIdx = (wIdx + 1) & mask
             }
 
             pitchWriteIdx[c] = wIdx
-            pitchReadPhase[c][0] = phase0
-            pitchReadPhase[c][1] = phase1
-            pitchCrossfade[c] = xfade
+            pitchReadPhase[c][0] = rd0
+            pitchReadPhase[c][1] = rd1
         }
     }
 
@@ -590,11 +591,14 @@ final class AudioEffectsChain {
         let damp = reverbDamp
         let damp1 = 1.0 - damp
         let mix = reverbMix
+        let inputGain: Float = 0.015  // scale input to prevent buildup
+        let combScale: Float = 1.0 / Float(combCount)  // normalize comb sum
 
         for c in 0..<channels {
             for i in 0..<frames {
                 let idx = i * channels + c
-                let input = buf[idx]
+                let dry = buf[idx]
+                let scaledInput = dry * inputGain
 
                 // Sum 8 parallel comb filters
                 var combSum: Float = 0
@@ -607,12 +611,13 @@ final class AudioEffectsChain {
                     let filtered = readVal * damp1 + combFilterStore[c][k] * damp
                     combFilterStore[c][k] = filtered
 
-                    combBufs[c][k][ci] = input + filtered * feedback
+                    combBufs[c][k][ci] = scaledInput + filtered * feedback
                     combIdx[c][k] = (ci + 1) % bufSize
                     combSum += readVal
                 }
+                combSum *= combScale
 
-                // 4 series allpass filters
+                // 4 series allpass filters (diffusion)
                 var apOut = combSum
                 for k in 0..<allpassCount {
                     let bufSize = apBufs[c][k].count
@@ -623,14 +628,14 @@ final class AudioEffectsChain {
                     apIdx[c][k] = (ai + 1) % bufSize
                 }
 
-                // DC blocker (prevent low-frequency buildup)
+                // DC blocker
                 let prevX = dcPrevX[c]
                 let prevY = dcPrevY[c]
                 let dcOut = apOut - prevX + 0.9999 * prevY
                 dcPrevX[c] = apOut
                 dcPrevY[c] = dcOut
 
-                buf[idx] = (1.0 - mix) * input + mix * dcOut
+                buf[idx] = (1.0 - mix) * dry + mix * dcOut
             }
         }
     }
