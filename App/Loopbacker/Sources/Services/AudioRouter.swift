@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreAudio
 import AudioToolbox
 import Combine
@@ -136,11 +137,38 @@ class AudioRouter: ObservableObject {
 
     init() {
         startMeterTimer()
+        // Restart routing after screen unlock / wake from sleep
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            logger.info("Screen woke -- restarting audio routes")
+            self?.restartAllRoutes()
+        }
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            logger.info("System woke -- restarting audio routes")
+            self?.restartAllRoutes()
+        }
     }
 
     deinit {
         meterTimer?.invalidate()
         stopAll()
+    }
+
+    /// Tear down and re-create all active routes (after sleep/screen lock kills audio units)
+    func restartAllRoutes() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let uids = Array(self.activeRoutes.keys)
+            for uid in uids {
+                self.stopRoutingInternal(sourceDeviceUID: uid)
+            }
+            // Brief pause for audio system to settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                for uid in uids {
+                    self.startRouting(sourceDeviceUID: uid)
+                }
+            }
+        }
     }
 
     // MARK: - Public API
