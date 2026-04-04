@@ -264,6 +264,30 @@ class AudioRouter: ObservableObject {
         }
     }
 
+    /// Start monitoring: capture from a source and play directly to physical output (hear yourself).
+    func startMonitoring(sourceDeviceUID: String, outputDeviceUID: String) {
+        let key = "monitor:\(sourceDeviceUID)"
+        logger.info("startMonitoring: \(sourceDeviceUID) -> \(outputDeviceUID)")
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stopOutputRoutingInternal(virtualDeviceUID: key)
+            guard !outputDeviceUID.isEmpty else { return }
+            guard let captureID = self.findDeviceByUID(sourceDeviceUID) else { return }
+            guard let outputID = self.findDeviceByUID(outputDeviceUID) else { return }
+            let rate = self.getDeviceSampleRate(captureID)
+            let chCount = UInt32(min(self.getInputChannelCount(captureID), 2))
+            guard chCount > 0 else { return }
+            let ctx = RouteContext(captureDeviceUID: sourceDeviceUID, captureDeviceID: captureID,
+                                  playbackDeviceID: outputID, playbackDeviceUID: outputDeviceUID,
+                                  channelCount: chCount, sampleRate: rate)
+            guard self.setupInputUnit(ctx) else { return }
+            guard self.setupOutputUnit(ctx) else { self.teardownUnit(&ctx.inputUnit); return }
+            if let u = ctx.inputUnit { AudioOutputUnitStart(u) }
+            if let u = ctx.outputUnit { AudioOutputUnitStart(u) }
+            self.activeOutputRoutes[key] = ctx
+        }
+    }
+
     /// Stop output routing for a specific virtual device.
     func stopOutputRouting(virtualDeviceUID: String) {
         queue.async { [weak self] in
@@ -530,14 +554,10 @@ class AudioRouter: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
 
-            guard let playbackDeviceID = self.findDeviceByUID("LoopbackerDevice_UID") else {
-                logger.error("Test tone: Loopbacker virtual device not found")
-                return
-            }
-
+            // Use the default system output (speakers) so the user can actually hear it
             var desc = AudioComponentDescription(
                 componentType: kAudioUnitType_Output,
-                componentSubType: kAudioUnitSubType_HALOutput,
+                componentSubType: kAudioUnitSubType_DefaultOutput,
                 componentManufacturer: kAudioUnitManufacturer_Apple,
                 componentFlags: 0,
                 componentFlagsMask: 0
@@ -549,19 +569,7 @@ class AudioRouter: ObservableObject {
             var status = AudioComponentInstanceNew(component, &audioUnit)
             guard status == noErr, let unit = audioUnit else { return }
 
-            var deviceID = playbackDeviceID
-            status = AudioUnitSetProperty(unit,
-                                          kAudioOutputUnitProperty_CurrentDevice,
-                                          kAudioUnitScope_Global,
-                                          0,
-                                          &deviceID,
-                                          UInt32(MemoryLayout<AudioObjectID>.size))
-            guard status == noErr else {
-                AudioComponentInstanceDispose(unit)
-                return
-            }
-
-            let sampleRate = self.getDeviceSampleRate(playbackDeviceID)
+            let sampleRate: Float64 = 48000.0
             let channelCount: UInt32 = 2
 
             var streamFormat = AudioStreamBasicDescription(
