@@ -21,6 +21,10 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
                 syncOutputRouting(destinations: routingState.outputDestinations)
+                // Start monitoring for any sources that have a saved monitor output
+                for source in routingState.sources where !source.monitorOutputUID.isEmpty && source.isEnabled && !source.isMuted {
+                    audioRouter.startMonitoring(sourceDeviceUID: source.deviceUID, outputDeviceUID: source.monitorOutputUID)
+                }
             }
         }
         .onChange(of: routingState.sources) { _, newSources in
@@ -57,6 +61,11 @@ struct ContentView: View {
                 if !source.deviceUID.isEmpty {
                     audioRouter.stopRouting(sourceDeviceUID: source.deviceUID)
                 }
+            }
+
+            // Monitor: only manage stop. Start is handled by the picker in SourceCardView.
+            if !shouldRoute && !source.monitorOutputUID.isEmpty {
+                audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(source.deviceUID)")
             }
         }
     }

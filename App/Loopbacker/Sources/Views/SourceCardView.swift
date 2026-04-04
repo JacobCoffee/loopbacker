@@ -3,6 +3,8 @@ import SwiftUI
 struct SourceCardView: View {
     @Binding var source: AudioSource
     @EnvironmentObject var routingState: RoutingState
+    @EnvironmentObject var audioDeviceManager: AudioDeviceManager
+    @EnvironmentObject var audioRouter: AudioRouter
     @State private var isHovering = false
     @State private var showOptions = false
 
@@ -155,24 +157,19 @@ struct SourceCardView: View {
             Divider()
                 .background(LoopbackerTheme.border)
 
-            // Pass-Through toggle
-            HStack {
-                Text("Pass-Thru")
+            // Monitor output picker
+            HStack(spacing: 6) {
+                Image(systemName: "speaker.wave.2")
+                    .font(.system(size: 10))
+                    .foregroundColor(LoopbackerTheme.textSecondary)
+
+                Text("Monitor:")
                     .font(.system(size: 11))
                     .foregroundColor(LoopbackerTheme.textSecondary)
-                    .tooltip("Also play this source through your speakers for monitoring")
 
-                Spacer()
-
-                Toggle("", isOn: $source.isPassThrough)
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .tint(LoopbackerTheme.accent)
-                    .onChange(of: source.isPassThrough) { _, _ in
-                        routingState.save()
-                    }
-                    .tooltip("Pass audio through without processing (monitor mode)")
+                monitorPicker
             }
+            .tooltip("Hear this source through a physical output (speakers/headphones)")
 
             // Mute toggle
             HStack {
@@ -243,6 +240,36 @@ struct SourceCardView: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
+    }
+
+    // MARK: - Monitor output picker
+
+    @ViewBuilder
+    private var monitorPicker: some View {
+        let devices = audioDeviceManager.outputDevices
+
+        Picker("", selection: Binding(
+            get: { source.monitorOutputUID },
+            set: { newUID in
+                if !source.monitorOutputUID.isEmpty {
+                    audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(source.deviceUID)")
+                }
+                source.monitorOutputUID = newUID
+                source.monitorOutputName = devices.first(where: { $0.uid == newUID })?.name ?? ""
+                routingState.save()
+                if !newUID.isEmpty && source.isEnabled && !source.isMuted {
+                    audioRouter.startMonitoring(sourceDeviceUID: source.deviceUID, outputDeviceUID: newUID)
+                }
+            }
+        )) {
+            Text("None").tag("")
+            ForEach(devices) { device in
+                Text(device.name).tag(device.uid)
+            }
+        }
+        .pickerStyle(.menu)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .tint(LoopbackerTheme.accent)
     }
 
     // MARK: - Options toggle button

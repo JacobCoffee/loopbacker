@@ -41,6 +41,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
     var isMuted: Bool
     /// The CoreAudio device UID for this source (used by AudioRouter)
     var deviceUID: String
+    /// Physical output device UID for monitoring (hear yourself through speakers)
+    var monitorOutputUID: String
+    var monitorOutputName: String
 
     init(
         id: UUID = UUID(),
@@ -50,7 +53,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
         isEnabled: Bool = true,
         isPassThrough: Bool = false,
         isMuted: Bool = false,
-        deviceUID: String = ""
+        deviceUID: String = "",
+        monitorOutputUID: String = "",
+        monitorOutputName: String = ""
     ) {
         self.id = id
         self.name = name
@@ -60,11 +65,12 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.isPassThrough = isPassThrough
         self.isMuted = isMuted
         self.deviceUID = deviceUID
+        self.monitorOutputUID = monitorOutputUID
+        self.monitorOutputName = monitorOutputName
     }
 
-    // Backward-compatible decoding: isMuted may not exist in old configs
     enum CodingKeys: String, CodingKey {
-        case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
+        case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID, monitorOutputUID, monitorOutputName
     }
 
     init(from decoder: Decoder) throws {
@@ -77,6 +83,8 @@ struct AudioSource: Identifiable, Equatable, Codable {
         isPassThrough = try container.decode(Bool.self, forKey: .isPassThrough)
         isMuted = (try? container.decode(Bool.self, forKey: .isMuted)) ?? false
         deviceUID = try container.decode(String.self, forKey: .deviceUID)
+        monitorOutputUID = (try? container.decode(String.self, forKey: .monitorOutputUID)) ?? ""
+        monitorOutputName = (try? container.decode(String.self, forKey: .monitorOutputName)) ?? ""
     }
 }
 
