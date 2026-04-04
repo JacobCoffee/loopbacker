@@ -523,6 +523,128 @@ class AudioRouter: ObservableObject {
         logger.info(" Stopped output routing: \(virtualDeviceUID)")
     }
 
+    // MARK: - Test tone
+
+    /// Plays a 1kHz sine wave through the Loopbacker virtual device for the given duration.
+    func playTestTone(duration: Double = 2.0) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            guard let playbackDeviceID = self.findDeviceByUID("LoopbackerDevice_UID") else {
+                logger.error("Test tone: Loopbacker virtual device not found")
+                return
+            }
+
+            var desc = AudioComponentDescription(
+                componentType: kAudioUnitType_Output,
+                componentSubType: kAudioUnitSubType_HALOutput,
+                componentManufacturer: kAudioUnitManufacturer_Apple,
+                componentFlags: 0,
+                componentFlagsMask: 0
+            )
+
+            guard let component = AudioComponentFindNext(nil, &desc) else { return }
+
+            var audioUnit: AudioComponentInstance?
+            var status = AudioComponentInstanceNew(component, &audioUnit)
+            guard status == noErr, let unit = audioUnit else { return }
+
+            var deviceID = playbackDeviceID
+            status = AudioUnitSetProperty(unit,
+                                          kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global,
+                                          0,
+                                          &deviceID,
+                                          UInt32(MemoryLayout<AudioObjectID>.size))
+            guard status == noErr else {
+                AudioComponentInstanceDispose(unit)
+                return
+            }
+
+            let sampleRate = self.getDeviceSampleRate(playbackDeviceID)
+            let channelCount: UInt32 = 2
+
+            var streamFormat = AudioStreamBasicDescription(
+                mSampleRate: sampleRate,
+                mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
+                mBytesPerPacket: channelCount * 4,
+                mFramesPerPacket: 1,
+                mBytesPerFrame: channelCount * 4,
+                mChannelsPerFrame: channelCount,
+                mBitsPerChannel: 32,
+                mReserved: 0
+            )
+
+            status = AudioUnitSetProperty(unit,
+                                          kAudioUnitProperty_StreamFormat,
+                                          kAudioUnitScope_Input,
+                                          0,
+                                          &streamFormat,
+                                          UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+            guard status == noErr else {
+                AudioComponentInstanceDispose(unit)
+                return
+            }
+
+            // Allocate tone state on the heap so the C callback can access it safely.
+            let toneState = UnsafeMutablePointer<TestToneState>.allocate(capacity: 1)
+            toneState.initialize(to: TestToneState(
+                phase: 0.0,
+                phaseIncrement: Float(2.0 * Double.pi * 1000.0 / sampleRate),
+                amplitude: 0.3,
+                channelCount: channelCount
+            ))
+
+            var callbackStruct = AURenderCallbackStruct(
+                inputProc: testToneRenderCallback,
+                inputProcRefCon: UnsafeMutableRawPointer(toneState)
+            )
+
+            status = AudioUnitSetProperty(unit,
+                                          kAudioUnitProperty_SetRenderCallback,
+                                          kAudioUnitScope_Input,
+                                          0,
+                                          &callbackStruct,
+                                          UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+            guard status == noErr else {
+                toneState.deinitialize(count: 1)
+                toneState.deallocate()
+                AudioComponentInstanceDispose(unit)
+                return
+            }
+
+            status = AudioUnitInitialize(unit)
+            guard status == noErr else {
+                toneState.deinitialize(count: 1)
+                toneState.deallocate()
+                AudioComponentInstanceDispose(unit)
+                return
+            }
+
+            status = AudioOutputUnitStart(unit)
+            guard status == noErr else {
+                toneState.deinitialize(count: 1)
+                toneState.deallocate()
+                AudioUnitUninitialize(unit)
+                AudioComponentInstanceDispose(unit)
+                return
+            }
+
+            logger.info("Test tone started")
+
+            // Stop after duration
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+                AudioOutputUnitStop(unit)
+                AudioUnitUninitialize(unit)
+                AudioComponentInstanceDispose(unit)
+                toneState.deinitialize(count: 1)
+                toneState.deallocate()
+                logger.info("Test tone stopped")
+            }
+        }
+    }
+
     // MARK: - AUHAL setup
 
     private func setupInputUnit(_ ctx: RouteContext) -> Bool {
@@ -907,5 +1029,48 @@ private func outputRenderCallback(
     // Read from the ring buffer into the output
     _ = ctx.readFromRing(outputBuffer, frames: inNumberFrames)
 
+    return noErr
+}
+
+// MARK: - Test tone support
+
+struct TestToneState {
+    var phase: Float
+    var phaseIncrement: Float
+    var amplitude: Float
+    var channelCount: UInt32
+}
+
+private func testToneRenderCallback(
+    inRefCon: UnsafeMutableRawPointer,
+    ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+    inTimeStamp: UnsafePointer<AudioTimeStamp>,
+    inBusNumber: UInt32,
+    inNumberFrames: UInt32,
+    ioData: UnsafeMutablePointer<AudioBufferList>?
+) -> OSStatus {
+    let state = inRefCon.assumingMemoryBound(to: TestToneState.self)
+    guard let bufferList = ioData else { return noErr }
+
+    let abl = UnsafeMutableAudioBufferListPointer(bufferList)
+    guard abl.count > 0, let buffer = abl[0].mData?.assumingMemoryBound(to: Float.self) else {
+        return noErr
+    }
+
+    let chCount = Int(state.pointee.channelCount)
+    var phase = state.pointee.phase
+
+    for frame in 0..<Int(inNumberFrames) {
+        let sample = sinf(phase) * state.pointee.amplitude
+        for ch in 0..<chCount {
+            buffer[frame * chCount + ch] = sample
+        }
+        phase += state.pointee.phaseIncrement
+        if phase > Float.pi * 2.0 {
+            phase -= Float.pi * 2.0
+        }
+    }
+
+    state.pointee.phase = phase
     return noErr
 }
