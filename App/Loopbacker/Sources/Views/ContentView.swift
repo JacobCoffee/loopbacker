@@ -166,7 +166,7 @@ struct ContentView: View {
             .background(LoopbackerTheme.bgCard)
             .clipShape(Capsule())
             .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
-            .help("Virtual device audio format: 48 kHz sample rate, 32-bit float")
+            .tooltip("Virtual device audio format: 48 kHz sample rate, 32-bit float")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -222,7 +222,7 @@ struct ContentView: View {
     private var sourcesColumn: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                sectionHeader(title: "Sources", icon: "waveform.path")
+                sectionHeader(title: "Sources", icon: "waveform.path", tip: "Audio input devices to capture from")
 
                 Spacer()
 
@@ -239,7 +239,7 @@ struct ContentView: View {
                         .shadow(color: LoopbackerTheme.accentGlow, radius: 4)
                 }
                 .buttonStyle(.plain)
-                .help("Add an audio input device as a source for routing")
+                .tooltip("Add an audio input device as a source for routing")
                 .popover(isPresented: $showSourcePicker) {
                     sourcePickerPopover
                 }
@@ -288,7 +288,7 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 12) {
             HStack {
                 Spacer()
-                sectionHeader(title: "Output Channels", icon: "speaker.wave.2")
+                sectionHeader(title: "Output Channels", icon: "speaker.wave.2", tip: "Virtual device channels that apps like Discord see")
             }
 
             ScrollView(.vertical, showsIndicators: true) {
@@ -305,7 +305,7 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 12) {
             HStack {
                 Spacer()
-                sectionHeader(title: "Output Routing", icon: "arrow.right.circle")
+                sectionHeader(title: "Output Routing", icon: "arrow.right.circle", tip: "Route app audio from virtual devices to physical outputs")
             }
 
             OutputRoutingView()
@@ -314,7 +314,7 @@ struct ContentView: View {
 
     // MARK: - Section header
 
-    private func sectionHeader(title: String, icon: String) -> some View {
+    private func sectionHeader(title: String, icon: String, tip: String = "") -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .semibold))
@@ -325,6 +325,7 @@ struct ContentView: View {
                 .foregroundColor(LoopbackerTheme.textSecondary)
                 .tracking(1.5)
         }
+        .tooltip(tip.isEmpty ? title : tip)
     }
 
     // MARK: - Grid background

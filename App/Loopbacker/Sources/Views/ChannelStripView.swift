@@ -192,7 +192,7 @@ struct ChannelStripView: View {
                 }
             }
         }
-        .help(isConnected ? "Click to start a new route from this channel, right-click to disconnect all routes" : "Click to connect this channel to a source or output")
+        .tooltip(isConnected ? "Click to start a new route from this channel, right-click to disconnect all routes" : "Click to connect this channel to a source or output")
         .background(
             GeometryReader { geo in
                 Color.clear

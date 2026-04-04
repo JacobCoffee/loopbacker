@@ -145,7 +145,7 @@ struct SourceCardView: View {
             )
         }
         .buttonStyle(.plain)
-        .help(source.isEnabled ? "Disable this audio source (stops routing)" : "Enable this audio source (starts routing)")
+        .tooltip(source.isEnabled ? "Disable this audio source (stops routing)" : "Enable this audio source (starts routing)")
     }
 
     // MARK: - Options section
@@ -160,6 +160,7 @@ struct SourceCardView: View {
                 Text("Pass-Thru")
                     .font(.system(size: 11))
                     .foregroundColor(LoopbackerTheme.textSecondary)
+                    .tooltip("Also play this source through your speakers for monitoring")
 
                 Spacer()
 
@@ -170,7 +171,7 @@ struct SourceCardView: View {
                     .onChange(of: source.isPassThrough) { _, _ in
                         routingState.save()
                     }
-                    .help("Pass audio through without processing (monitor mode)")
+                    .tooltip("Pass audio through without processing (monitor mode)")
             }
 
             // Mute toggle
@@ -206,7 +207,7 @@ struct SourceCardView: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .help(source.isMuted ? "Unmute this source to resume audio routing" : "Mute this source (silences output without disconnecting routes)")
+                .tooltip(source.isMuted ? "Unmute this source to resume audio routing" : "Mute this source (silences output without disconnecting routes)")
             }
 
             // Solo button
@@ -237,7 +238,7 @@ struct SourceCardView: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .help("Mute all other sources and listen to only this one")
+                .tooltip("Mute all other sources and listen to only this one")
             }
         }
         .padding(.horizontal, 12)
@@ -263,6 +264,6 @@ struct SourceCardView: View {
                 showOptions.toggle()
             }
         }
-        .help(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
+        .tooltip(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
     }
 }

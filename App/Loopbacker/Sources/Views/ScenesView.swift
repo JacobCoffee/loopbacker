@@ -39,7 +39,7 @@ struct ScenesView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Save the current routing configuration as a named preset")
+                .tooltip("Save the current routing configuration as a named preset")
             }
 
             Divider().background(LoopbackerTheme.border)
@@ -105,7 +105,7 @@ struct ScenesView: View {
             }
             .buttonStyle(.plain)
             .disabled(newPresetName.isEmpty)
-            .help("Confirm and save this preset")
+            .tooltip("Confirm and save this preset")
 
             Button(action: {
                 showSaveField = false
@@ -116,7 +116,7 @@ struct ScenesView: View {
                     .foregroundColor(LoopbackerTheme.textMuted)
             }
             .buttonStyle(.plain)
-            .help("Cancel saving preset")
+            .tooltip("Cancel saving preset")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -148,7 +148,7 @@ struct ScenesView: View {
                     .overlay(Capsule().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
             }
             .buttonStyle(.plain)
-            .help("Load the '\(name)' preset, replacing current config")
+            .tooltip("Load the '\(name)' preset, replacing current config")
 
             Button(action: { deletePreset(name: name) }) {
                 Image(systemName: "trash")
@@ -156,7 +156,7 @@ struct ScenesView: View {
                     .foregroundColor(LoopbackerTheme.danger)
             }
             .buttonStyle(.plain)
-            .help("Delete the '\(name)' preset")
+            .tooltip("Delete the '\(name)' preset")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
