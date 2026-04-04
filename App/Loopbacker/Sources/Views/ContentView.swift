@@ -129,7 +129,8 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(
                         LinearGradient(
-                            colors: [LoopbackerTheme.accent.opacity(0.3), LoopbackerTheme.accent.opacity(0.1)],
+                            colors: [Color(red: 0.39, green: 0.40, blue: 0.95).opacity(0.35),
+                                     Color(red: 0.39, green: 0.40, blue: 0.95).opacity(0.12)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
@@ -138,7 +139,7 @@ struct ContentView: View {
 
                 Image(systemName: "cable.connector.horizontal")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(LoopbackerTheme.accent)
+                    .foregroundColor(Color(red: 0.51, green: 0.55, blue: 0.97))
             }
 
             Text("Loopbacker")
