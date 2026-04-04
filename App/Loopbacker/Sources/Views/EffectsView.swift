@@ -706,9 +706,33 @@ struct EffectsView: View {
         case effect(index: Int)
     }
 
+    /// Items reordered for display: row 2 is reversed so the pipeline snakes.
+    /// Row 1 (L→R): Input, Gate, EQ, Compressor, De-Esser
+    /// Row 2 (R→L visually): Chorus, Pitch, Reverb, Delay, Limiter (reversed in grid)
+    /// Row 3 (L→R): Output
+    private var displayItems: [(id: String, kind: PipelineItemKind)] {
+        let items = allPipelineItems
+        let cols = 5
+        var result: [(id: String, kind: PipelineItemKind)] = []
+        var row = 0
+        var i = 0
+        while i < items.count {
+            let end = min(i + cols, items.count)
+            let chunk = Array(items[i..<end])
+            if row % 2 == 1 {
+                result.append(contentsOf: chunk.reversed())  // snake: reverse even rows
+            } else {
+                result.append(contentsOf: chunk)
+            }
+            i = end
+            row += 1
+        }
+        return result
+    }
+
     private var pipelineGrid: some View {
         let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 5)
-        let items = allPipelineItems
+        let items = allPipelineItems  // signal-flow order for cables
 
         return ZStack {
             // Cable overlay — drawn behind blocks
@@ -780,7 +804,7 @@ struct EffectsView: View {
 
             // Grid of blocks
             LazyVGrid(columns: columns, spacing: 14) {
-                ForEach(items, id: \.id) { item in
+                ForEach(displayItems, id: \.id) { item in
                     switch item.kind {
                     case .terminal(let label, let icon):
                         terminalBlock(label: label, icon: icon, isInput: label == "INPUT")
