@@ -41,7 +41,7 @@ struct OutputRoutingView: View {
                             .overlay(Circle().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
-                    .help("Remove last output route")
+                    .help("Remove the last virtual output device and stop its routing")
                 }
 
                 // Add button
@@ -56,7 +56,7 @@ struct OutputRoutingView: View {
                             .overlay(Circle().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
-                    .help("Add output route (Loopbacker \(activeCount + 2))")
+                    .help("Add a new virtual output device (Loopbacker \(activeCount + 2)) for routing to a physical output")
                 }
             }
 
@@ -199,6 +199,7 @@ struct OutputRoutingView: View {
         .pickerStyle(.menu)
         .frame(maxWidth: .infinity, alignment: .leading)
         .tint(LoopbackerTheme.accent)
+        .help("Select the physical audio output device for this virtual device")
     }
 
     // MARK: - Enable toggle
@@ -242,6 +243,7 @@ struct OutputRoutingView: View {
             )
         }
         .buttonStyle(.plain)
+        .help(dest.isEnabled ? "Disable output routing for this virtual device" : "Enable output routing for this virtual device")
     }
 
     // MARK: - Helpers

@@ -43,13 +43,13 @@ struct ContentView: View {
 
     // MARK: - Audio routing sync
 
-    /// Starts/stops audio routing based on which sources are enabled and have routes
+    /// Starts/stops audio routing based on which sources are enabled, not muted, and have routes
     private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute]) {
         let routedSourceIDs = Set(routes.map(\.sourceId))
 
         for source in sources {
             let hasRoutes = routedSourceIDs.contains(source.id)
-            let shouldRoute = source.isEnabled && hasRoutes && !source.deviceUID.isEmpty
+            let shouldRoute = source.isEnabled && !source.isMuted && hasRoutes && !source.deviceUID.isEmpty
 
             if shouldRoute {
                 audioRouter.startRouting(sourceDeviceUID: source.deviceUID)
@@ -166,6 +166,7 @@ struct ContentView: View {
             .background(LoopbackerTheme.bgCard)
             .clipShape(Capsule())
             .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
+            .help("Virtual device audio format: 48 kHz sample rate, 32-bit float")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -238,7 +239,7 @@ struct ContentView: View {
                         .shadow(color: LoopbackerTheme.accentGlow, radius: 4)
                 }
                 .buttonStyle(.plain)
-                .help("Add audio source")
+                .help("Add an audio input device as a source for routing")
                 .popover(isPresented: $showSourcePicker) {
                     sourcePickerPopover
                 }

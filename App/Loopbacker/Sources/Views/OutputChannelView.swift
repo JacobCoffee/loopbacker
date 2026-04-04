@@ -112,7 +112,7 @@ struct OutputChannelView: View {
                         .overlay(Circle().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
                 }
                 .buttonStyle(.plain)
-                .help("Remove last output channel")
+                .help("Remove the last output channel and its routes")
             }
 
             // Add channel button
@@ -130,7 +130,7 @@ struct OutputChannelView: View {
                     .overlay(Circle().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
             }
             .buttonStyle(.plain)
-            .help("Add output channel")
+            .help("Add a new output channel to the virtual device")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

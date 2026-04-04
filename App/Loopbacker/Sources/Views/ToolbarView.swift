@@ -1,10 +1,12 @@
 import SwiftUI
+import AppKit
 
 struct ToolbarView: View {
     @EnvironmentObject var driverInstaller: DriverInstaller
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var routingState: RoutingState
+    @State private var showScenesPopover = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -18,11 +20,23 @@ struct ToolbarView: View {
 
             statusSection
 
+            sectionDivider
+
+            // MARK: - Scenes
+
+            scenesSection
+
             Spacer()
 
-            // MARK: - Right: Quick Route Actions
+            // MARK: - Quick Route Actions
 
             quickRouteSection
+
+            sectionDivider
+
+            // MARK: - Utility: Test / Debug
+
+            utilitySection
 
             sectionDivider
 
@@ -49,7 +63,8 @@ struct ToolbarView: View {
             dockButton(
                 label: "Stop All",
                 icon: "speaker.slash",
-                color: LoopbackerTheme.danger
+                color: LoopbackerTheme.danger,
+                tooltip: "Stop all audio routing and disconnect all routes"
             ) {
                 withAnimation {
                     audioRouter.stopAll()
@@ -60,7 +75,8 @@ struct ToolbarView: View {
             dockButton(
                 label: "Reconnect",
                 icon: "arrow.clockwise",
-                color: LoopbackerTheme.accent
+                color: LoopbackerTheme.accent,
+                tooltip: "Restart audio routing (fixes glitches after sleep/wake)"
             ) {
                 audioRouter.restartAllRoutes()
             }
@@ -68,7 +84,8 @@ struct ToolbarView: View {
             dockButton(
                 label: "Reload",
                 icon: "arrow.triangle.2.circlepath",
-                color: LoopbackerTheme.accent
+                color: LoopbackerTheme.accent,
+                tooltip: "Re-scan system audio devices for hotplugged hardware"
             ) {
                 audioDeviceManager.enumerateDevices()
             }
@@ -91,7 +108,7 @@ struct ToolbarView: View {
                         ? LoopbackerTheme.textMuted
                         : LoopbackerTheme.textPrimary)
             }
-            .help("\(routingState.routes.count) active route\(routingState.routes.count == 1 ? "" : "s")")
+            .help("\(routingState.routes.count) active route\(routingState.routes.count == 1 ? "" : "s") between sources and outputs")
 
             // Sample rate badge
             HStack(spacing: 3) {
@@ -106,6 +123,7 @@ struct ToolbarView: View {
             .background(LoopbackerTheme.bgInset)
             .clipShape(Capsule())
             .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
+            .help("Virtual device sample rate")
 
             // Underrun / health indicator
             HStack(spacing: 3) {
@@ -115,7 +133,7 @@ struct ToolbarView: View {
                         ? LoopbackerTheme.textMuted
                         : LoopbackerTheme.accent)
             }
-            .help(routingState.routes.isEmpty ? "No active routes" : "Audio healthy")
+            .help(routingState.routes.isEmpty ? "No active routes -- add sources and connect channels" : "Audio engine healthy, all routes active")
 
             // Driver status dot
             HStack(spacing: 4) {
@@ -128,6 +146,32 @@ struct ToolbarView: View {
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(LoopbackerTheme.textMuted)
             }
+            .help(driverStatusTooltip)
+        }
+    }
+
+    // MARK: - Scenes Section
+
+    private var scenesSection: some View {
+        HStack(spacing: 6) {
+            Button(action: { showScenesPopover.toggle() }) {
+                HStack(spacing: 3) {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Scenes")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundColor(LoopbackerTheme.accent)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(LoopbackerTheme.accent.opacity(0.1)))
+                .overlay(Capsule().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .help("Save, load, or delete routing presets (e.g. Podcast, Streaming, Discord)")
+            .popover(isPresented: $showScenesPopover) {
+                ScenesView()
+            }
         }
     }
 
@@ -138,7 +182,8 @@ struct ToolbarView: View {
             dockButton(
                 label: "Auto Stereo",
                 icon: "arrow.left.arrow.right",
-                color: LoopbackerTheme.accent
+                color: LoopbackerTheme.accent,
+                tooltip: "Auto-route first stereo input to output channels 1 & 2"
             ) {
                 autoRouteStereo()
             }
@@ -146,12 +191,37 @@ struct ToolbarView: View {
             dockButton(
                 label: "Disconnect",
                 icon: "xmark.circle",
-                color: LoopbackerTheme.warning
+                color: LoopbackerTheme.warning,
+                tooltip: "Remove all cable connections (keeps sources and outputs intact)"
             ) {
                 withAnimation {
                     audioRouter.stopAll()
                     routingState.disconnectAll()
                 }
+            }
+        }
+    }
+
+    // MARK: - Utility Section (Test Tone / Debug)
+
+    private var utilitySection: some View {
+        HStack(spacing: 6) {
+            dockButton(
+                label: "Test",
+                icon: "tuningfork",
+                color: LoopbackerTheme.accent,
+                tooltip: "Play a 1kHz test tone through the virtual device for 2 seconds"
+            ) {
+                audioRouter.playTestTone(duration: 2.0)
+            }
+
+            dockButton(
+                label: "Copy Debug",
+                icon: "doc.on.clipboard",
+                color: LoopbackerTheme.textSecondary,
+                tooltip: "Copy a diagnostic snapshot to the clipboard for troubleshooting"
+            ) {
+                copyDebugSnapshot()
             }
         }
     }
@@ -204,6 +274,9 @@ struct ToolbarView: View {
             }
             .buttonStyle(.plain)
             .disabled(driverInstaller.isProcessing)
+            .help(driverInstaller.isInstalled
+                  ? "Uninstall the Loopbacker audio driver (requires admin)"
+                  : "Install the Loopbacker audio driver (requires admin)")
 
             // Quit
             Button(action: {
@@ -222,6 +295,7 @@ struct ToolbarView: View {
                 .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
             }
             .buttonStyle(.plain)
+            .help("Quit Loopbacker completely (stops all audio routing)")
         }
     }
 
@@ -237,6 +311,7 @@ struct ToolbarView: View {
         label: String,
         icon: String,
         color: Color,
+        tooltip: String,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -253,7 +328,7 @@ struct ToolbarView: View {
             .overlay(Capsule().strokeBorder(color.opacity(0.3), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
-        .help(label)
+        .help(tooltip)
     }
 
     // MARK: - Driver status
@@ -275,6 +350,18 @@ struct ToolbarView: View {
             return "No driver"
         }
         return audioDeviceManager.loopbackerDevicePresent ? "Active" : "No device"
+    }
+
+    private var driverStatusTooltip: String {
+        if driverInstaller.isProcessing {
+            return "Driver operation in progress..."
+        }
+        if !driverInstaller.isInstalled {
+            return "Audio driver not installed -- click Install to set up"
+        }
+        return audioDeviceManager.loopbackerDevicePresent
+            ? "Loopbacker virtual audio device is active and visible to the system"
+            : "Driver installed but virtual device not detected -- try Reload"
     }
 
     // MARK: - Auto Route Stereo
@@ -321,5 +408,68 @@ struct ToolbarView: View {
             sourceChannelId: source.channels[1].id,
             outputChannelId: outChannels[1].id
         )
+    }
+
+    // MARK: - Debug Snapshot
+
+    private func copyDebugSnapshot() {
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+
+        var lines: [String] = []
+        lines.append("=== Loopbacker Debug Snapshot ===")
+        lines.append("App Version: \(appVersion) (\(buildNumber))")
+        lines.append("Date: \(ISO8601DateFormatter().string(from: Date()))")
+        lines.append("")
+
+        // Driver status
+        lines.append("-- Driver --")
+        lines.append("Installed: \(driverInstaller.isInstalled)")
+        lines.append("Virtual Device Present: \(audioDeviceManager.loopbackerDevicePresent)")
+        lines.append("")
+
+        // Sources
+        lines.append("-- Sources (\(routingState.sources.count)) --")
+        for source in routingState.sources {
+            let status = source.isEnabled ? (source.isMuted ? "MUTED" : "ON") : "OFF"
+            lines.append("  [\(status)] \(source.name) (\(source.channels.count)ch) uid=\(source.deviceUID)")
+        }
+        lines.append("")
+
+        // Routes
+        lines.append("-- Routes (\(routingState.routes.count)) --")
+        for route in routingState.routes {
+            let sourceName = routingState.sources.first(where: { $0.id == route.sourceId })?.name ?? "?"
+            lines.append("  \(sourceName) ch\(route.sourceChannelId) -> out ch\(route.outputChannelId)")
+        }
+        lines.append("")
+
+        // Output channels
+        lines.append("-- Output Channels (\(routingState.outputChannels.count)) --")
+        for ch in routingState.outputChannels {
+            lines.append("  ch\(ch.id) \(ch.label) active=\(ch.isActive)")
+        }
+        lines.append("")
+
+        // Output destinations
+        lines.append("-- Output Destinations (\(routingState.outputDestinations.count)) --")
+        for dest in routingState.outputDestinations {
+            let status = dest.isEnabled ? "ON" : "OFF"
+            lines.append("  [\(status)] \(dest.virtualDeviceName) -> \(dest.physicalOutputName) (\(dest.physicalOutputUID))")
+        }
+        lines.append("")
+
+        // System audio devices
+        lines.append("-- System Audio Devices (\(audioDeviceManager.systemDevices.count)) --")
+        for device in audioDeviceManager.systemDevices {
+            let io = [device.isInput ? "in:\(device.inputChannelCount)" : nil,
+                       device.isOutput ? "out:\(device.outputChannelCount)" : nil]
+                .compactMap { $0 }.joined(separator: " ")
+            lines.append("  \(device.name) [\(io)] uid=\(device.uid)")
+        }
+
+        let text = lines.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 }
