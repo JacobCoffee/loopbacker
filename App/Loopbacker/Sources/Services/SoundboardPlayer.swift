@@ -11,6 +11,7 @@ private let sbLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category:
 /// CoreAudio handles mixing multiple simultaneous sounds on the device side.
 class SoundboardPlayer: ObservableObject {
     @Published var playingIDs: Set<UUID> = []
+    @Published var meterLevel: Float = 0.0  // global output level for UI
 
     /// Global volume multiplier (0...1)
     var globalVolume: Float = 1.0
@@ -31,12 +32,14 @@ class SoundboardPlayer: ObservableObject {
     // MARK: - Per-sound playback context
 
     fileprivate class PlaybackContext {
-        var audioUnit: AudioComponentInstance?
+        var speakerUnit: AudioComponentInstance?   // plays through speakers (monitor)
+        var loopbackUnit: AudioComponentInstance?  // plays through virtual device (Discord/Zoom)
         var buffer: DecodedBuffer
         var readPosition: UInt32 = 0
         var volume: Float = 1.0
         var globalVolume: Float = 1.0
         var done: Bool = false
+        var meterLevel: Float = 0.0  // peak level for UI meter
         let itemID: UUID
 
         init(buffer: DecodedBuffer, itemID: UUID, volume: Float, globalVolume: Float) {
@@ -78,116 +81,112 @@ class SoundboardPlayer: ObservableObject {
 
     // MARK: - Internal playback
 
-    private func startPlayback(item: SoundboardItem) {
-        // Decode audio (or use cache)
-        guard let decoded = getOrDecodeBuffer(item: item) else {
-            sbLogger.error("Failed to decode audio for \(item.name)")
-            return
-        }
-
-        // Find the Loopbacker virtual device
-        guard let deviceID = findDeviceByUID("LoopbackerDevice_UID") else {
-            sbLogger.error("Loopbacker virtual device not found")
-            return
-        }
-
-        // Create playback context
-        let ctx = PlaybackContext(
-            buffer: decoded,
-            itemID: item.id,
-            volume: item.volume,
-            globalVolume: globalVolume
-        )
-
-        // Create AUHAL output unit targeting the Loopbacker device
+    /// Helper: create an AudioUnit with a render callback, optionally targeting a specific device
+    private func createOutputUnit(ctx: PlaybackContext, deviceID: AudioObjectID?, decoded: DecodedBuffer) -> AudioComponentInstance? {
+        let subType = deviceID != nil ? kAudioUnitSubType_HALOutput : kAudioUnitSubType_DefaultOutput
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
+            componentSubType: subType,
             componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0,
-            componentFlagsMask: 0
+            componentFlags: 0, componentFlagsMask: 0
         )
-
-        guard let component = AudioComponentFindNext(nil, &desc) else { return }
+        guard let component = AudioComponentFindNext(nil, &desc) else { return nil }
 
         var audioUnit: AudioComponentInstance?
         var status = AudioComponentInstanceNew(component, &audioUnit)
-        guard status == noErr, let unit = audioUnit else { return }
+        guard status == noErr, let unit = audioUnit else { return nil }
 
-        // Set output device
-        var devID = deviceID
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                                      kAudioUnitScope_Global, 0,
-                                      &devID, UInt32(MemoryLayout<AudioObjectID>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return }
+        // Target specific device if provided
+        if var devID = deviceID {
+            status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0,
+                                          &devID, UInt32(MemoryLayout<AudioObjectID>.size))
+            guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        }
 
-        // Set format: stereo float32 at the decoded sample rate
-        var streamFormat = AudioStreamBasicDescription(
-            mSampleRate: decoded.sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
+        // Format
+        var fmt = AudioStreamBasicDescription(
+            mSampleRate: decoded.sampleRate, mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: decoded.channelCount * 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: decoded.channelCount * 4,
-            mChannelsPerFrame: decoded.channelCount,
-            mBitsPerChannel: 32,
-            mReserved: 0
+            mBytesPerPacket: decoded.channelCount * 4, mFramesPerPacket: 1,
+            mBytesPerFrame: decoded.channelCount * 4, mChannelsPerFrame: decoded.channelCount,
+            mBitsPerChannel: 32, mReserved: 0
         )
-
         status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
                                       kAudioUnitScope_Input, 0,
-                                      &streamFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return }
+                                      &fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
 
-        // Set render callback
+        // Render callback (shared context - the speaker unit drives playback position)
         let contextPtr = Unmanaged.passRetained(ctx).toOpaque()
-        var callbackStruct = AURenderCallbackStruct(
-            inputProc: soundboardRenderCallback,
-            inputProcRefCon: contextPtr
-        )
-
+        var cb = AURenderCallbackStruct(inputProc: soundboardRenderCallback, inputProcRefCon: contextPtr)
         status = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
                                       kAudioUnitScope_Input, 0,
-                                      &callbackStruct, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+                                      &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
         guard status == noErr else {
             Unmanaged<PlaybackContext>.fromOpaque(contextPtr).release()
             AudioComponentInstanceDispose(unit)
-            return
+            return nil
         }
 
         status = AudioUnitInitialize(unit)
         guard status == noErr else {
             Unmanaged<PlaybackContext>.fromOpaque(contextPtr).release()
             AudioComponentInstanceDispose(unit)
+            return nil
+        }
+
+        return unit
+    }
+
+    private func startPlayback(item: SoundboardItem) {
+        guard let decoded = getOrDecodeBuffer(item: item) else {
+            sbLogger.error("Failed to decode audio for \(item.name)")
             return
         }
 
-        ctx.audioUnit = unit
+        let ctx = PlaybackContext(
+            buffer: decoded, itemID: item.id,
+            volume: item.volume, globalVolume: globalVolume
+        )
+
+        // Speaker unit (so user hears the sound)
+        guard let speakerUnit = createOutputUnit(ctx: ctx, deviceID: nil, decoded: decoded) else {
+            sbLogger.error("Failed to create speaker output unit")
+            return
+        }
+        ctx.speakerUnit = speakerUnit
+
+        // Loopback unit (so Discord/Zoom hears it)
+        if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
+            if let lbUnit = createOutputUnit(ctx: ctx, deviceID: loopbackDeviceID, decoded: decoded) {
+                ctx.loopbackUnit = lbUnit
+            }
+        }
+
         activePlaybacks[item.id] = ctx
 
         DispatchQueue.main.async { [weak self] in
             self?.playingIDs.insert(item.id)
         }
 
-        status = AudioOutputUnitStart(unit)
-        guard status == noErr else {
-            stopPlayback(id: item.id)
-            return
-        }
+        // Start speaker (drives the read position)
+        AudioOutputUnitStart(speakerUnit)
+        // Start loopback if available
+        if let lb = ctx.loopbackUnit { AudioOutputUnitStart(lb) }
 
         sbLogger.info("Playing: \(item.name)")
-
-        // Poll for completion
         pollForCompletion(id: item.id)
     }
 
     private func pollForCompletion(id: UUID) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30.0) { [weak self] in
             guard let self else { return }
             guard let ctx = self.activePlaybacks[id] else { return }
             if ctx.done {
                 self.stop(id: id)
             } else {
+                self.updateMeter()
                 self.pollForCompletion(id: id)
             }
         }
@@ -196,20 +195,35 @@ class SoundboardPlayer: ObservableObject {
     private func stopPlayback(id: UUID) {
         guard let ctx = activePlaybacks.removeValue(forKey: id) else { return }
 
-        if let unit = ctx.audioUnit {
+        // Tear down speaker unit
+        if let unit = ctx.speakerUnit {
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
+            Unmanaged.passUnretained(ctx).release()  // balance passRetained from createOutputUnit
         }
 
-        // Balance the passRetained
-        Unmanaged.passUnretained(ctx).release()
+        // Tear down loopback unit
+        if let unit = ctx.loopbackUnit {
+            AudioOutputUnitStop(unit)
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+            Unmanaged.passUnretained(ctx).release()  // balance passRetained
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.playingIDs.remove(id)
+            self?.updateMeter()
         }
+    }
 
-        sbLogger.info("Stopped: \(ctx.itemID)")
+    /// Update the published meter level from active playbacks
+    private func updateMeter() {
+        var maxLevel: Float = 0
+        for (_, ctx) in activePlaybacks {
+            if ctx.meterLevel > maxLevel { maxLevel = ctx.meterLevel }
+        }
+        meterLevel = maxLevel
     }
 
     // MARK: - Audio file decoding
@@ -353,13 +367,18 @@ private func soundboardRenderCallback(
     let toPlay = min(inNumberFrames, remaining)
     let vol = ctx.volume * ctx.globalVolume
 
-    // Copy decoded samples to output with volume
+    // Copy decoded samples to output with volume + track peak for meter
     let srcOffset = Int(ctx.readPosition) * chCount
+    var peak: Float = 0
     for i in 0..<Int(toPlay) {
         for ch in 0..<chCount {
-            outBuf[i * chCount + ch] = ctx.buffer.samples[srcOffset + i * chCount + ch] * vol
+            let sample = ctx.buffer.samples[srcOffset + i * chCount + ch] * vol
+            outBuf[i * chCount + ch] = sample
+            let abs = sample < 0 ? -sample : sample
+            if abs > peak { peak = abs }
         }
     }
+    ctx.meterLevel = peak
 
     // Zero-fill remainder if file ended
     if toPlay < inNumberFrames {

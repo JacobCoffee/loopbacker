@@ -68,12 +68,27 @@ class SoundboardState: ObservableObject {
         return state
     }
 
+    private static let soundsDirectoryURL: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Loopbacker", isDirectory: true)
+            .appendingPathComponent("sounds", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// Add a single file — copies it to app storage so the original can be deleted
     func addFile(url: URL) {
-        guard let item = SoundboardItem.from(url: url, sortIndex: items.count) else { return }
+        let dest = Self.soundsDirectoryURL.appendingPathComponent(url.lastPathComponent)
+        // Copy to app storage (skip if already there)
+        if !FileManager.default.fileExists(atPath: dest.path) {
+            try? FileManager.default.copyItem(at: url, to: dest)
+        }
+        guard let item = SoundboardItem.from(url: dest, sortIndex: items.count) else { return }
         items.append(item)
         save()
     }
 
+    /// Add all audio files from a folder — references them in-place (no copy)
     func addFolder(url: URL) {
         let extensions = Set(["mp3", "m4a", "wav", "aiff", "aif", "mp4", "caf", "flac"])
         guard let contents = try? FileManager.default.contentsOfDirectory(

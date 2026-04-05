@@ -8,6 +8,13 @@ struct SoundboardView: View {
 
     private let columns = [GridItem(.adaptive(minimum: 130, maximum: 170))]
 
+    private var meterColor: Color {
+        let level = soundboardPlayer.meterLevel
+        if level > 0.9 { return LoopbackerTheme.danger }
+        if level > 0.7 { return LoopbackerTheme.warning }
+        return LoopbackerTheme.accent
+    }
+
     var body: some View {
         ZStack {
             // Background
@@ -35,7 +42,13 @@ struct SoundboardView: View {
                                     soundboardPlayer.play(item: item)
                                 }
                                 .contextMenu {
-                                    Button("Remove") {
+                                    if let url = item.resolveURL() {
+                                        Button("Show in Finder") {
+                                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                                        }
+                                    }
+                                    Divider()
+                                    Button("Remove", role: .destructive) {
                                         soundboardPlayer.stop(id: item.id)
                                         soundboardState.remove(id: item.id)
                                     }
@@ -188,13 +201,21 @@ struct SoundboardView: View {
             .tint(LoopbackerTheme.accent)
             .frame(width: 120)
 
-            Text("Vol")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(LoopbackerTheme.textMuted)
+            // Output level meter
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(LoopbackerTheme.bgInset)
+                    .frame(width: 80, height: 6)
+
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(meterColor)
+                    .frame(width: 80 * CGFloat(min(soundboardPlayer.meterLevel, 1.0)), height: 6)
+                    .animation(.linear(duration: 0.05), value: soundboardPlayer.meterLevel)
+            }
 
             Spacer()
 
-            Text("Keys 1-9 trigger first 9 sounds")
+            Text("Sounds are copied to app storage")
                 .font(.system(size: 9))
                 .foregroundColor(LoopbackerTheme.textMuted)
 
