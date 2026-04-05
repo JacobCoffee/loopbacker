@@ -31,23 +31,33 @@ class SoundboardPlayer: ObservableObject {
 
     // MARK: - Per-sound playback context
 
-    fileprivate class PlaybackContext {
-        var speakerUnit: AudioComponentInstance?   // plays through speakers (monitor)
-        var loopbackUnit: AudioComponentInstance?  // plays through virtual device (Discord/Zoom)
+    /// One per audio unit — each has its own read position into the shared buffer
+    fileprivate class RenderState {
         var buffer: DecodedBuffer
         var readPosition: UInt32 = 0
         var volume: Float = 1.0
         var globalVolume: Float = 1.0
         var done: Bool = false
-        var meterLevel: Float = 0.0  // peak level for UI meter
-        let itemID: UUID
+        var meterLevel: Float = 0.0
 
-        init(buffer: DecodedBuffer, itemID: UUID, volume: Float, globalVolume: Float) {
+        init(buffer: DecodedBuffer, volume: Float, globalVolume: Float) {
             self.buffer = buffer
-            self.itemID = itemID
             self.volume = volume
             self.globalVolume = globalVolume
         }
+    }
+
+    fileprivate class PlaybackContext {
+        var speakerUnit: AudioComponentInstance?
+        var loopbackUnit: AudioComponentInstance?
+        var speakerState: RenderState?
+        var loopbackState: RenderState?
+        let itemID: UUID
+
+        var done: Bool { speakerState?.done ?? true }
+        var meterLevel: Float { speakerState?.meterLevel ?? 0 }
+
+        init(itemID: UUID) { self.itemID = itemID }
     }
 
     // MARK: - Public API
@@ -82,7 +92,7 @@ class SoundboardPlayer: ObservableObject {
     // MARK: - Internal playback
 
     /// Helper: create an AudioUnit with a render callback, optionally targeting a specific device
-    private func createOutputUnit(ctx: PlaybackContext, deviceID: AudioObjectID?, decoded: DecodedBuffer) -> AudioComponentInstance? {
+    private func createOutputUnit(state: RenderState, deviceID: AudioObjectID?, decoded: DecodedBuffer) -> AudioComponentInstance? {
         let subType = deviceID != nil ? kAudioUnitSubType_HALOutput : kAudioUnitSubType_DefaultOutput
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
@@ -117,8 +127,8 @@ class SoundboardPlayer: ObservableObject {
                                       &fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
         guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
 
-        // Render callback (shared context - the speaker unit drives playback position)
-        let contextPtr = Unmanaged.passRetained(ctx).toOpaque()
+        // Render callback — each unit gets its own RenderState
+        let contextPtr = Unmanaged.passRetained(state).toOpaque()
         var cb = AURenderCallbackStruct(inputProc: soundboardRenderCallback, inputProcRefCon: contextPtr)
         status = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
                                       kAudioUnitScope_Input, 0,
@@ -145,22 +155,23 @@ class SoundboardPlayer: ObservableObject {
             return
         }
 
-        let ctx = PlaybackContext(
-            buffer: decoded, itemID: item.id,
-            volume: item.volume, globalVolume: globalVolume
-        )
+        let ctx = PlaybackContext(itemID: item.id)
 
-        // Speaker unit (so user hears the sound)
-        guard let speakerUnit = createOutputUnit(ctx: ctx, deviceID: nil, decoded: decoded) else {
+        // Speaker state + unit (so user hears the sound)
+        let spkState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
+        guard let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) else {
             sbLogger.error("Failed to create speaker output unit")
             return
         }
         ctx.speakerUnit = speakerUnit
+        ctx.speakerState = spkState
 
-        // Loopback unit (so Discord/Zoom hears it)
+        // Loopback state + unit (so Discord/Zoom hears it) — independent read position
         if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
-            if let lbUnit = createOutputUnit(ctx: ctx, deviceID: loopbackDeviceID, decoded: decoded) {
+            let lbState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
+            if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
                 ctx.loopbackUnit = lbUnit
+                ctx.loopbackState = lbState
             }
         }
 
@@ -170,9 +181,7 @@ class SoundboardPlayer: ObservableObject {
             self?.playingIDs.insert(item.id)
         }
 
-        // Start speaker (drives the read position)
         AudioOutputUnitStart(speakerUnit)
-        // Start loopback if available
         if let lb = ctx.loopbackUnit { AudioOutputUnitStart(lb) }
 
         sbLogger.info("Playing: \(item.name)")
@@ -195,20 +204,24 @@ class SoundboardPlayer: ObservableObject {
     private func stopPlayback(id: UUID) {
         guard let ctx = activePlaybacks.removeValue(forKey: id) else { return }
 
-        // Tear down speaker unit
+        // Tear down speaker unit + state
         if let unit = ctx.speakerUnit {
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
-            Unmanaged.passUnretained(ctx).release()  // balance passRetained from createOutputUnit
+        }
+        if let state = ctx.speakerState {
+            Unmanaged.passUnretained(state).release()
         }
 
-        // Tear down loopback unit
+        // Tear down loopback unit + state
         if let unit = ctx.loopbackUnit {
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
             AudioComponentInstanceDispose(unit)
-            Unmanaged.passUnretained(ctx).release()  // balance passRetained
+        }
+        if let state = ctx.loopbackState {
+            Unmanaged.passUnretained(state).release()
         }
 
         DispatchQueue.main.async { [weak self] in
@@ -354,7 +367,7 @@ private func soundboardRenderCallback(
     inNumberFrames: UInt32,
     ioData: UnsafeMutablePointer<AudioBufferList>?
 ) -> OSStatus {
-    let ctx = Unmanaged<SoundboardPlayer.PlaybackContext>.fromOpaque(inRefCon).takeUnretainedValue()
+    let state = Unmanaged<SoundboardPlayer.RenderState>.fromOpaque(inRefCon).takeUnretainedValue()
     guard let bufferList = ioData else { return noErr }
 
     let abl = UnsafeMutableAudioBufferListPointer(bufferList)
@@ -362,32 +375,30 @@ private func soundboardRenderCallback(
         return noErr
     }
 
-    let chCount = Int(ctx.buffer.channelCount)
-    let remaining = ctx.buffer.frameCount - ctx.readPosition
+    let chCount = Int(state.buffer.channelCount)
+    let remaining = state.buffer.frameCount - state.readPosition
     let toPlay = min(inNumberFrames, remaining)
-    let vol = ctx.volume * ctx.globalVolume
+    let vol = state.volume * state.globalVolume
 
-    // Copy decoded samples to output with volume + track peak for meter
-    let srcOffset = Int(ctx.readPosition) * chCount
+    let srcOffset = Int(state.readPosition) * chCount
     var peak: Float = 0
     for i in 0..<Int(toPlay) {
         for ch in 0..<chCount {
-            let sample = ctx.buffer.samples[srcOffset + i * chCount + ch] * vol
+            let sample = state.buffer.samples[srcOffset + i * chCount + ch] * vol
             outBuf[i * chCount + ch] = sample
-            let abs = sample < 0 ? -sample : sample
-            if abs > peak { peak = abs }
+            let s = sample < 0 ? -sample : sample
+            if s > peak { peak = s }
         }
     }
-    ctx.meterLevel = peak
+    state.meterLevel = peak
 
-    // Zero-fill remainder if file ended
     if toPlay < inNumberFrames {
         let offset = Int(toPlay) * chCount
-        let remaining = Int(inNumberFrames - toPlay) * chCount
-        for j in 0..<remaining { outBuf[offset + j] = 0.0 }
-        ctx.done = true
+        let rem = Int(inNumberFrames - toPlay) * chCount
+        for j in 0..<rem { outBuf[offset + j] = 0.0 }
+        state.done = true
     }
 
-    ctx.readPosition += toPlay
+    state.readPosition += toPlay
     return noErr
 }
