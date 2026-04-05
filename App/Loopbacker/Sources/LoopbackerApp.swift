@@ -7,6 +7,8 @@ struct LoopbackerApp: App {
     @StateObject private var audioDeviceManager = AudioDeviceManager()
     @StateObject private var driverInstaller = DriverInstaller()
     @StateObject private var audioRouter = AudioRouter()
+    @StateObject private var soundboardState = SoundboardState.load()
+    @StateObject private var soundboardPlayer = SoundboardPlayer()
 
     var body: some Scene {
         WindowGroup {
@@ -15,6 +17,8 @@ struct LoopbackerApp: App {
                 .environmentObject(audioDeviceManager)
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
+                .environmentObject(soundboardState)
+                .environmentObject(soundboardPlayer)
                 .frame(minWidth: 800, minHeight: 500)
         }
         .windowStyle(.titleBar)

@@ -3,11 +3,13 @@ import SwiftUI
 enum AppTab: String, CaseIterable {
     case routing = "Routing"
     case effects = "Effects"
+    case soundboard = "Soundboard"
 
     var icon: String {
         switch self {
         case .routing: return "point.3.connected.trianglepath.dotted"
         case .effects: return "waveform.badge.magnifyingglass"
+        case .soundboard: return "music.quarternote.3"
         }
     }
 }
@@ -327,6 +329,9 @@ struct ContentView: View {
                 .transition(.opacity)
         case .effects:
             EffectsView()
+                .transition(.opacity)
+        case .soundboard:
+            SoundboardView()
                 .transition(.opacity)
         }
     }
