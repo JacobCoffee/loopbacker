@@ -17,7 +17,8 @@ class SoundboardPlayer: ObservableObject {
     var globalVolume: Float = 1.0
 
     private var activePlaybacks: [UUID: PlaybackContext] = [:]
-    private var decodedCache: [Data: DecodedBuffer] = [:]  // keyed by bookmark data
+    // No persistent cache — decode fresh each first play to avoid stale sample rates
+    private var decodedCache: [Data: DecodedBuffer] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.soundboard", qos: .userInteractive)
 
     // MARK: - Decoded audio buffer
@@ -172,7 +173,12 @@ class SoundboardPlayer: ObservableObject {
             if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
                 ctx.loopbackUnit = lbUnit
                 ctx.loopbackState = lbState
+                sbLogger.info("Loopback unit created for virtual device")
+            } else {
+                sbLogger.warning("Failed to create loopback unit — sound won't appear in Discord/Zoom")
             }
+        } else {
+            sbLogger.warning("Loopbacker virtual device not found — sound plays on speakers only")
         }
 
         activePlaybacks[item.id] = ctx
@@ -185,6 +191,7 @@ class SoundboardPlayer: ObservableObject {
         if let lb = ctx.loopbackUnit { AudioOutputUnitStart(lb) }
 
         sbLogger.info("Playing: \(item.name)")
+        print("[Soundboard] Playing: \(item.name) (speaker + loopback:\(ctx.loopbackUnit != nil))")
         pollForCompletion(id: item.id)
     }
 
@@ -256,30 +263,51 @@ class SoundboardPlayer: ObservableObject {
         let frameCount = UInt32(audioFile.length)
         guard frameCount > 0 else { return nil }
 
-        // Target format: stereo float32 at source sample rate
+        // Always decode to 48kHz stereo float32 to match the Loopbacker virtual device
+        let targetSampleRate: Double = 48000.0
         let channelCount: UInt32 = 2
+        // Estimate output frame count after resampling
+        let resampledFrameCount = UInt32(Double(frameCount) * targetSampleRate / srcFormat.sampleRate) + 256
         guard let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: srcFormat.sampleRate,
+            sampleRate: targetSampleRate,
             channels: AVAudioChannelCount(channelCount),
             interleaved: true
         ) else { return nil }
 
-        // Read into a buffer
-        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frameCount) else { return nil }
+        // Read the entire file into a non-interleaved buffer (AVAudioFile's native output)
+        let readFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: srcFormat.sampleRate,
+            channels: AVAudioChannelCount(srcFormat.channelCount),
+            interleaved: false
+        )!
+        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: frameCount) else { return nil }
         do {
             try audioFile.read(into: srcBuffer)
         } catch {
             sbLogger.error("Failed to read audio file: \(error)")
             return nil
         }
+        sbLogger.info("Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz, \(srcFormat.channelCount)ch")
+        print("[Soundboard] Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz")
 
-        // Convert to interleaved stereo float32
-        guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else { return nil }
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCount) else { return nil }
+        // Convert to interleaved stereo float32 at 48kHz
+        guard let converter = AVAudioConverter(from: readFormat, to: targetFormat) else {
+            sbLogger.error("Failed to create audio converter")
+            return nil
+        }
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: resampledFrameCount) else { return nil }
 
+        // Use the simple block-based conversion with proper data supply
+        var inputConsumed = false
         var convError: NSError?
         converter.convert(to: outBuffer, error: &convError) { _, outStatus in
+            if inputConsumed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            inputConsumed = true
             outStatus.pointee = .haveData
             return srcBuffer
         }
@@ -290,18 +318,27 @@ class SoundboardPlayer: ObservableObject {
         }
 
         let actualFrames = outBuffer.frameLength
+        guard actualFrames > 0 else {
+            sbLogger.error("Conversion produced 0 frames")
+            return nil
+        }
+        sbLogger.info("Converted to \(actualFrames) frames at 48kHz stereo")
+        print("[Soundboard] Converted to \(actualFrames) frames at 48kHz stereo")
+
         let totalSamples = Int(actualFrames * channelCount)
         let samples = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
 
-        // Copy interleaved data
+        // Copy to interleaved buffer
         if let floatData = outBuffer.floatChannelData {
             if targetFormat.isInterleaved {
                 memcpy(samples, floatData[0], totalSamples * MemoryLayout<Float>.size)
             } else {
-                // De-interleave: copy channel by channel
+                // Interleave from separate channel buffers
+                let srcChannels = Int(min(channelCount, UInt32(outBuffer.format.channelCount)))
                 for frame in 0..<Int(actualFrames) {
                     for ch in 0..<Int(channelCount) {
-                        samples[frame * Int(channelCount) + ch] = floatData[ch][frame]
+                        let srcCh = min(ch, srcChannels - 1)  // mono -> duplicate to both channels
+                        samples[frame * Int(channelCount) + ch] = floatData[srcCh][frame]
                     }
                 }
             }
@@ -311,7 +348,7 @@ class SoundboardPlayer: ObservableObject {
             samples: samples,
             frameCount: actualFrames,
             channelCount: channelCount,
-            sampleRate: srcFormat.sampleRate
+            sampleRate: targetSampleRate
         )
 
         decodedCache[item.fileBookmark] = decoded
