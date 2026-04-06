@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // Number of virtual devices this plugin exposes
-static const uint32_t kMaxDevices = 8;
+static const uint32_t kMaxDevices = 2;
 
 // Object IDs
 // Plugin itself is always kAudioObjectPlugInObject (1).
@@ -24,12 +24,6 @@ struct VirtualDeviceInfo {
 static const VirtualDeviceInfo kDeviceInfos[kMaxDevices] = {
     { "Loopbacker",   "LoopbackerDevice_UID",   10, 11, 12, 13 },
     { "Loopbacker 2", "LoopbackerDevice_UID_2", 20, 21, 22, 23 },
-    { "Loopbacker 3", "LoopbackerDevice_UID_3", 30, 31, 32, 33 },
-    { "Loopbacker 4", "LoopbackerDevice_UID_4", 40, 41, 42, 43 },
-    { "Loopbacker 5", "LoopbackerDevice_UID_5", 50, 51, 52, 53 },
-    { "Loopbacker 6", "LoopbackerDevice_UID_6", 60, 61, 62, 63 },
-    { "Loopbacker 7", "LoopbackerDevice_UID_7", 70, 71, 72, 73 },
-    { "Loopbacker 8", "LoopbackerDevice_UID_8", 80, 81, 82, 83 },
 };
 
 // Device metadata

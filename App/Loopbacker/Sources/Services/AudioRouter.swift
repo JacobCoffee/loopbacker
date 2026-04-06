@@ -204,13 +204,15 @@ class AudioRouter: ObservableObject {
             }
             // Retry with bounded attempts instead of a fixed 0.5s delay.
             // The audio system may take a variable amount of time to settle after wake.
-            self.retryRoutingAfterWake(sourceUIDs: uids, attempt: 0, maxAttempts: 3)
+            self.retryRoutingAfterWake(sourceUIDs: uids, attempt: 0, maxAttempts: 5)
         }
     }
 
-    /// Retry starting routes after wake with bounded attempts at 0.2s intervals.
+    /// Retry starting routes after wake with bounded attempts at increasing intervals.
     private func retryRoutingAfterWake(sourceUIDs: [String], attempt: Int, maxAttempts: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        // USB devices like MOTU M2 need more time to re-enumerate after wake
+        let delay = Double(attempt + 1) * 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             var failedUIDs: [String] = []
             for uid in sourceUIDs {
@@ -454,11 +456,19 @@ class AudioRouter: ObservableObject {
         }
 
         activeRoutes[sourceDeviceUID] = ctx
+
+        // Listen for sample rate changes on the capture device — auto-restart the route
+        // when the device rate changes (e.g., after sleep or another app changes it).
+        installSampleRateListener(deviceID: captureDeviceID, sourceDeviceUID: sourceDeviceUID)
+
         logger.info(" Started routing: \(sourceDeviceUID)")
     }
 
     private func stopRoutingInternal(sourceDeviceUID: String) {
         guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
+
+        // Remove sample rate listener for this device
+        removeSampleRateListener(deviceID: ctx.captureDeviceID)
 
         // Stop callbacks first, then dispose, then release the retained references.
         // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
@@ -979,6 +989,58 @@ class AudioRouter: ObservableObject {
         return Int(total)
     }
 
+    // MARK: - Sample rate change listener
+
+    /// Track which devices have a sample rate listener installed, to avoid duplicates
+    /// and to remove them on teardown.
+    private var sampleRateListeners: [AudioObjectID: String] = [:]  // deviceID -> sourceDeviceUID
+
+    private func installSampleRateListener(deviceID: AudioObjectID, sourceDeviceUID: String) {
+        // Remove existing listener if any
+        removeSampleRateListener(deviceID: deviceID)
+
+        sampleRateListeners[deviceID] = sourceDeviceUID
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        // The listener closure captures a weak ref to self to avoid retain cycles.
+        // We pass the deviceID as context so the C callback can identify which device changed.
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        AudioObjectAddPropertyListener(deviceID, &address, sampleRateChangeListener, selfPtr)
+    }
+
+    private func removeSampleRateListener(deviceID: AudioObjectID) {
+        guard sampleRateListeners.removeValue(forKey: deviceID) != nil else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        AudioObjectRemovePropertyListener(deviceID, &address, sampleRateChangeListener, selfPtr)
+    }
+
+    /// Called from the C listener callback when any monitored device changes sample rate.
+    fileprivate func handleSampleRateChange(deviceID: AudioObjectID) {
+        // Find which source UID this device corresponds to
+        guard let sourceUID = sampleRateListeners[deviceID] else { return }
+        let newRate = getDeviceSampleRate(deviceID)
+        logger.info("Sample rate changed on device \(deviceID) to \(newRate)Hz — restarting route for \(sourceUID)")
+
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stopRoutingInternal(sourceDeviceUID: sourceUID)
+            // Small delay to let the device settle at the new rate
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.startRouting(sourceDeviceUID: sourceUID)
+            }
+        }
+    }
+
     private func getDeviceSampleRate(_ deviceID: AudioObjectID) -> Float64 {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -993,6 +1055,20 @@ class AudioRouter: ObservableObject {
         }
         return sampleRate
     }
+}
+
+// MARK: - Sample rate change listener (C function)
+
+private func sampleRateChangeListener(
+    objectID: AudioObjectID,
+    numberAddresses: UInt32,
+    addresses: UnsafePointer<AudioObjectPropertyAddress>,
+    clientData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let clientData else { return noErr }
+    let router = Unmanaged<AudioRouter>.fromOpaque(clientData).takeUnretainedValue()
+    router.handleSampleRateChange(deviceID: objectID)
+    return noErr
 }
 
 // MARK: - Render callbacks (C functions)

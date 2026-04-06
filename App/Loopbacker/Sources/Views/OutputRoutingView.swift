@@ -7,10 +7,10 @@ struct OutputRoutingView: View {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
 
-    /// All available virtual devices (indices 2-8, device 1 is the main loopback)
-    private static let allVirtualDevices: [(uid: String, name: String)] = (2...8).map { i in
-        ("LoopbackerDevice_UID_\(i)", "Loopbacker \(i)")
-    }
+    /// All available virtual devices (device 1 is the main loopback, device 2 is for output routing)
+    private static let allVirtualDevices: [(uid: String, name: String)] = [
+        ("LoopbackerDevice_UID_2", "Loopbacker 2"),
+    ]
 
     /// How many virtual output devices are currently shown
     private var activeCount: Int {
