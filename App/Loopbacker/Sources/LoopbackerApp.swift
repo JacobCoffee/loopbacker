@@ -9,6 +9,7 @@ struct LoopbackerApp: App {
     @StateObject private var audioRouter = AudioRouter()
     @StateObject private var soundboardState = SoundboardState.load()
     @StateObject private var soundboardPlayer = SoundboardPlayer()
+    @StateObject private var appCaptureService = AppCaptureService()
 
     var body: some Scene {
         WindowGroup {
@@ -19,6 +20,7 @@ struct LoopbackerApp: App {
                 .environmentObject(audioRouter)
                 .environmentObject(soundboardState)
                 .environmentObject(soundboardPlayer)
+                .environmentObject(appCaptureService)
                 .frame(minWidth: 800, minHeight: 500)
         }
         .windowStyle(.titleBar)
@@ -30,6 +32,7 @@ struct LoopbackerApp: App {
                 .environmentObject(audioDeviceManager)
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
+                .environmentObject(appCaptureService)
         } label: {
             Image(systemName: "waveform.path")
         }

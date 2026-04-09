@@ -5,6 +5,7 @@ struct SourceCardView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
+    @EnvironmentObject var appCaptureService: AppCaptureService
     @State private var isHovering = false
     @State private var showOptions = false
 
@@ -98,9 +99,19 @@ struct SourceCardView: View {
                             .background(LoopbackerTheme.warning.opacity(0.15))
                             .clipShape(Capsule())
                     }
+
+                    if source.isAppCapture && !appCaptureService.isAppRunning(bundleID: source.appBundleID) {
+                        Text("NOT RUNNING")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundColor(LoopbackerTheme.textMuted)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(LoopbackerTheme.bgInset)
+                            .clipShape(Capsule())
+                    }
                 }
 
-                Text("\(source.channels.count) channel\(source.channels.count == 1 ? "" : "s")")
+                Text(source.isAppCapture ? "App Audio" : "\(source.channels.count) channel\(source.channels.count == 1 ? "" : "s")")
                     .font(.system(size: 10, weight: .regular))
                     .foregroundColor(LoopbackerTheme.textSecondary)
             }
@@ -157,19 +168,21 @@ struct SourceCardView: View {
             Divider()
                 .background(LoopbackerTheme.border)
 
-            // Monitor output picker
-            HStack(spacing: 6) {
-                Image(systemName: "speaker.wave.2")
-                    .font(.system(size: 10))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
+            // Monitor output picker (not available for app capture sources)
+            if !source.isAppCapture {
+                HStack(spacing: 6) {
+                    Image(systemName: "speaker.wave.2")
+                        .font(.system(size: 10))
+                        .foregroundColor(LoopbackerTheme.textSecondary)
 
-                Text("Monitor:")
-                    .font(.system(size: 11))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
+                    Text("Monitor:")
+                        .font(.system(size: 11))
+                        .foregroundColor(LoopbackerTheme.textSecondary)
 
-                monitorPicker
+                    monitorPicker
+                }
+                .tooltip("Hear this source through a physical output (speakers/headphones)")
             }
-            .tooltip("Hear this source through a physical output (speakers/headphones)")
 
             // Mute toggle
             HStack {

@@ -307,6 +307,149 @@ class AudioRouter: ObservableObject {
         }
     }
 
+    // MARK: - Public API (app audio capture)
+
+    /// Start routing audio from a running application (via ScreenCaptureKit) to the Loopbacker virtual device.
+    func startAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
+        let key = "app:\(bundleID)"
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.activeRoutes[key] == nil else { return }
+
+            // Find the Loopbacker virtual device for output
+            guard let playbackDeviceID = self.findDeviceByUID("LoopbackerDevice_UID") else {
+                logger.error("Loopbacker virtual device not found for app capture")
+                return
+            }
+
+            let sampleRate = self.getDeviceSampleRate(playbackDeviceID)
+            let channelCount: UInt32 = 2
+
+            // Create a RouteContext with no input AUHAL — SCStream replaces it
+            let ctx = RouteContext(
+                captureDeviceUID: key,
+                captureDeviceID: 0,
+                playbackDeviceID: playbackDeviceID,
+                playbackDeviceUID: "LoopbackerDevice_UID",
+                channelCount: channelCount,
+                sampleRate: sampleRate
+            )
+            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+
+            // App capture needs a much larger ring buffer than device routing.
+            // SCStream delivers audio on its own schedule with jitter, unlike
+            // the synchronized AUHAL input/output pair used for device routing.
+            // 16384 frames = ~340ms at 48kHz — enough cushion for jitter.
+            let appRingFrames: UInt32 = 16384  // must be power of 2
+            let appRingSamples = Int(appRingFrames * channelCount)
+            ctx.ringBuffer?.deallocate()
+            ctx.ringBufferFrames = appRingFrames
+            ctx.ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: appRingSamples)
+            ctx.ringBuffer?.initialize(repeating: 0.0, count: appRingSamples)
+
+            // Pre-advance writePos so the output side has a cushion before
+            // SCStream starts delivering. This prevents underruns during startup.
+            ctx.writePos = 2048  // ~42ms of silence cushion
+
+            // Allocate a larger render buffer for app capture (SCStream can deliver large chunks)
+            let largeBufferFrames: UInt32 = 8192
+            let largeBufferSamples = Int(largeBufferFrames * channelCount)
+            ctx.renderBuffer?.deallocate()
+            ctx.renderBufferFrames = largeBufferFrames
+            ctx.renderBuffer = UnsafeMutablePointer<Float>.allocate(capacity: largeBufferSamples)
+            ctx.renderBuffer?.initialize(repeating: 0.0, count: largeBufferSamples)
+
+            // Set up only the output AUHAL (SCStream provides the input)
+            guard self.setupOutputUnit(ctx) else {
+                logger.error("Failed to set up output unit for app capture")
+                return
+            }
+
+            if let u = ctx.outputUnit {
+                let status = AudioOutputUnitStart(u)
+                if status != noErr {
+                    logger.error("Failed to start output unit for app capture: \(status)")
+                    self.teardownUnit(&ctx.outputUnit)
+                    return
+                }
+            }
+            self.activeRoutes[key] = ctx
+
+            // Start SCStream capture, writing into this context's ring buffer
+            let ringWriter: (UnsafePointer<Float>, UInt32, UInt32) -> Void = { [weak ctx] buffer, frames, chCount in
+                guard let ctx = ctx, let renderBuf = ctx.renderBuffer else { return }
+
+                // Copy to render buffer for effects processing
+                let sampleCount = Int(frames * chCount)
+                let maxSamples = Int(ctx.renderBufferFrames * ctx.channelCount)
+                guard sampleCount <= maxSamples else {
+                    // Chunk is too large — process in pieces
+                    let maxFrames = ctx.renderBufferFrames
+                    var offset: UInt32 = 0
+                    while offset < frames {
+                        let chunk = min(maxFrames, frames - offset)
+                        let chunkSamples = Int(chunk * chCount)
+                        memcpy(renderBuf, buffer.advanced(by: Int(offset * chCount)), chunkSamples * MemoryLayout<Float>.size)
+                        ctx.effectsChain?.process(renderBuf, frames: chunk, channels: ctx.channelCount)
+                        ctx.computeRMS(from: renderBuf, frames: chunk)
+                        ctx.writeToRing(renderBuf, frames: chunk)
+                        offset += chunk
+                    }
+                    return
+                }
+
+                memcpy(renderBuf, buffer, sampleCount * MemoryLayout<Float>.size)
+                ctx.effectsChain?.process(renderBuf, frames: frames, channels: ctx.channelCount)
+                ctx.computeRMS(from: renderBuf, frames: frames)
+                ctx.writeToRing(renderBuf, frames: frames)
+            }
+
+            Task {
+                do {
+                    try await appCaptureService.startCapture(
+                        bundleID: bundleID,
+                        ringBufferWriter: ringWriter,
+                        sampleRate: sampleRate,
+                        channelCount: channelCount
+                    )
+                } catch {
+                    logger.error("Failed to start app capture for \(bundleID): \(error.localizedDescription)")
+                    // Clean up the route context on failure
+                    self.queue.async { [weak self] in
+                        self?.stopAppCaptureInternal(bundleID: bundleID)
+                    }
+                }
+            }
+
+            logger.info("Started app capture routing for \(bundleID)")
+        }
+    }
+
+    /// Stop app audio capture routing for a specific bundle.
+    func stopAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
+        queue.async { [weak self] in
+            self?.stopAppCaptureInternal(bundleID: bundleID)
+        }
+        Task {
+            await appCaptureService.stopCapture(bundleID: bundleID)
+        }
+    }
+
+    private func stopAppCaptureInternal(bundleID: String) {
+        let key = "app:\(bundleID)"
+        guard let ctx = activeRoutes.removeValue(forKey: key) else { return }
+
+        if let outputUnit = ctx.outputUnit {
+            AudioOutputUnitStop(outputUnit)
+        }
+        // Only release for the output unit (no input unit was created)
+        let hadOutput = ctx.outputUnit != nil
+        teardownUnit(&ctx.outputUnit)
+        if hadOutput { Unmanaged.passUnretained(ctx).release() }
+
+        logger.info("Stopped app capture routing for \(bundleID)")
+    }
+
     // MARK: - Effects
 
     /// Update the effects preset on all active route contexts.

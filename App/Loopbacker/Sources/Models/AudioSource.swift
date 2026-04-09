@@ -32,6 +32,12 @@ struct AudioChannel: Identifiable, Equatable, Codable {
 }
 
 struct AudioSource: Identifiable, Equatable, Codable {
+    /// Distinguishes hardware device sources from app audio capture sources
+    enum SourceType: String, Codable {
+        case device      // CoreAudio hardware device
+        case appCapture  // ScreenCaptureKit app audio
+    }
+
     let id: UUID
     var name: String
     var icon: String
@@ -39,11 +45,15 @@ struct AudioSource: Identifiable, Equatable, Codable {
     var isEnabled: Bool
     var isPassThrough: Bool
     var isMuted: Bool
-    /// The CoreAudio device UID for this source (used by AudioRouter)
+    /// The CoreAudio device UID for this source, or "app:<bundleID>" for app capture sources
     var deviceUID: String
     /// Physical output device UID for monitoring (hear yourself through speakers)
     var monitorOutputUID: String
     var monitorOutputName: String
+    /// Source type: hardware device or app audio capture
+    var sourceType: SourceType
+    /// Bundle identifier for app capture sources (empty for device sources)
+    var appBundleID: String
 
     init(
         id: UUID = UUID(),
@@ -55,7 +65,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
         isMuted: Bool = false,
         deviceUID: String = "",
         monitorOutputUID: String = "",
-        monitorOutputName: String = ""
+        monitorOutputName: String = "",
+        sourceType: SourceType = .device,
+        appBundleID: String = ""
     ) {
         self.id = id
         self.name = name
@@ -67,10 +79,15 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.deviceUID = deviceUID
         self.monitorOutputUID = monitorOutputUID
         self.monitorOutputName = monitorOutputName
+        self.sourceType = sourceType
+        self.appBundleID = appBundleID
     }
 
+    var isAppCapture: Bool { sourceType == .appCapture }
+
     enum CodingKeys: String, CodingKey {
-        case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID, monitorOutputUID, monitorOutputName
+        case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
+        case monitorOutputUID, monitorOutputName, sourceType, appBundleID
     }
 
     init(from decoder: Decoder) throws {
@@ -85,6 +102,24 @@ struct AudioSource: Identifiable, Equatable, Codable {
         deviceUID = try container.decode(String.self, forKey: .deviceUID)
         monitorOutputUID = (try? container.decode(String.self, forKey: .monitorOutputUID)) ?? ""
         monitorOutputName = (try? container.decode(String.self, forKey: .monitorOutputName)) ?? ""
+        sourceType = (try? container.decode(SourceType.self, forKey: .sourceType)) ?? .device
+        appBundleID = (try? container.decode(String.self, forKey: .appBundleID)) ?? ""
+    }
+
+    /// Create an AudioSource from a captured app
+    static func fromApp(_ app: CaptureApp) -> AudioSource {
+        AudioSource(
+            name: app.name,
+            icon: "app.badge.fill",
+            channels: [
+                AudioChannel(id: 1, label: "1 (L)"),
+                AudioChannel(id: 2, label: "2 (R)")
+            ],
+            isEnabled: true,
+            deviceUID: "app:\(app.id)",
+            sourceType: .appCapture,
+            appBundleID: app.id
+        )
     }
 }
 

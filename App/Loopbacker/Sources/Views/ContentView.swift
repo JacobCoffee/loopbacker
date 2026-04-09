@@ -18,6 +18,7 @@ struct ContentView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
+    @EnvironmentObject var appCaptureService: AppCaptureService
     @State private var showSourcePicker = false
     @State private var connectorPositions: [ConnectorEnd: CGRect] = [:]
     @State private var selectedTab: AppTab = .routing
@@ -121,15 +122,22 @@ struct ContentView: View {
             let shouldRoute = source.isEnabled && !source.isMuted && hasRoutes && !source.deviceUID.isEmpty
 
             if shouldRoute {
-                audioRouter.startRouting(sourceDeviceUID: source.deviceUID)
+                if source.isAppCapture {
+                    audioRouter.startAppCapture(bundleID: source.appBundleID, appCaptureService: appCaptureService)
+                } else {
+                    audioRouter.startRouting(sourceDeviceUID: source.deviceUID)
+                }
             } else {
-                if !source.deviceUID.isEmpty {
+                if source.isAppCapture {
+                    audioRouter.stopAppCapture(bundleID: source.appBundleID, appCaptureService: appCaptureService)
+                } else if !source.deviceUID.isEmpty {
                     audioRouter.stopRouting(sourceDeviceUID: source.deviceUID)
                 }
             }
 
             // Monitor: only manage stop. Start is handled by the picker in SourceCardView.
-            if !shouldRoute && !source.monitorOutputUID.isEmpty {
+            // (Monitoring not supported for app capture sources — they don't have a CoreAudio device)
+            if !shouldRoute && !source.monitorOutputUID.isEmpty && !source.isAppCapture {
                 audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(source.deviceUID)")
             }
         }
@@ -386,7 +394,13 @@ struct ContentView: View {
                 Spacer()
 
                 if !routingState.sources.isEmpty {
-                    Text("\(routingState.sources.count) device\(routingState.sources.count == 1 ? "" : "s")")
+                    let deviceCount = routingState.sources.filter { !$0.isAppCapture }.count
+                    let appCount = routingState.sources.filter { $0.isAppCapture }.count
+                    let parts = [
+                        deviceCount > 0 ? "\(deviceCount) device\(deviceCount == 1 ? "" : "s")" : nil,
+                        appCount > 0 ? "\(appCount) app\(appCount == 1 ? "" : "s")" : nil
+                    ].compactMap { $0 }
+                    Text(parts.joined(separator: ", "))
                         .font(.system(size: 10))
                         .foregroundColor(LoopbackerTheme.textMuted)
                 }
@@ -541,36 +555,181 @@ struct ContentView: View {
 
             Divider().background(LoopbackerTheme.border)
 
-            let inputDevices = audioDeviceManager.systemDevices.filter { $0.isInput && !$0.name.contains("Loopbacker") }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Section 1: Hardware devices
+                    Text("DEVICES")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                        .tracking(1.0)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                        .padding(.bottom, 4)
 
-            if inputDevices.isEmpty {
-                HStack {
-                    Spacer()
-                    VStack(spacing: 6) {
-                        Image(systemName: "speaker.slash")
-                            .font(.system(size: 20))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                        Text("No input devices found")
-                            .font(.system(size: 12))
-                            .foregroundColor(LoopbackerTheme.textMuted)
+                    let inputDevices = audioDeviceManager.systemDevices.filter { $0.isInput && !$0.name.contains("Loopbacker") }
+
+                    if inputDevices.isEmpty {
+                        HStack {
+                            Spacer()
+                            Text("No input devices found")
+                                .font(.system(size: 11))
+                                .foregroundColor(LoopbackerTheme.textMuted)
+                                .padding(.vertical, 8)
+                            Spacer()
+                        }
+                    } else {
+                        VStack(spacing: 2) {
+                            ForEach(inputDevices) { device in
+                                devicePickerRow(device)
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 20)
-                    Spacer()
+
+                    Divider().background(LoopbackerTheme.border).padding(.vertical, 4)
+
+                    // Section 2: App audio capture
+                    Text("APP AUDIO")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                        .tracking(1.0)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 4)
+
+                    if !appCaptureService.permissionGranted {
+                        permissionRequestRow
+                    } else if appCaptureService.availableApps.isEmpty {
+                        HStack {
+                            Spacer()
+                            VStack(spacing: 4) {
+                                Image(systemName: "app.dashed")
+                                    .font(.system(size: 16))
+                                    .foregroundColor(LoopbackerTheme.textMuted)
+                                Text("No apps detected")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(LoopbackerTheme.textMuted)
+                                Button("Refresh") {
+                                    Task { await appCaptureService.refreshApps() }
+                                }
+                                .font(.system(size: 10))
+                                .buttonStyle(.plain)
+                                .foregroundColor(LoopbackerTheme.accent)
+                            }
+                            .padding(.vertical, 8)
+                            Spacer()
+                        }
+                    } else {
+                        VStack(spacing: 2) {
+                            ForEach(appCaptureService.availableApps) { app in
+                                appPickerRow(app)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
                 }
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(inputDevices) { device in
-                            devicePickerRow(device)
+            }
+            .frame(maxHeight: 400)
+        }
+        .frame(width: 300)
+        .background(LoopbackerTheme.bgCard)
+        .onAppear {
+            Task { await appCaptureService.refreshApps() }
+        }
+    }
+
+    private var permissionRequestRow: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 14))
+                    .foregroundColor(LoopbackerTheme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Screen Recording Permission")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(LoopbackerTheme.textPrimary)
+                    Text("Required to capture audio from apps")
+                        .font(.system(size: 10))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("Grant Access") {
+                    Task {
+                        let granted = await appCaptureService.checkPermission()
+                        if granted {
+                            await appCaptureService.refreshApps()
                         }
                     }
-                    .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 300)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(LoopbackerTheme.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(LoopbackerTheme.accent.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .buttonStyle(.plain)
+
+                Button("Open Settings") {
+                    appCaptureService.openPermissionSettings()
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(LoopbackerTheme.textSecondary)
+                .buttonStyle(.plain)
             }
         }
-        .frame(width: 280)
-        .background(LoopbackerTheme.bgCard)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func appPickerRow(_ app: CaptureApp) -> some View {
+        let alreadyAdded = routingState.sources.contains { $0.appBundleID == app.id }
+
+        return Button(action: {
+            guard !alreadyAdded else { return }
+            let newSource = AudioSource.fromApp(app)
+            withAnimation(.easeInOut(duration: 0.2)) {
+                routingState.sources.append(newSource)
+                routingState.save()
+            }
+            showSourcePicker = false
+        }) {
+            HStack(spacing: 10) {
+                if let icon = app.icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                } else {
+                    Image(systemName: "app.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.accent)
+                        .frame(width: 20, height: 20)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(app.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.textPrimary)
+                    Text("App Audio")
+                        .font(.system(size: 10))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                }
+
+                Spacer()
+
+                if alreadyAdded {
+                    Text("Added")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(LoopbackerTheme.textMuted)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(alreadyAdded)
     }
 
     private func devicePickerRow(_ device: SystemAudioDevice) -> some View {

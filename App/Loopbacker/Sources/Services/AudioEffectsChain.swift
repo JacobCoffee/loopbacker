@@ -110,14 +110,13 @@ final class AudioEffectsChain {
     private var chorusWriteIdx: [Int]
     private var chorusLFOPhase: [Float]
 
-    // Pitch shift state per channel
+    // Pitch shift state per channel (overlap-add with grain phase tracking)
     private var pitchBuf: [[Float]]  // [ch][sample]
     private let pitchBufSize = 4096
     private let pitchBufMask = 4095
-    private let pitchGrainSize = 1024
     private var pitchWriteIdx: [Int]
-    private var pitchReadPhase: [[Float]]  // [ch][2 heads]
-    private var pitchCrossfade: [Float]
+    private var pitchReadPos: [[Float]]   // [ch][2 heads] - buffer read positions
+    private var pitchGrainPhase: [[Float]] // [ch][2 heads] - 0..1 phase within grain
 
     // Reverb state (Freeverb: 8 combs + 4 allpasses per channel)
     private let combCount = 8
@@ -174,11 +173,11 @@ final class AudioEffectsChain {
         chorusWriteIdx = [0, 0]
         chorusLFOPhase = [0.0, 0.25]  // ch1 offset 90 degrees for stereo width
 
-        // Pitch shift
+        // Pitch shift (two-head overlap-add)
         pitchBuf = [[Float](repeating: 0, count: 4096), [Float](repeating: 0, count: 4096)]
         pitchWriteIdx = [0, 0]
-        pitchReadPhase = [[0, 0], [0, 0]]
-        pitchCrossfade = [0, 0]
+        pitchReadPos = [[0, 0], [0, 0]]
+        pitchGrainPhase = [[0, 0.5], [0, 0.5]]  // heads offset by half grain
 
         // Reverb (Freeverb) — sizes scaled for 48kHz
         let stereoSpread = 23
@@ -259,7 +258,7 @@ final class AudioEffectsChain {
 
         // Reverb
         reverbEnabled = p.reverbEnabled
-        reverbFeedback = p.reverbRoomSize * 0.3 + 0.5   // maps 0..1 to 0.5..0.8 (less metallic)
+        reverbFeedback = p.reverbRoomSize * 0.28 + 0.7    // maps 0..1 to 0.7..0.98
         reverbDamp = p.reverbDamping * 0.4               // maps 0..1 to 0..0.4
         reverbMix = p.reverbMix
 
@@ -500,7 +499,7 @@ final class AudioEffectsChain {
         }
     }
 
-    // MARK: - Pitch Shift (low-latency two-tap crossfade)
+    // MARK: - Pitch Shift (two-head overlap-add with Hann window)
 
     private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
         let ratio = pitchRatio
@@ -508,75 +507,95 @@ final class AudioEffectsChain {
         guard fabsf(ratio - 1.0) > 0.001 else { return }
 
         let mask = pitchBufMask
-        // Small grain = low latency. 512 samples = ~10ms at 48kHz
-        let grain: Float = 512
-        let halfGrain: Float = 256
+        let bufSizeF = Float(pitchBufSize)
+        // Larger grain = smoother crossfades. 2048 samples = ~42ms at 48kHz
+        let grainSamples: Float = 2048
+        // How fast the grain phase advances: ratio=2 means read head moves 2x,
+        // so it outruns the write head by (ratio-1) samples per input sample.
+        // The grain phase must advance so that when it reaches 1.0, the head
+        // has drifted far enough to need resetting.
+        let phaseInc = fabsf(ratio - 1.0) / grainSamples
 
         for c in 0..<channels {
             var wIdx = pitchWriteIdx[c]
-            var rd0 = pitchReadPhase[c][0]
-            var rd1 = pitchReadPhase[c][1]
+            var rp0 = pitchReadPos[c][0]
+            var rp1 = pitchReadPos[c][1]
+            var gp0 = pitchGrainPhase[c][0]
+            var gp1 = pitchGrainPhase[c][1]
 
-            // Initialize: place read heads close to write head
-            if rd0 == 0 && rd1 == 0 && wIdx == 0 {
-                rd0 = Float(pitchBufSize) - halfGrain
-                rd1 = Float(pitchBufSize) - grain
+            // First-time init: place read heads behind write head
+            if rp0 == 0 && rp1 == 0 && wIdx == 0 {
+                let latency: Float = grainSamples * 0.75
+                rp0 = bufSizeF - latency
+                rp1 = bufSizeF - latency
+                gp0 = 0
+                gp1 = 0.5  // offset by half grain
             }
 
             for i in 0..<frames {
                 let idx = i * channels + c
                 let x = buf[idx]
 
+                // Write input to circular buffer
                 pitchBuf[c][wIdx] = x
 
-                // Linear interpolation reads
-                let i0 = Int(rd0) & mask, i0n = (i0 + 1) & mask
-                let f0 = rd0 - floorf(rd0)
-                let v0 = pitchBuf[c][i0] * (1.0 - f0) + pitchBuf[c][i0n] * f0
+                // Read from head 0 with linear interpolation
+                let ri0 = Int(rp0) & mask
+                let ri0n = (ri0 + 1) & mask
+                let f0 = rp0 - floorf(rp0)
+                let v0 = pitchBuf[c][ri0] * (1.0 - f0) + pitchBuf[c][ri0n] * f0
 
-                let i1 = Int(rd1) & mask, i1n = (i1 + 1) & mask
-                let f1 = rd1 - floorf(rd1)
-                let v1 = pitchBuf[c][i1] * (1.0 - f1) + pitchBuf[c][i1n] * f1
+                // Read from head 1 with linear interpolation
+                let ri1 = Int(rp1) & mask
+                let ri1n = (ri1 + 1) & mask
+                let f1 = rp1 - floorf(rp1)
+                let v1 = pitchBuf[c][ri1] * (1.0 - f1) + pitchBuf[c][ri1n] * f1
 
-                // Advance reads at pitch ratio
-                rd0 += ratio
-                rd1 += ratio
-                if rd0 >= Float(pitchBufSize) { rd0 -= Float(pitchBufSize) }
-                if rd0 < 0 { rd0 += Float(pitchBufSize) }
-                if rd1 >= Float(pitchBufSize) { rd1 -= Float(pitchBufSize) }
-                if rd1 < 0 { rd1 += Float(pitchBufSize) }
+                // Advance read positions at pitch ratio
+                rp0 += ratio
+                if rp0 >= bufSizeF { rp0 -= bufSizeF }
+                if rp0 < 0 { rp0 += bufSizeF }
+                rp1 += ratio
+                if rp1 >= bufSizeF { rp1 -= bufSizeF }
+                if rp1 < 0 { rp1 += bufSizeF }
 
-                // How far behind write head is each read?
-                var d0 = Float(wIdx) - rd0
-                if d0 < 0 { d0 += Float(pitchBufSize) }
-                if d0 > Float(pitchBufSize / 2) { d0 = Float(pitchBufSize) - d0 }
-                var d1 = Float(wIdx) - rd1
-                if d1 < 0 { d1 += Float(pitchBufSize) }
-                if d1 > Float(pitchBufSize / 2) { d1 = Float(pitchBufSize) - d1 }
+                // Advance grain phases
+                gp0 += phaseInc
+                gp1 += phaseInc
 
-                // Reset heads that drift out of the grain window
-                if d0 > grain || d0 < 1 {
-                    rd0 = Float(wIdx) - halfGrain
-                    if rd0 < 0 { rd0 += Float(pitchBufSize) }
+                // When a grain phase wraps past 1.0, reset that head to
+                // a safe position behind the write head. The phase wraps
+                // smoothly so the Hann window is at zero at the boundary.
+                if gp0 >= 1.0 {
+                    gp0 -= 1.0
+                    var newPos = Float(wIdx) - grainSamples * 0.75
+                    if newPos < 0 { newPos += bufSizeF }
+                    rp0 = newPos
                 }
-                if d1 > grain || d1 < 1 {
-                    rd1 = Float(wIdx) - grain
-                    if rd1 < 0 { rd1 += Float(pitchBufSize) }
+                if gp1 >= 1.0 {
+                    gp1 -= 1.0
+                    var newPos = Float(wIdx) - grainSamples * 0.75
+                    if newPos < 0 { newPos += bufSizeF }
+                    rp1 = newPos
                 }
 
-                // Crossfade: sine window peaks when head is mid-grain
-                let w0 = sinf(Float.pi * min(d0 / grain, 1.0))
-                let w1 = sinf(Float.pi * min(d1 / grain, 1.0))
-                let wSum = max(w0 + w1, 0.001)
-                let shifted = (v0 * w0 + v1 * w1) / wSum
+                // Hann window based on grain phase (0 at edges, 1 at center)
+                let w0 = 0.5 - 0.5 * cosf(2.0 * Float.pi * gp0)
+                let w1 = 0.5 - 0.5 * cosf(2.0 * Float.pi * gp1)
+
+                // With two heads offset by 0.5, Hann windows sum to ~1.0
+                let wSum = w0 + w1
+                let shifted = wSum > 0.001 ? (v0 * w0 + v1 * w1) / wSum : 0
 
                 buf[idx] = (1.0 - mix) * x + mix * shifted
                 wIdx = (wIdx + 1) & mask
             }
 
             pitchWriteIdx[c] = wIdx
-            pitchReadPhase[c][0] = rd0
-            pitchReadPhase[c][1] = rd1
+            pitchReadPos[c][0] = rp0
+            pitchReadPos[c][1] = rp1
+            pitchGrainPhase[c][0] = gp0
+            pitchGrainPhase[c][1] = gp1
         }
     }
 
@@ -587,8 +606,8 @@ final class AudioEffectsChain {
         let damp = reverbDamp
         let damp1 = 1.0 - damp
         let mix = reverbMix
-        let inputGain: Float = 0.015  // scale input to prevent buildup
-        let combScale: Float = 1.0 / Float(combCount)  // normalize comb sum
+        let inputGain: Float = 0.25   // scale input into comb network
+        let combScale: Float = 0.25  // normalize comb sum (keeps output near unity)
 
         for c in 0..<channels {
             for i in 0..<frames {
