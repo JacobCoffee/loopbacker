@@ -282,12 +282,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DefaultDeviceRestorer.shared.saveDefaults()
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if Self.shouldReallyQuit { return .terminateNow }
+        if Self.shouldReallyQuit {
+            DefaultDeviceRestorer.shared.restoreDefaultsIfNeeded()
+            return .terminateNow
+        }
         for window in NSApplication.shared.windows { window.close() }
         return .terminateCancel
     }

@@ -457,9 +457,11 @@ class AudioRouter: ObservableObject {
 
         activeRoutes[sourceDeviceUID] = ctx
 
-        // Listen for sample rate changes on the capture device — auto-restart the route
-        // when the device rate changes (e.g., after sleep or another app changes it).
+        // Listen for sample rate changes on both the capture device (M2) and the
+        // playback device (Loopbacker virtual) — auto-restart the route when either
+        // changes (e.g., after sleep, or when a browser forces a different rate).
         installSampleRateListener(deviceID: captureDeviceID, sourceDeviceUID: sourceDeviceUID)
+        installSampleRateListener(deviceID: playbackDeviceID, sourceDeviceUID: sourceDeviceUID)
 
         logger.info(" Started routing: \(sourceDeviceUID)")
     }
@@ -467,8 +469,9 @@ class AudioRouter: ObservableObject {
     private func stopRoutingInternal(sourceDeviceUID: String) {
         guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
 
-        // Remove sample rate listener for this device
+        // Remove sample rate listeners for both capture and playback devices
         removeSampleRateListener(deviceID: ctx.captureDeviceID)
+        removeSampleRateListener(deviceID: ctx.playbackDeviceID)
 
         // Stop callbacks first, then dispose, then release the retained references.
         // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
@@ -589,7 +592,7 @@ class AudioRouter: ObservableObject {
     /// Plays a 1kHz sine wave through the Loopbacker virtual device for the given duration.
     func playTestTone(duration: Double = 2.0) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard self != nil else { return }
 
             // Use the default system output (speakers) so the user can actually hear it
             var desc = AudioComponentDescription(

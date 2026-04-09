@@ -18,12 +18,13 @@ struct VirtualDeviceInfo {
     AudioObjectID deviceID;
     AudioObjectID inputStreamID;
     AudioObjectID outputStreamID;
-    AudioObjectID volumeControlID;
+    AudioObjectID volumeControlID;       // output scope
+    AudioObjectID inputVolumeControlID;  // input scope (shows "Input volume" in System Settings)
 };
 
 static const VirtualDeviceInfo kDeviceInfos[kMaxDevices] = {
-    { "Loopbacker",   "LoopbackerDevice_UID",   10, 11, 12, 13 },
-    { "Loopbacker 2", "LoopbackerDevice_UID_2", 20, 21, 22, 23 },
+    { "Loopbacker",   "LoopbackerDevice_UID",   10, 11, 12, 13, 14 },
+    { "Loopbacker 2", "LoopbackerDevice_UID_2", 20, 21, 22, 23, 24 },
 };
 
 // Device metadata
@@ -35,9 +36,10 @@ static const uint32_t kChannelCount    = 2;
 static const uint32_t kBitsPerChannel  = 32;
 static const uint32_t kBytesPerFrame   = kChannelCount * (kBitsPerChannel / 8); // 8
 
-// Supported sample rates
-static const Float64 kSampleRates[] = { 44100.0, 48000.0, 96000.0 };
-static const uint32_t kNumSampleRates = 3;
+// Supported sample rates — locked to 48kHz to prevent browsers (Firefox/Chrome)
+// from changing the rate and breaking active routes. Browsers resample on their end.
+static const Float64 kSampleRates[] = { 48000.0 };
+static const uint32_t kNumSampleRates = 1;
 static const Float64 kDefaultSampleRate = 48000.0;
 
 // Ring buffer

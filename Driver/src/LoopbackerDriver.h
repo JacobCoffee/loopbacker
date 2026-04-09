@@ -16,6 +16,7 @@ struct DeviceState {
     AudioObjectID inputStreamID;
     AudioObjectID outputStreamID;
     AudioObjectID volumeControlID;
+    AudioObjectID inputVolumeControlID;
 
     Float64 sampleRate;
     std::atomic<UInt32> ioIsRunning;       // number of active IO clients
@@ -36,6 +37,7 @@ struct DeviceState {
         , inputStreamID(0)
         , outputStreamID(0)
         , volumeControlID(0)
+        , inputVolumeControlID(0)
         , sampleRate(kDefaultSampleRate)
         , ioIsRunning(0)
         , ioCycleCount(0)
