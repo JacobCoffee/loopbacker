@@ -79,8 +79,10 @@ struct ContentView: View {
             // Apply saved effects preset to the audio router
             audioRouter.currentEffectsPreset = routingState.effectsPreset
             audioRouter.updateEffectsPreset(routingState.effectsPreset)
-            // Start routing for saved state after a brief settle
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            // Start routing for saved state after the audio system settles.
+            // After a driver reinstall, coreaudiod can take 2-3s to fully
+            // re-initialize. Starting too early blocks and hangs the app.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
                 syncOutputRouting(destinations: routingState.outputDestinations)
                 // Start monitoring for any sources that have a saved monitor output
@@ -120,6 +122,16 @@ struct ContentView: View {
         for source in sources {
             let hasRoutes = routedSourceIDs.contains(source.id)
             let shouldRoute = source.isEnabled && !source.isMuted && hasRoutes && !source.deviceUID.isEmpty
+
+            // Push the per-source channel mix matrix so the engine knows how to
+            // fan source channels into output channels (handles mono→stereo, cross-routing).
+            let sourceRoutes: [(srcCh: Int, dstCh: Int)] = routes
+                .filter { $0.sourceId == source.id }
+                .map { (srcCh: $0.sourceChannelId, dstCh: $0.outputChannelId) }
+            let mixUID = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
+            if !mixUID.isEmpty {
+                audioRouter.setChannelMix(sourceDeviceUID: mixUID, routes: sourceRoutes)
+            }
 
             if shouldRoute {
                 if source.isAppCapture {

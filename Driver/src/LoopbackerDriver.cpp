@@ -94,6 +94,8 @@ LoopbackerDriver::LoopbackerDriver()
         mDevices[i].volume           = 1.0f;
         mDevices[i].mute             = false;
         mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames, kBytesPerFrame);
+        mDevices[i].snapshotBuffer.resize(kDefaultIOBufferFrames * kChannelCount, 0.0f);
+        mDevices[i].needsSnapshot.store(false, std::memory_order_relaxed);
         mDevices[i].anchorHostTime   = 0;
         mDevices[i].hostTicksPerFrame = 0.0;
     }
@@ -976,9 +978,16 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID) ? 1 : 0);
 
                 case kAudioStreamPropertyTerminalType:
+                    // USB Audio Class generic terminals (INPUT_UNDEFINED 0x0200 /
+                    // OUTPUT_UNDEFINED 0x0300). Reporting Microphone/Speaker makes
+                    // macOS Voice Processing IO (FaceTime, Phone, iPhone-relay)
+                    // treat this virtual device as a real mic/speaker candidate;
+                    // its AEC/voice-isolation engine then mis-models the chain,
+                    // gates the user's real mic to near-silence, and reports
+                    // "Voice Isolation / Wide Spectrum currently unavailable."
                     WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID)
-                               ? kAudioStreamTerminalTypeMicrophone
-                               : kAudioStreamTerminalTypeSpeaker);
+                               ? 0x0200u   // INPUT_UNDEFINED
+                               : 0x0300u); // OUTPUT_UNDEFINED
 
                 case kAudioStreamPropertyStartingChannel:
                     WRITE_PROP(UInt32, 1);
@@ -1295,6 +1304,8 @@ OSStatus LoopbackerDriver::StartIO(AudioServerPlugInDriverRef inDriver,
         dev->ioCycleCount = 0;
         dev->anchorHostTime = mach_absolute_time();
         dev->ringBuffer->reset();
+        std::fill(dev->snapshotBuffer.begin(), dev->snapshotBuffer.end(), 0.0f);
+        dev->needsSnapshot.store(false, std::memory_order_relaxed);
     }
     return kAudioHardwareNoError;
 }
@@ -1391,27 +1402,44 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
         case kAudioServerPlugInIOOperationWriteMix: {
             auto* samples = static_cast<const float*>(ioMainBuffer);
             dev->ringBuffer->write(samples, inIOBufferFrameSize);
+            // Signal that fresh data is available for readers to snapshot
+            dev->needsSnapshot.store(true, std::memory_order_release);
             break;
         }
 
         case kAudioServerPlugInIOOperationReadInput: {
             auto* samples = static_cast<float*>(ioMainBuffer);
-            uint32_t framesRead = dev->ringBuffer->read(samples, inIOBufferFrameSize);
-            if (framesRead < inIOBufferFrameSize) {
-                uint32_t remainingSamples = (inIOBufferFrameSize - framesRead) * kChannelCount;
-                memset(&samples[framesRead * kChannelCount], 0,
-                       remainingSamples * sizeof(float));
-            }
 
-            // Apply volume & mute to output samples
-            float vol = dev->volume;
-            if (dev->mute) vol = 0.0f;
-            if (vol < 1.0f) {
-                uint32_t totalSamples = inIOBufferFrameSize * kChannelCount;
-                for (uint32_t i = 0; i < totalSamples; ++i) {
-                    samples[i] *= vol;
+            // Snapshot the ring buffer once per IO cycle. The first reader
+            // atomically claims the snapshot; all subsequent readers in the
+            // same cycle get the same data. This allows multiple apps (Meet,
+            // Granola, output routing) to read identical audio.
+            bool expected = true;
+            if (dev->needsSnapshot.compare_exchange_strong(expected, false,
+                    std::memory_order_acq_rel)) {
+                // First reader this cycle — consume from ring buffer into snapshot
+                uint32_t framesRead = dev->ringBuffer->read(
+                    dev->snapshotBuffer.data(), inIOBufferFrameSize);
+                if (framesRead < inIOBufferFrameSize) {
+                    uint32_t rem = (inIOBufferFrameSize - framesRead) * kChannelCount;
+                    memset(&dev->snapshotBuffer[framesRead * kChannelCount], 0,
+                           rem * sizeof(float));
+                }
+
+                // Apply volume & mute once (into the snapshot)
+                float vol = dev->volume;
+                if (dev->mute) vol = 0.0f;
+                if (vol < 1.0f) {
+                    uint32_t totalSamples = inIOBufferFrameSize * kChannelCount;
+                    for (uint32_t i = 0; i < totalSamples; ++i) {
+                        dev->snapshotBuffer[i] *= vol;
+                    }
                 }
             }
+
+            // All readers get the same snapshot
+            memcpy(samples, dev->snapshotBuffer.data(),
+                   static_cast<size_t>(inIOBufferFrameSize) * kBytesPerFrame);
             break;
         }
 

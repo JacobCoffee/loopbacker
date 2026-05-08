@@ -27,6 +27,11 @@ struct DeviceState {
 
     std::unique_ptr<RingBuffer> ringBuffer;
 
+    // Snapshot buffer for broadcast reads: all ReadInput clients in the same
+    // IO cycle get the same data instead of each consuming from the ring buffer.
+    std::vector<float> snapshotBuffer;
+    std::atomic<bool>  needsSnapshot;      // set by WriteMix, cleared by first ReadInput
+
     UInt64  anchorHostTime;                // mach_absolute_time at IO start
     Float64 hostTicksPerFrame;             // host ticks per sample frame
 
@@ -43,6 +48,7 @@ struct DeviceState {
         , ioCycleCount(0)
         , volume(1.0f)
         , mute(false)
+        , needsSnapshot(false)
         , anchorHostTime(0)
         , hostTicksPerFrame(0.0)
     {

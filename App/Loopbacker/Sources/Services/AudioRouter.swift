@@ -9,7 +9,7 @@ private let logger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "
 
 /// Routes audio from real input devices to the Loopbacker virtual output device,
 /// providing real-time meter levels back to the UI.
-class AudioRouter: ObservableObject {
+class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Published state
 
     /// Per-source meter levels: [sourceDeviceUID: [channelIndex: level]]
@@ -28,6 +28,11 @@ class AudioRouter: ObservableObject {
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
 
+    /// Per-source channel mix saved from the UI. Applied when the route is (re)started,
+    /// and pushed live to the running route via `mixMatrix` if it's already active.
+    /// Key = sourceDeviceUID (or "app:<bundle>" for app captures).
+    private var pendingMixMatrices: [String: [(srcCh: Int, dstCh: Int)]] = [:]
+
     /// Holds the CoreAudio resources for a single source -> destination route
     fileprivate class RouteContext {
         var inputUnit: AudioComponentInstance?
@@ -41,7 +46,7 @@ class AudioRouter: ObservableObject {
 
         // Ring buffer for passing audio from input callback to output callback
         var ringBuffer: UnsafeMutablePointer<Float>?
-        var ringBufferFrames: UInt32 = 2048  // ~42ms at 48kHz - low latency
+        var ringBufferFrames: UInt32 = 4096  // ~85ms at 48kHz - enough cushion for jitter
         var writePos: UInt32 = 0
         var readPos: UInt32 = 0
 
@@ -53,8 +58,20 @@ class AudioRouter: ObservableObject {
         var effectsChain: AudioEffectsChain?
 
         // Meter levels -- C buffer for thread safety (written from RT thread, read from main)
+        // Pre-mix levels reflect the raw input per source channel (drives source meter).
         var meterLevelsPtr: UnsafeMutablePointer<Float>?
         var meterChannelCount: Int = 0
+
+        // Post-mix per-output-channel levels (drives the output channel meter so it
+        // reflects what's actually being sent to the virtual device).
+        var outMeterLevelsPtr: UnsafeMutablePointer<Float>?
+
+        // 2x2 channel mix matrix in row-major order:
+        //   [dst0_src0, dst0_src1, dst1_src0, dst1_src1]
+        // Identity = [1, 0, 0, 1] (passthrough). The UI's per-channel routing fills
+        // this so a single source channel can fan out to both outputs (mono fold)
+        // or be cross-routed without touching the input clamp.
+        var mixMatrix: UnsafeMutablePointer<Float>?
 
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", channelCount: UInt32, sampleRate: Float64) {
@@ -69,9 +86,23 @@ class AudioRouter: ObservableObject {
             meterLevelsPtr = UnsafeMutablePointer<Float>.allocate(capacity: meterChannelCount)
             meterLevelsPtr?.initialize(repeating: 0.0, count: meterChannelCount)
 
+            outMeterLevelsPtr = UnsafeMutablePointer<Float>.allocate(capacity: meterChannelCount)
+            outMeterLevelsPtr?.initialize(repeating: 0.0, count: meterChannelCount)
+
+            mixMatrix = UnsafeMutablePointer<Float>.allocate(capacity: 4)
+            // Identity matrix: dst0 = src0, dst1 = src1
+            mixMatrix?[0] = 1.0
+            mixMatrix?[1] = 0.0
+            mixMatrix?[2] = 0.0
+            mixMatrix?[3] = 1.0
+
             let totalSamples = Int(ringBufferFrames * channelCount)
             ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
             ringBuffer?.initialize(repeating: 0.0, count: totalSamples)
+
+            // Pre-advance writePos so output side has a cushion of silence
+            // before real data arrives — prevents underruns during startup
+            writePos = 1024  // ~21ms cushion at 48kHz
 
             // Pre-allocate render buffer for max expected IO size
             let renderSamples = Int(renderBufferFrames * channelCount)
@@ -86,6 +117,8 @@ class AudioRouter: ObservableObject {
             if let buf = ringBuffer { buf.deallocate() }
             if let buf = renderBuffer { buf.deallocate() }
             if let buf = meterLevelsPtr { buf.deallocate() }
+            if let buf = outMeterLevelsPtr { buf.deallocate() }
+            if let buf = mixMatrix { buf.deallocate() }
         }
 
         func writeToRing(_ data: UnsafePointer<Float>, frames: UInt32) {
@@ -135,22 +168,46 @@ class AudioRouter: ObservableObject {
         }
 
         func computeRMS(from buffer: UnsafePointer<Float>, frames: UInt32) {
+            computePeak(from: buffer, frames: frames, into: meterLevelsPtr)
+        }
+
+        func computeOutRMS(from buffer: UnsafePointer<Float>, frames: UInt32) {
+            computePeak(from: buffer, frames: frames, into: outMeterLevelsPtr)
+        }
+
+        private func computePeak(from buffer: UnsafePointer<Float>,
+                                 frames: UInt32,
+                                 into levelsOpt: UnsafeMutablePointer<Float>?) {
             let chCount = Int(channelCount)
-            guard chCount > 0 && frames > 0, let levels = meterLevelsPtr else { return }
+            guard chCount > 0 && frames > 0, let levels = levelsOpt else { return }
 
             for ch in 0..<chCount {
-                // Peak detection (more responsive than RMS for meters)
                 var peak: Float = 0.0
                 for i in 0..<Int(frames) {
                     let s = fabsf(buffer[i * chCount + ch])
                     if s > peak { peak = s }
                 }
-                // Map dB to 0..1: -60dB=0, 0dB=1
                 let db = peak > 0.00001 ? 20.0 * log10f(peak) : -100.0
                 let normalized = max(0.0, min(1.0, (db + 60.0) / 60.0))
-                // Fast attack, slow release
                 let prev = levels[ch]
                 levels[ch] = normalized > prev ? normalized : prev * 0.93 + normalized * 0.07
+            }
+        }
+
+        /// Apply the 2x2 channel mix matrix in place. No-op for non-stereo buffers.
+        /// The matrix is written from the main thread and read here on the RT thread;
+        /// races across routing changes manifest as at most a single glitch-free cycle
+        /// with a half-applied matrix, which is inaudible.
+        func applyMix(_ buffer: UnsafeMutablePointer<Float>, frames: UInt32) {
+            guard channelCount == 2, let m = mixMatrix else { return }
+            let m00 = m[0], m01 = m[1], m10 = m[2], m11 = m[3]
+            // Skip the work when the matrix is identity.
+            if m00 == 1.0 && m01 == 0.0 && m10 == 0.0 && m11 == 1.0 { return }
+            for i in 0..<Int(frames) {
+                let s0 = buffer[i * 2 + 0]
+                let s1 = buffer[i * 2 + 1]
+                buffer[i * 2 + 0] = m00 * s0 + m01 * s1
+                buffer[i * 2 + 1] = m10 * s0 + m11 * s1
             }
         }
     }
@@ -374,6 +431,9 @@ class AudioRouter: ObservableObject {
                 }
             }
             self.activeRoutes[key] = ctx
+            if let pending = self.pendingMixMatrices[key] {
+                self.applyMixToContext(ctx, routes: pending)
+            }
 
             // Start SCStream capture, writing into this context's ring buffer
             let ringWriter: (UnsafePointer<Float>, UInt32, UInt32) -> Void = { [weak ctx] buffer, frames, chCount in
@@ -392,6 +452,8 @@ class AudioRouter: ObservableObject {
                         memcpy(renderBuf, buffer.advanced(by: Int(offset * chCount)), chunkSamples * MemoryLayout<Float>.size)
                         ctx.effectsChain?.process(renderBuf, frames: chunk, channels: ctx.channelCount)
                         ctx.computeRMS(from: renderBuf, frames: chunk)
+                        ctx.applyMix(renderBuf, frames: chunk)
+                        ctx.computeOutRMS(from: renderBuf, frames: chunk)
                         ctx.writeToRing(renderBuf, frames: chunk)
                         offset += chunk
                     }
@@ -401,10 +463,13 @@ class AudioRouter: ObservableObject {
                 memcpy(renderBuf, buffer, sampleCount * MemoryLayout<Float>.size)
                 ctx.effectsChain?.process(renderBuf, frames: frames, channels: ctx.channelCount)
                 ctx.computeRMS(from: renderBuf, frames: frames)
+                ctx.applyMix(renderBuf, frames: frames)
+                ctx.computeOutRMS(from: renderBuf, frames: frames)
                 ctx.writeToRing(renderBuf, frames: frames)
             }
 
-            Task {
+            Task { [weak self] in
+                guard let self else { return }
                 do {
                     try await appCaptureService.startCapture(
                         bundleID: bundleID,
@@ -414,9 +479,8 @@ class AudioRouter: ObservableObject {
                     )
                 } catch {
                     logger.error("Failed to start app capture for \(bundleID): \(error.localizedDescription)")
-                    // Clean up the route context on failure
-                    self.queue.async { [weak self] in
-                        self?.stopAppCaptureInternal(bundleID: bundleID)
+                    self.queue.async {
+                        self.stopAppCaptureInternal(bundleID: bundleID)
                     }
                 }
             }
@@ -448,6 +512,39 @@ class AudioRouter: ObservableObject {
         if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
         logger.info("Stopped app capture routing for \(bundleID)")
+    }
+
+    // MARK: - Channel routing
+
+    /// Push the per-source channel mix from the UI's route graph into the audio engine.
+    /// `routes` is a list of (sourceChannel, outputChannel) 1-indexed pairs for a single source.
+    /// An empty list falls back to identity passthrough (src1→out1, src2→out2).
+    /// Applied immediately if the route is active, and cached so it's re-applied on restart.
+    func setChannelMix(sourceDeviceUID: String, routes: [(srcCh: Int, dstCh: Int)]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.pendingMixMatrices[sourceDeviceUID] = routes
+            if let ctx = self.activeRoutes[sourceDeviceUID] {
+                self.applyMixToContext(ctx, routes: routes)
+            }
+        }
+    }
+
+    /// Write the mix matrix cells for a route context from a route list.
+    private func applyMixToContext(_ ctx: RouteContext, routes: [(srcCh: Int, dstCh: Int)]) {
+        guard let m = ctx.mixMatrix else { return }
+        if routes.isEmpty {
+            // Default passthrough: src1→out1, src2→out2
+            m[0] = 1.0; m[1] = 0.0; m[2] = 0.0; m[3] = 1.0
+            return
+        }
+        m[0] = 0.0; m[1] = 0.0; m[2] = 0.0; m[3] = 0.0
+        for r in routes {
+            let dst = r.dstCh - 1   // 1-indexed in the UI, 0-indexed here
+            let src = r.srcCh - 1
+            guard (0...1).contains(dst), (0...1).contains(src) else { continue }
+            m[dst * 2 + src] = 1.0
+        }
     }
 
     // MARK: - Effects
@@ -496,13 +593,22 @@ class AudioRouter: ObservableObject {
             for i in 0..<ctx.meterChannelCount {
                 let level = levels[i]
                 channelLevels[i + 1] = level
-                let existingOutput = newOutputLevels[i + 1] ?? 0.0
-                newOutputLevels[i + 1] = max(existingOutput, level)
-                // Decay
+                // Decay source meter
                 levels[i] = level * 0.85
                 if levels[i] < 0.001 { levels[i] = 0.0 }
             }
             newSourceLevels[uid] = channelLevels
+
+            // Output meter takes post-mix levels (sum across sources via max).
+            if let outLevels = ctx.outMeterLevelsPtr {
+                for i in 0..<ctx.meterChannelCount {
+                    let outLevel = outLevels[i]
+                    let existing = newOutputLevels[i + 1] ?? 0.0
+                    newOutputLevels[i + 1] = max(existing, outLevel)
+                    outLevels[i] = outLevel * 0.85
+                    if outLevels[i] < 0.001 { outLevels[i] = 0.0 }
+                }
+            }
         }
 
         // Include output route meters
@@ -598,13 +704,22 @@ class AudioRouter: ObservableObject {
             }
         }
 
+        // Restore any previously-configured channel mix for this source so it survives
+        // restarts (wake, sample rate change) without the UI having to reapply it.
+        if let pending = pendingMixMatrices[sourceDeviceUID] {
+            applyMixToContext(ctx, routes: pending)
+        }
+
         activeRoutes[sourceDeviceUID] = ctx
 
-        // Listen for sample rate changes on both the capture device (M2) and the
-        // playback device (Loopbacker virtual) — auto-restart the route when either
-        // changes (e.g., after sleep, or when a browser forces a different rate).
+        // Listen for sample rate changes on the capture device only — auto-restart
+        // the route when the hardware rate changes (e.g., after sleep).
+        // NOTE: Do NOT listen on the playback (Loopbacker) device. Apps like Chrome/Meet
+        // can force rate changes on the virtual device, which would cause a restart loop
+        // (stop → 0.3s gap → restart → rate changes again) producing crackling and
+        // breaking transcription apps (Granola, Fellow) that read from the device.
+        // Wake-related rate changes are already handled by restartAllRoutes().
         installSampleRateListener(deviceID: captureDeviceID, sourceDeviceUID: sourceDeviceUID)
-        installSampleRateListener(deviceID: playbackDeviceID, sourceDeviceUID: sourceDeviceUID)
 
         logger.info(" Started routing: \(sourceDeviceUID)")
     }
@@ -612,9 +727,8 @@ class AudioRouter: ObservableObject {
     private func stopRoutingInternal(sourceDeviceUID: String) {
         guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
 
-        // Remove sample rate listeners for both capture and playback devices
+        // Remove sample rate listener for the capture device
         removeSampleRateListener(deviceID: ctx.captureDeviceID)
-        removeSampleRateListener(deviceID: ctx.playbackDeviceID)
 
         // Stop callbacks first, then dispose, then release the retained references.
         // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
@@ -1259,10 +1373,16 @@ private func inputRenderCallback(
     // Apply effects chain (Gate → EQ → Compressor → De-Esser → Limiter)
     ctx.effectsChain?.process(renderBuf, frames: inNumberFrames, channels: channelCount)
 
-    // Compute meter levels (post-effects)
+    // Source meter -- pre-mix, shows the physical input level per channel.
     ctx.computeRMS(from: renderBuf, frames: inNumberFrames)
 
-    // Write captured audio into the ring buffer
+    // Apply UI's channel routing matrix (e.g. mono fold, cross-route) in place.
+    ctx.applyMix(renderBuf, frames: inNumberFrames)
+
+    // Output meter -- post-mix, shows what's actually going to the virtual device.
+    ctx.computeOutRMS(from: renderBuf, frames: inNumberFrames)
+
+    // Write (possibly remixed) audio into the ring buffer
     ctx.writeToRing(renderBuf, frames: inNumberFrames)
 
     return noErr

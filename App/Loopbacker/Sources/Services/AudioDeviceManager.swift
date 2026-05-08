@@ -13,10 +13,18 @@ class AudioDeviceManager: ObservableObject {
     private var didPopulateInitial = false
 
     init() {
-        // Synchronous on init -- populate immediately so data is ready for onAppear
-        systemDevices = fetchDevices()
-        loopbackerDevicePresent = systemDevices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
+        // Async device enumeration — CoreAudio property queries can block the
+        // main thread for seconds when coreaudiod is still starting up (e.g.,
+        // right after a driver install). This prevents "Application Not Responding."
         installDeviceChangeListener()
+        Self.enumerationQueue.async { [weak self] in
+            guard let self else { return }
+            let devices = self.fetchDevices()
+            DispatchQueue.main.async {
+                self.systemDevices = devices
+                self.loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
+            }
+        }
     }
 
     /// Call once after routingState is available -- just stores the reference.
