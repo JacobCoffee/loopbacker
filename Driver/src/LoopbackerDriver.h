@@ -25,6 +25,10 @@ struct DeviceState {
     Float32 volume;
     bool    mute;
 
+    // Per-device stream terminal types (see LoopbackerTypes.h).
+    UInt32 inputTerminalType;
+    UInt32 outputTerminalType;
+
     std::unique_ptr<RingBuffer> ringBuffer;
 
     // Snapshot buffer for broadcast reads: all ReadInput clients in the same
@@ -48,6 +52,8 @@ struct DeviceState {
         , ioCycleCount(0)
         , volume(1.0f)
         , mute(false)
+        , inputTerminalType(0)
+        , outputTerminalType(0)
         , needsSnapshot(false)
         , anchorHostTime(0)
         , hostTicksPerFrame(0.0)

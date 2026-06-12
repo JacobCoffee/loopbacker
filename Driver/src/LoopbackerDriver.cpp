@@ -88,6 +88,8 @@ LoopbackerDriver::LoopbackerDriver()
         mDevices[i].outputStreamID   = kDeviceInfos[i].outputStreamID;
         mDevices[i].volumeControlID       = kDeviceInfos[i].volumeControlID;
         mDevices[i].inputVolumeControlID  = kDeviceInfos[i].inputVolumeControlID;
+        mDevices[i].inputTerminalType     = kDeviceInfos[i].inputTerminalType;
+        mDevices[i].outputTerminalType    = kDeviceInfos[i].outputTerminalType;
         mDevices[i].sampleRate       = kDefaultSampleRate;
         mDevices[i].ioIsRunning.store(0, std::memory_order_relaxed);
         mDevices[i].ioCycleCount     = 0;
@@ -978,16 +980,15 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID) ? 1 : 0);
 
                 case kAudioStreamPropertyTerminalType:
-                    // USB Audio Class generic terminals (INPUT_UNDEFINED 0x0200 /
-                    // OUTPUT_UNDEFINED 0x0300). Reporting Microphone/Speaker makes
-                    // macOS Voice Processing IO (FaceTime, Phone, iPhone-relay)
-                    // treat this virtual device as a real mic/speaker candidate;
-                    // its AEC/voice-isolation engine then mis-models the chain,
-                    // gates the user's real mic to near-silence, and reports
-                    // "Voice Isolation / Wide Spectrum currently unavailable."
+                    // Per-device terminal type (see LoopbackerTypes.h). Device 0
+                    // reports Microphone/Speaker so strict pickers (Slack, some
+                    // CallKit clients) list it. Device 1 reports the USB Audio
+                    // Class undefined terminals so VPIO (FaceTime, Phone,
+                    // iPhone-relay) doesn't treat it as a candidate mic and
+                    // gate the user's real mic to near-silence.
                     WRITE_PROP(UInt32, (inObjectID == dev->inputStreamID)
-                               ? 0x0200u   // INPUT_UNDEFINED
-                               : 0x0300u); // OUTPUT_UNDEFINED
+                               ? dev->inputTerminalType
+                               : dev->outputTerminalType);
 
                 case kAudioStreamPropertyStartingChannel:
                     WRITE_PROP(UInt32, 1);
