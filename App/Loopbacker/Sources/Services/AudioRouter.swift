@@ -349,6 +349,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                                   playbackDeviceID: outputID, playbackDeviceUID: outputDeviceUID,
                                   channelCount: chCount, sampleRate: rate)
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+            // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
+            if let pending = self.pendingMixMatrices[sourceDeviceUID] {
+                self.applyMixToContext(ctx, routes: pending)
+            }
             guard self.setupInputUnit(ctx) else { return }
             guard self.setupOutputUnit(ctx) else { self.teardownUnit(&ctx.inputUnit); return }
             if let u = ctx.inputUnit { AudioOutputUnitStart(u) }
@@ -526,6 +530,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.pendingMixMatrices[sourceDeviceUID] = routes
             if let ctx = self.activeRoutes[sourceDeviceUID] {
                 self.applyMixToContext(ctx, routes: routes)
+            }
+            if let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
+                self.applyMixToContext(monitor, routes: routes)
             }
         }
     }
