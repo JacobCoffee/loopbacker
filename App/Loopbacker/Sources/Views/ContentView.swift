@@ -83,6 +83,7 @@ struct ContentView: View {
             // After a driver reinstall, coreaudiod can take 2-3s to fully
             // re-initialize. Starting too early blocks and hangs the app.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                rebindMissingDeviceSources()
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
                 syncOutputRouting(destinations: routingState.outputDestinations)
                 // Start monitoring for any sources that have a saved monitor output
@@ -99,6 +100,7 @@ struct ContentView: View {
         }
         // Re-sync when devices are hotplugged (e.g. M2 connected/disconnected)
         .onChange(of: audioDeviceManager.systemDevices) { _, _ in
+            rebindMissingDeviceSources()
             syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
         }
         .onReceive(audioRouter.$sourceMeterLevels) { levels in
@@ -114,6 +116,19 @@ struct ContentView: View {
     }
 
     // MARK: - Audio routing sync
+
+    /// Re-points sources whose device UID changed (same hardware, different driver)
+    /// and tears down any route/monitor still keyed by the old UID.
+    private func rebindMissingDeviceSources() {
+        let changes = routingState.rebindMissingDeviceSources(to: audioDeviceManager.systemDevices)
+        for change in changes {
+            audioRouter.stopRouting(sourceDeviceUID: change.old)
+            audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(change.old)")
+            guard let source = routingState.sources.first(where: { $0.deviceUID == change.new }),
+                  !source.monitorOutputUID.isEmpty, source.isEnabled, !source.isMuted else { continue }
+            audioRouter.startMonitoring(sourceDeviceUID: change.new, outputDeviceUID: source.monitorOutputUID)
+        }
+    }
 
     /// Starts/stops audio routing based on which sources are enabled, not muted, and have routes
     private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute]) {

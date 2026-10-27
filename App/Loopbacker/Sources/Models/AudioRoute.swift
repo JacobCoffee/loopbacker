@@ -152,6 +152,35 @@ class RoutingState: ObservableObject {
         save()
     }
 
+    /// Re-binds device sources whose saved UID no longer exists to a present input
+    /// device with the same name. CoreAudio UIDs change when a different driver
+    /// claims the hardware (e.g. MOTU's CoreUAC driver vs. AppleUSBAudioEngine),
+    /// which would otherwise leave the source silently unroutable.
+    /// A source is only re-bound when exactly one unclaimed input device matches.
+    /// Returns the (old, new) UID pairs that changed.
+    @discardableResult
+    func rebindMissingDeviceSources(to devices: [SystemAudioDevice]) -> [(old: String, new: String)] {
+        let presentUIDs = Set(devices.map(\.uid))
+        var claimedUIDs = Set(sources.map(\.deviceUID))
+        var changes: [(old: String, new: String)] = []
+
+        for idx in sources.indices {
+            let source = sources[idx]
+            guard !source.isAppCapture, !source.deviceUID.isEmpty,
+                  !presentUIDs.contains(source.deviceUID) else { continue }
+            let candidates = devices.filter {
+                $0.isInput && $0.name == source.name && !claimedUIDs.contains($0.uid)
+            }
+            guard candidates.count == 1, let match = candidates.first else { continue }
+            claimedUIDs.insert(match.uid)
+            changes.append((old: source.deviceUID, new: match.uid))
+            sources[idx].deviceUID = match.uid
+        }
+
+        if !changes.isEmpty { save() }
+        return changes
+    }
+
     func addOutputChannel() {
         let nextId = (outputChannels.map(\.id).max() ?? 0) + 1
         let label: String

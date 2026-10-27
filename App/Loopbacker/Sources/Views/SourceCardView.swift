@@ -13,6 +13,14 @@ struct SourceCardView: View {
         routingState.routes.contains { $0.sourceId == source.id }
     }
 
+    /// Device source whose CoreAudio UID isn't among the current system devices
+    /// (unplugged, or re-enumerated under a different driver with no unique name match).
+    private var isDeviceMissing: Bool {
+        guard !source.isAppCapture, !source.deviceUID.isEmpty,
+              !audioDeviceManager.systemDevices.isEmpty else { return false }
+        return !audioDeviceManager.systemDevices.contains { $0.uid == source.deviceUID }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
@@ -108,6 +116,17 @@ struct SourceCardView: View {
                             .padding(.vertical, 1)
                             .background(LoopbackerTheme.bgInset)
                             .clipShape(Capsule())
+                    }
+
+                    if isDeviceMissing {
+                        Text("UNAVAILABLE")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundColor(LoopbackerTheme.warning)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(LoopbackerTheme.warning.opacity(0.15))
+                            .clipShape(Capsule())
+                            .help("No audio device with this source's ID is connected. Reconnect it, or remove and re-add the source.")
                     }
                 }
 
