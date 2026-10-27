@@ -16,8 +16,7 @@ struct DeviceState {
     AudioObjectID inputStreamID;
     AudioObjectID outputStreamID;
     AudioObjectID volumeControlID;
-    AudioObjectID inputVolumeControlID;
-
+    AudioObjectID inputVolumeControlID;  // input scope (shows "Input volume" in System Settings)
     Float64 sampleRate;
     std::atomic<UInt32> ioIsRunning;       // number of active IO clients
     UInt64  ioCycleCount;                  // counts IO cycles for timestamp synthesis
@@ -39,6 +38,15 @@ struct DeviceState {
     UInt64  anchorHostTime;                // mach_absolute_time at IO start
     Float64 hostTicksPerFrame;             // host ticks per sample frame
 
+    // Current channel count, shared by both streams. Read on the IO thread
+    // (atomic load only, real-time safe); written only from
+    // PerformDeviceConfigurationChange (IO is stopped by the HAL at that
+    // point) or Initialize.
+    std::atomic<UInt32> channelCount;
+    // Requested channel count awaiting PerformDeviceConfigurationChange.
+    // Guarded by LoopbackerDriver::mMutex; only touched off the IO thread.
+    UInt32 pendingChannelCount;
+
     DeviceState()
         : name(nullptr)
         , uid(nullptr)
@@ -57,6 +65,8 @@ struct DeviceState {
         , needsSnapshot(false)
         , anchorHostTime(0)
         , hostTicksPerFrame(0.0)
+        , channelCount(kDefaultChannelCount)
+        , pendingChannelCount(kDefaultChannelCount)
     {
     }
 };

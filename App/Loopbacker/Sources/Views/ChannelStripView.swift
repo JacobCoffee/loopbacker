@@ -10,8 +10,15 @@ struct ChannelStripView: View {
     @EnvironmentObject var routingState: RoutingState
 
     enum StripSide {
-        case source  // connector port on right
-        case output  // connector port on left
+        /// Connector port on the right; meter reads the source's route key (`AudioSource.deviceUID`).
+        case source(meterKey: String)
+        /// Connector port on the left; meter reads the virtual mic's post-mix level.
+        case output
+    }
+
+    private var isSourceSide: Bool {
+        if case .source = side { return true }
+        return false
     }
 
     private var isConnected: Bool {
@@ -29,19 +36,19 @@ struct ChannelStripView: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            if side == .output {
+            if !isSourceSide {
                 connectorPort
             }
 
             Text(channel.label)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(isSourceEnabled ? .primary : .tertiary)
-                .frame(width: 44, alignment: side == .source ? .leading : .trailing)
+                .frame(width: 44, alignment: isSourceSide ? .leading : .trailing)
 
-            SignalMeter(level: isSourceEnabled ? channel.meterLevel : 0, axis: .horizontal, thickness: 6)
+            ChannelLevelMeter(side: side, channel: channel.id, isLive: isSourceEnabled)
                 .frame(height: 16)
 
-            if side == .source {
+            if isSourceSide {
                 connectorPort
             }
         }
@@ -96,6 +103,28 @@ struct ChannelStripView: View {
             } else {
                 routingState.handleConnectorTap(connectorEnd)
             }
+        }
+    }
+}
+
+// MARK: - Live meter
+
+/// The only part of a strip that reads `MeterLevels`, so 30 Hz meter updates re-render
+/// just this view rather than the card around it.
+private struct ChannelLevelMeter: View {
+    @Environment(MeterLevels.self) private var meters
+    let side: ChannelStripView.StripSide
+    let channel: Int
+    let isLive: Bool
+
+    var body: some View {
+        SignalMeter(level: isLive ? level : 0, axis: .horizontal, thickness: 6)
+    }
+
+    private var level: Float {
+        switch side {
+        case .source(let key): meters.level(source: key, channel: channel)
+        case .output: meters.output(channel: channel)
         }
     }
 }

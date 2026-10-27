@@ -276,29 +276,31 @@ final class AudioEffectsChain {
 
     // MARK: - Real-time process (called from audio callback)
 
-    /// Process interleaved Float32 audio in-place.
+    /// Process interleaved Float32 audio in-place. `channels` is the buffer's interleave
+    /// width; only the first two channels (the voice pair) are processed.
     func process(_ buffer: UnsafeMutablePointer<Float>, frames: UInt32, channels: UInt32) {
         guard enabled else { return }
         let n = Int(frames)
-        let ch = min(Int(channels), maxCh)
+        let stride = Int(channels)
+        let ch = min(stride, maxCh)
         guard n > 0 && ch > 0 else { return }
 
-        if gateEnabled { processGate(buffer, frames: n, channels: ch) }
-        if eqEnabled { processEQ(buffer, frames: n, channels: ch) }
-        if compressorEnabled { processCompressor(buffer, frames: n, channels: ch) }
-        if deEsserEnabled { processDeEsser(buffer, frames: n, channels: ch) }
+        if gateEnabled { processGate(buffer, frames: n, channels: ch, stride: stride) }
+        if eqEnabled { processEQ(buffer, frames: n, channels: ch, stride: stride) }
+        if compressorEnabled { processCompressor(buffer, frames: n, channels: ch, stride: stride) }
+        if deEsserEnabled { processDeEsser(buffer, frames: n, channels: ch, stride: stride) }
         // Creative effects
-        if chorusEnabled { processChorus(buffer, frames: n, channels: ch) }
-        if pitchShiftEnabled { processPitchShift(buffer, frames: n, channels: ch) }
-        if reverbEnabled { processReverb(buffer, frames: n, channels: ch) }
-        if delayEnabled { processDelay(buffer, frames: n, channels: ch) }
+        if chorusEnabled { processChorus(buffer, frames: n, channels: ch, stride: stride) }
+        if pitchShiftEnabled { processPitchShift(buffer, frames: n, channels: ch, stride: stride) }
+        if reverbEnabled { processReverb(buffer, frames: n, channels: ch, stride: stride) }
+        if delayEnabled { processDelay(buffer, frames: n, channels: ch, stride: stride) }
         // Safety limiter always last
-        if limiterEnabled { processLimiter(buffer, frames: n, channels: ch) }
+        if limiterEnabled { processLimiter(buffer, frames: n, channels: ch, stride: stride) }
     }
 
     // MARK: - Noise Gate
 
-    private func processGate(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processGate(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let thresh = gateThresholdLin
         let reduction = gateReductionLin
         let attackC = gateAttackCoeff
@@ -306,7 +308,7 @@ final class AudioEffectsChain {
 
         for i in 0..<frames {
             for c in 0..<channels {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let sample = buf[idx]
                 let level = fabsf(sample)
 
@@ -333,7 +335,7 @@ final class AudioEffectsChain {
 
     // MARK: - Parametric EQ (5-band biquad)
 
-    private func processEQ(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processEQ(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         for band in 0..<bandCount {
             let b0 = eqB0[band]
             let b1 = eqB1[band]
@@ -347,7 +349,7 @@ final class AudioEffectsChain {
                 var z2 = eqZ2[si]
 
                 for i in 0..<frames {
-                    let idx = i * channels + c
+                    let idx = i * stride + c
                     let x = buf[idx]
                     // Transposed Direct Form II
                     let y = b0 * x + z1
@@ -364,7 +366,7 @@ final class AudioEffectsChain {
 
     // MARK: - Compressor
 
-    private func processCompressor(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processCompressor(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let thresh = compThresholdLin
         let ratio = compRatio
         let attackC = compAttackCoeff
@@ -375,7 +377,7 @@ final class AudioEffectsChain {
             // Linked stereo: use max of all channels for detection
             var maxLevel: Float = 0
             for c in 0..<channels {
-                let level = fabsf(buf[i * channels + c])
+                let level = fabsf(buf[i * stride + c])
                 if level > maxLevel { maxLevel = level }
             }
 
@@ -402,14 +404,14 @@ final class AudioEffectsChain {
 
             // Apply gain to all channels
             for c in 0..<channels {
-                buf[i * channels + c] *= gain
+                buf[i * stride + c] *= gain
             }
         }
     }
 
     // MARK: - De-Esser
 
-    private func processDeEsser(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processDeEsser(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let ratio = deEsserRatio
         let reductionLin = deEsserReductionLin
         let threshold = deEsserThresholdLin
@@ -421,7 +423,7 @@ final class AudioEffectsChain {
             var env = deEnv[c]
 
             for i in 0..<frames {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let x = buf[idx]
 
                 // Bandpass filter for sidechain (detect sibilance energy)
@@ -456,7 +458,7 @@ final class AudioEffectsChain {
 
     // MARK: - Chorus (modulated delay line)
 
-    private func processChorus(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processChorus(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let rate = chorusRate
         let depth = chorusDepthSamples
         let center = chorusCenterDelay
@@ -469,7 +471,7 @@ final class AudioEffectsChain {
             var wIdx = chorusWriteIdx[c]
 
             for i in 0..<frames {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let x = buf[idx]
 
                 // Write to delay line
@@ -501,7 +503,7 @@ final class AudioEffectsChain {
 
     // MARK: - Pitch Shift (two-head overlap-add with Hann window)
 
-    private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processPitchShift(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let ratio = pitchRatio
         let mix = pitchMix
         guard fabsf(ratio - 1.0) > 0.001 else { return }
@@ -533,7 +535,7 @@ final class AudioEffectsChain {
             }
 
             for i in 0..<frames {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let x = buf[idx]
 
                 // Write input to circular buffer
@@ -601,7 +603,7 @@ final class AudioEffectsChain {
 
     // MARK: - Reverb (Freeverb: 8 combs + 4 allpasses)
 
-    private func processReverb(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processReverb(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let feedback = reverbFeedback
         let damp = reverbDamp
         let damp1 = 1.0 - damp
@@ -611,7 +613,7 @@ final class AudioEffectsChain {
 
         for c in 0..<channels {
             for i in 0..<frames {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let dry = buf[idx]
                 let scaledInput = dry * inputGain
 
@@ -657,7 +659,7 @@ final class AudioEffectsChain {
 
     // MARK: - Delay (circular buffer with feedback)
 
-    private func processDelay(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processDelay(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let dSamples = delaySamples
         let fb = delayFeedback
         let mix = delayMix
@@ -666,7 +668,7 @@ final class AudioEffectsChain {
             var wIdx = delayWriteIdx[c]
 
             for i in 0..<frames {
-                let idx = i * channels + c
+                let idx = i * stride + c
                 let x = buf[idx]
 
                 let rIdx = (wIdx - dSamples + delayLineSize) & delayLineMask
@@ -687,7 +689,7 @@ final class AudioEffectsChain {
 
     // MARK: - Limiter
 
-    private func processLimiter(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
+    private func processLimiter(_ buf: UnsafeMutablePointer<Float>, frames: Int, channels: Int, stride: Int) {
         let ceiling = limiterCeilingLin
         let releaseC = limiterReleaseCoeff
 
@@ -695,7 +697,7 @@ final class AudioEffectsChain {
             // Linked limiting: find peak across channels
             var peak: Float = 0
             for c in 0..<channels {
-                let level = fabsf(buf[i * channels + c])
+                let level = fabsf(buf[i * stride + c])
                 if level > peak { peak = level }
             }
 
@@ -712,7 +714,7 @@ final class AudioEffectsChain {
             if env > ceiling {
                 let gain = ceiling / max(env, 1e-10)
                 for c in 0..<channels {
-                    buf[i * channels + c] *= gain
+                    buf[i * stride + c] *= gain
                 }
             }
         }

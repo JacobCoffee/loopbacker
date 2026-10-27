@@ -199,6 +199,40 @@ class RoutingState: ObservableObject {
         save()
     }
 
+    /// Channels the virtual mic device should expose: the UI's channels rounded up to a pair.
+    var micChannelCount: Int {
+        VirtualDeviceChannels.deviceCount(forChannels: outputChannels.count)
+    }
+
+    /// Grow the virtual mic by one stereo pair (up to the driver's 16-channel limit).
+    func addOutputChannelPair() {
+        let target = min(VirtualDeviceChannels.maxCount, (outputChannels.count / 2 + 1) * 2)
+        while outputChannels.count < target { addOutputChannel() }
+    }
+
+    /// Drop the last pair (or the odd leftover channel) and the routes into it; never below 2.
+    func removeLastOutputChannelPair() {
+        let target = max(2, (outputChannels.count - 1) / 2 * 2)
+        let doomed = outputChannels.sorted { $0.id < $1.id }.dropFirst(target).map(\.id)
+        outputChannels.removeAll { doomed.contains($0.id) }
+        routes.removeAll { doomed.contains($0.outputChannelId) }
+        save()
+    }
+
+    /// Set an output destination's device width, keeping its monitor pair inside it.
+    func setOutputDestinationChannels(id: UUID, channelCount: Int) {
+        guard let idx = outputDestinations.firstIndex(where: { $0.id == id }) else { return }
+        outputDestinations[idx].channelCount = channelCount
+        outputDestinations[idx].monitorChannel = min(outputDestinations[idx].monitorChannel, channelCount - 1)
+        save()
+    }
+
+    func setOutputDestinationMonitorChannel(id: UUID, monitorChannel: Int) {
+        guard let idx = outputDestinations.firstIndex(where: { $0.id == id }) else { return }
+        outputDestinations[idx].monitorChannel = monitorChannel
+        save()
+    }
+
     // MARK: - Output destination management
 
     func addOutputDestination(virtualDeviceUID: String, virtualDeviceName: String,

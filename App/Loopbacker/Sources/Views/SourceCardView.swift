@@ -32,7 +32,7 @@ struct SourceCardView: View {
                 ForEach(source.channels) { channel in
                     ChannelStripView(
                         channel: channel,
-                        side: .source,
+                        side: .source(meterKey: source.deviceUID),
                         isSourceEnabled: isLive,
                         connectorEnd: .source(sourceId: source.id, channelId: channel.id)
                     )

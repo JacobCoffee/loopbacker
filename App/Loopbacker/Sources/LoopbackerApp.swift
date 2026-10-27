@@ -26,6 +26,7 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardState)
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
+                .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
         .windowToolbarStyle(.unified)
@@ -41,6 +42,7 @@ struct LoopbackerApp: App {
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
                 .environmentObject(appCaptureService)
+                .environment(audioRouter.meters)
         } label: {
             Image(systemName: "waveform.path")
         }

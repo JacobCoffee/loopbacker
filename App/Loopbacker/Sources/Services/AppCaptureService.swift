@@ -39,6 +39,27 @@ final class AppCaptureService: NSObject, ObservableObject {
     /// Audio callback queue — not the main thread, not the CoreAudio IO thread
     private let captureQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.appcapture", qos: .userInteractive)
 
+    /// Bundle IDs of running apps, kept current by NSWorkspace launch/terminate notifications so
+    /// views can ask `isAppRunning` from `body` without a LaunchServices round trip.
+    @Published private(set) var runningBundleIDs: Set<String> = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+
+    override init() {
+        super.init()
+        refreshRunningApps()
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshRunningApps() }
+            })
+        }
+    }
+
+    private func refreshRunningApps() {
+        let ids = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        if ids != runningBundleIDs { runningBundleIDs = ids }
+    }
+
     // MARK: - Permission
 
     /// Check Screen Recording permission. The first call triggers the system prompt.
@@ -103,9 +124,9 @@ final class AppCaptureService: NSObject, ObservableObject {
         }
     }
 
-    /// Check if a specific app is currently running.
+    /// Check if a specific app is currently running (cached; safe to call from `body`).
     func isAppRunning(bundleID: String) -> Bool {
-        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+        runningBundleIDs.contains(bundleID)
     }
 
     // MARK: - Capture

@@ -38,6 +38,9 @@ struct ContentView: View {
             // After a driver reinstall, coreaudiod can take 2-3s to fully
             // re-initialize. Starting too early blocks and hangs the app.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                // Size the virtual devices first; the router queue runs these before the
+                // route starts below, so routes open the devices at their final width.
+                applyVirtualDeviceChannels()
                 rebindMissingDeviceSources()
                 syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
                 syncOutputRouting(destinations: routingState.outputDestinations)
@@ -58,15 +61,12 @@ struct ContentView: View {
             rebindMissingDeviceSources()
             syncAudioRouting(sources: routingState.sources, routes: routingState.routes)
         }
-        .onReceive(audioRouter.$sourceMeterLevels) { levels in
-            updateSourceMeters(levels)
-        }
-        .onReceive(audioRouter.$outputMeterLevels) { levels in
-            updateOutputMeters(levels)
-        }
         .onChange(of: routingState.effectsPreset) { _, newPreset in
             audioRouter.currentEffectsPreset = newPreset
             audioRouter.updateEffectsPreset(newPreset)
+        }
+        .onChange(of: routingState.micChannelCount) { _, count in
+            setDeviceChannels(count, deviceUID: VirtualDeviceChannels.micUID)
         }
     }
 
@@ -182,48 +182,25 @@ struct ContentView: View {
             if dest.isEnabled && !dest.physicalOutputUID.isEmpty {
                 audioRouter.startOutputRouting(
                     virtualDeviceUID: dest.virtualDeviceUID,
-                    physicalOutputUID: dest.physicalOutputUID
+                    physicalOutputUID: dest.physicalOutputUID,
+                    monitorChannel: dest.monitorChannel
                 )
             }
         }
     }
 
-    /// Push meter levels from AudioRouter into the source channel models.
-    /// Only updates when the new value differs meaningfully (> 0.01) to avoid
-    /// unnecessary SwiftUI redraws.
-    private func updateSourceMeters(_ levels: [String: [Int: Float]]) {
-        for i in routingState.sources.indices {
-            let uid = routingState.sources[i].deviceUID
-            guard let channelLevels = levels[uid] else {
-                // No levels -- zero out only if not already zero
-                for j in routingState.sources[i].channels.indices {
-                    if routingState.sources[i].channels[j].meterLevel > 0.01 {
-                        routingState.sources[i].channels[j].meterLevel = 0.0
-                    }
-                }
-                continue
-            }
-            for j in routingState.sources[i].channels.indices {
-                let chId = routingState.sources[i].channels[j].id
-                let newLevel = channelLevels[chId] ?? 0.0
-                let oldLevel = routingState.sources[i].channels[j].meterLevel
-                if abs(newLevel - oldLevel) > 0.01 {
-                    routingState.sources[i].channels[j].meterLevel = newLevel
-                }
-            }
+    /// Push the saved channel counts to the driver (the virtual mic plus every output device).
+    private func applyVirtualDeviceChannels() {
+        setDeviceChannels(routingState.micChannelCount, deviceUID: VirtualDeviceChannels.micUID)
+        for dest in routingState.outputDestinations {
+            setDeviceChannels(dest.channelCount, deviceUID: dest.virtualDeviceUID)
         }
     }
 
-    /// Push meter levels from AudioRouter into the output channel models.
-    /// Only updates when the new value differs meaningfully (> 0.01).
-    private func updateOutputMeters(_ levels: [Int: Float]) {
-        for i in routingState.outputChannels.indices {
-            let chId = routingState.outputChannels[i].id
-            let newLevel = levels[chId] ?? 0.0
-            let oldLevel = routingState.outputChannels[i].meterLevel
-            if abs(newLevel - oldLevel) > 0.01 {
-                routingState.outputChannels[i].meterLevel = newLevel
-            }
+    private func setDeviceChannels(_ count: Int, deviceUID: String) {
+        audioRouter.setVirtualDeviceChannels(count, deviceUID: deviceUID,
+                                             appCaptureService: appCaptureService) { [audioDeviceManager] _ in
+            audioDeviceManager.enumerateDevices()
         }
     }
 }

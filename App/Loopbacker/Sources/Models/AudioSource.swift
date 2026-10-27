@@ -6,28 +6,12 @@ struct AudioChannel: Identifiable, Equatable, Codable {
     let label: String
     var volume: Float
     var isActive: Bool
-    var meterLevel: Float
 
-    init(id: Int, label: String, volume: Float = 1.0, isActive: Bool = true, meterLevel: Float = 0.0) {
+    init(id: Int, label: String, volume: Float = 1.0, isActive: Bool = true) {
         self.id = id
         self.label = label
         self.volume = volume
         self.isActive = isActive
-        self.meterLevel = meterLevel
-    }
-
-    // Exclude meterLevel from persistence (it's transient runtime data)
-    enum CodingKeys: String, CodingKey {
-        case id, label, volume, isActive
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(Int.self, forKey: .id)
-        label = try container.decode(String.self, forKey: .label)
-        volume = try container.decode(Float.self, forKey: .volume)
-        isActive = try container.decode(Bool.self, forKey: .isActive)
-        meterLevel = 0.0
     }
 }
 

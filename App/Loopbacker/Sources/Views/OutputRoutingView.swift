@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// Card-style view for routing Loopbacker virtual devices to physical outputs.
-/// Users can add/remove virtual devices dynamically (Loopbacker 2 through 8).
+/// Card-style view for routing Loopbacker virtual devices to physical outputs, with each
+/// device's channel count and the monitored channel pair.
 struct OutputRoutingView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
+    @EnvironmentObject var appCaptureService: AppCaptureService
 
     /// All available virtual devices (device 1 is the main loopback, device 2 is for output routing)
     private static let allVirtualDevices: [(uid: String, name: String)] = [
@@ -150,11 +151,32 @@ struct OutputRoutingView: View {
                 outputPicker(dest: dest)
             }
             .padding(.horizontal, Metrics.panelPadding)
+            .padding(.top, 10)
+
+            HStack(spacing: 8) {
+                Text("Channels")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                channelCountPicker(dest: dest)
+                Text("Monitor")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                monitorPairPicker(dest: dest)
+            }
+            .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
+            if let reported = reportedChannels(dest), reported < dest.channelCount {
+                Label("The installed driver provides \(reported) channels. Reinstall the driver to use \(dest.channelCount).",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, Metrics.panelPadding)
+                    .padding(.bottom, 10)
+            }
+
             if isActive {
-                let level = outputRouteMeterLevel(dest)
-                SignalMeter(level: level, axis: .horizontal, thickness: 4)
+                SourcePeakMeter(key: "output:\(dest.virtualDeviceUID)", isLive: true)
                     .frame(height: 10)
                     .padding(.horizontal, Metrics.panelPadding)
                     .padding(.bottom, 10)
@@ -187,6 +209,42 @@ struct OutputRoutingView: View {
         .help("Select the physical audio output device for this virtual device")
     }
 
+    // MARK: - Channel pickers
+
+    /// Width of the virtual device that apps (e.g. Resolve, a timecode reader) see.
+    @ViewBuilder
+    private func channelCountPicker(dest: OutputDestination) -> some View {
+        Picker("Channels", selection: Binding(
+            get: { dest.channelCount },
+            set: { setChannelCount($0, dest: dest) }
+        )) {
+            ForEach(VirtualDeviceChannels.supportedCounts, id: \.self) { count in
+                Text("\(count)").tag(count)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .help("How many channels \(dest.virtualDeviceName) offers to apps")
+    }
+
+    /// Which pair of the virtual device plays to the physical output.
+    @ViewBuilder
+    private func monitorPairPicker(dest: OutputDestination) -> some View {
+        Picker("Monitor", selection: Binding(
+            get: { dest.monitorChannel },
+            set: { setMonitorChannel($0, dest: dest) }
+        )) {
+            ForEach(Array(stride(from: 1, to: dest.channelCount, by: 2)), id: \.self) { first in
+                Text("\(first)\u{2013}\(first + 1)").tag(first)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .help("The channel pair of \(dest.virtualDeviceName) you hear on the output; other channels stay on the device for apps to record")
+    }
+
     // MARK: - Enable toggle
 
     private func toggleEnable(dest: OutputDestination) {
@@ -197,15 +255,11 @@ struct OutputRoutingView: View {
             } else if !dest.physicalOutputUID.isEmpty {
                 audioRouter.startOutputRouting(
                     virtualDeviceUID: dest.virtualDeviceUID,
-                    physicalOutputUID: dest.physicalOutputUID
+                    physicalOutputUID: dest.physicalOutputUID,
+                    monitorChannel: dest.monitorChannel
                 )
             }
         }
-    }
-
-    private func outputRouteMeterLevel(_ dest: OutputDestination) -> Float {
-        let levels = audioRouter.sourceMeterLevels["output:\(dest.virtualDeviceUID)"] ?? [:]
-        return levels.values.max() ?? 0
     }
 
     // MARK: - Helpers
@@ -222,7 +276,39 @@ struct OutputRoutingView: View {
         }
 
         if !physicalOutputUID.isEmpty, dest.isEnabled {
-            audioRouter.startOutputRouting(virtualDeviceUID: dest.virtualDeviceUID, physicalOutputUID: physicalOutputUID)
+            audioRouter.startOutputRouting(virtualDeviceUID: dest.virtualDeviceUID, physicalOutputUID: physicalOutputUID,
+                                           monitorChannel: dest.monitorChannel)
         }
+    }
+
+    private func setChannelCount(_ count: Int, dest: OutputDestination) {
+        routingState.setOutputDestinationChannels(id: dest.id, channelCount: count)
+        audioRouter.setVirtualDeviceChannels(count, deviceUID: dest.virtualDeviceUID,
+                                             appCaptureService: appCaptureService) { [audioDeviceManager] _ in
+            audioDeviceManager.enumerateDevices()
+        }
+        // A narrower device may have pushed the monitor pair down; replay it.
+        if let updated = routingState.outputDestinations.first(where: { $0.id == dest.id }),
+           updated.monitorChannel != dest.monitorChannel {
+            restartIfRouting(updated)
+        }
+    }
+
+    private func setMonitorChannel(_ first: Int, dest: OutputDestination) {
+        routingState.setOutputDestinationMonitorChannel(id: dest.id, monitorChannel: first)
+        if let updated = routingState.outputDestinations.first(where: { $0.id == dest.id }) {
+            restartIfRouting(updated)
+        }
+    }
+
+    private func restartIfRouting(_ dest: OutputDestination) {
+        guard dest.isEnabled, !dest.physicalOutputUID.isEmpty else { return }
+        audioRouter.startOutputRouting(virtualDeviceUID: dest.virtualDeviceUID, physicalOutputUID: dest.physicalOutputUID,
+                                       monitorChannel: dest.monitorChannel)
+    }
+
+    /// Input channels the installed driver reports for the destination's virtual device.
+    private func reportedChannels(_ dest: OutputDestination) -> Int? {
+        audioDeviceManager.systemDevices.first { $0.uid == dest.virtualDeviceUID }?.inputChannelCount
     }
 }

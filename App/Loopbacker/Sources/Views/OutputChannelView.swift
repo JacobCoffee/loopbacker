@@ -2,6 +2,12 @@ import SwiftUI
 
 struct OutputChannelView: View {
     @EnvironmentObject var routingState: RoutingState
+    @EnvironmentObject var audioDeviceManager: AudioDeviceManager
+
+    /// Channels the installed driver actually exposes on the virtual mic (nil until enumerated).
+    private var deviceChannels: Int? {
+        audioDeviceManager.systemDevices.first { $0.uid == VirtualDeviceChannels.micUID }?.outputChannelCount
+    }
 
     private var hasActiveRoutes: Bool {
         !routingState.routes.isEmpty
@@ -35,6 +41,15 @@ struct OutputChannelView: View {
             .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
+            if let deviceChannels, deviceChannels < routingState.outputChannels.count {
+                Label("The installed driver provides \(deviceChannels) channels. Reinstall the driver to use channels \(deviceChannels + 1)\u{2013}\(routingState.outputChannels.count).",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, Metrics.panelPadding)
+                    .padding(.bottom, 10)
+            }
+
             channelSummary
         }
         .glassPanel(tint: hasActiveRoutes ? .loopbacker.opacity(0.08) : nil)
@@ -67,33 +82,30 @@ struct OutputChannelView: View {
 
             Spacer(minLength: 8)
 
-            if routingState.outputChannels.count > 1 {
+            if routingState.outputChannels.count > 2 {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        if let last = routingState.outputChannels.last {
-                            routingState.removeOutputChannel(last.id)
-                        }
-                    }
+                    withAnimation(.easeInOut(duration: 0.2)) { routingState.removeLastOutputChannelPair() }
                 } label: {
                     Image(systemName: "minus.circle")
                 }
                 .buttonStyle(.borderless)
                 .font(.title3)
                 .foregroundStyle(.secondary)
-                .help("Remove the last output channel and its routes")
-                .accessibilityLabel("Remove last output channel")
+                .help("Remove the last channel pair and its routes")
+                .accessibilityLabel("Remove last channel pair")
             }
 
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) { routingState.addOutputChannel() }
+                withAnimation(.easeInOut(duration: 0.2)) { routingState.addOutputChannelPair() }
             } label: {
                 Image(systemName: "plus.circle")
             }
             .buttonStyle(.borderless)
             .font(.title3)
             .foregroundStyle(.secondary)
-            .help("Add a new output channel to the virtual device")
-            .accessibilityLabel("Add output channel")
+            .disabled(routingState.outputChannels.count >= VirtualDeviceChannels.maxCount)
+            .help("Add a channel pair to the virtual mic (up to \(VirtualDeviceChannels.maxCount) channels)")
+            .accessibilityLabel("Add channel pair")
         }
         .padding(.horizontal, Metrics.panelPadding)
         .padding(.vertical, 10)

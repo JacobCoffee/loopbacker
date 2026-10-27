@@ -95,8 +95,11 @@ LoopbackerDriver::LoopbackerDriver()
         mDevices[i].ioCycleCount     = 0;
         mDevices[i].volume           = 1.0f;
         mDevices[i].mute             = false;
-        mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames, kBytesPerFrame);
-        mDevices[i].snapshotBuffer.resize(kDefaultIOBufferFrames * kChannelCount, 0.0f);
+        mDevices[i].channelCount.store(kDefaultChannelCount, std::memory_order_relaxed);
+        mDevices[i].pendingChannelCount = kDefaultChannelCount;
+        mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames,
+                                            BytesPerFrameForChannelCount(kDefaultChannelCount));
+        mDevices[i].snapshotBuffer.resize(kDefaultIOBufferFrames * kDefaultChannelCount, 0.0f);
         mDevices[i].needsSnapshot.store(false, std::memory_order_relaxed);
         mDevices[i].anchorHostTime   = 0;
         mDevices[i].hostTicksPerFrame = 0.0;
@@ -219,6 +222,46 @@ ULONG LoopbackerDriver::Release(void* inDriver)
 }
 
 // =============================================================================
+// Helper: channel-count persistence (host storage)
+// =============================================================================
+
+static CFStringRef CreateChannelCountStorageKey(const char* uid)
+{
+    return CFStringCreateWithFormat(nullptr, nullptr, CFSTR("channelCount.%s"), uid);
+}
+
+// Validates a requested channel count: must be even and in [2, kMaxChannelCount].
+static bool IsValidChannelCount(SInt32 value)
+{
+    return value >= static_cast<SInt32>(kDefaultChannelCount)
+        && value <= static_cast<SInt32>(kMaxChannelCount)
+        && (value % 2) == 0;
+}
+
+// Reads the persisted channel count for a device from host storage. Falls
+// back to kDefaultChannelCount if absent, malformed, or out of range.
+static UInt32 RestoreChannelCount(AudioServerPlugInHostRef host, const char* uid)
+{
+    if (host == nullptr) return kDefaultChannelCount;
+
+    UInt32 result = kDefaultChannelCount;
+    CFStringRef key = CreateChannelCountStorageKey(uid);
+    CFPropertyListRef stored = nullptr;
+    if (host->CopyFromStorage(host, key, &stored) == kAudioHardwareNoError && stored != nullptr) {
+        if (CFGetTypeID(stored) == CFNumberGetTypeID()) {
+            SInt32 value = 0;
+            if (CFNumberGetValue(static_cast<CFNumberRef>(stored), kCFNumberSInt32Type, &value)
+                    && IsValidChannelCount(value)) {
+                result = static_cast<UInt32>(value);
+            }
+        }
+        CFRelease(stored);
+    }
+    CFRelease(key);
+    return result;
+}
+
+// =============================================================================
 // Basic operations
 // =============================================================================
 
@@ -228,7 +271,15 @@ OSStatus LoopbackerDriver::Initialize(AudioServerPlugInDriverRef inDriver,
     auto* driver = AsDriver(inDriver);
     driver->mHost = inHost;
     for (uint32_t i = 0; i < kMaxDevices; ++i) {
-        driver->mDevices[i].hostTicksPerFrame = ComputeHostTicksPerFrame(driver->mDevices[i].sampleRate);
+        DeviceState& dev = driver->mDevices[i];
+        UInt32 restoredCount = RestoreChannelCount(inHost, dev.uid);
+        dev.channelCount.store(restoredCount, std::memory_order_relaxed);
+        dev.pendingChannelCount = restoredCount;
+        // Safe to (re)allocate here: IO has not started yet.
+        dev.ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames,
+                                                        BytesPerFrameForChannelCount(restoredCount));
+        dev.snapshotBuffer.assign(static_cast<size_t>(kDefaultIOBufferFrames) * restoredCount, 0.0f);
+        dev.hostTicksPerFrame = ComputeHostTicksPerFrame(dev.sampleRate);
     }
     return kAudioHardwareNoError;
 }
@@ -261,19 +312,65 @@ OSStatus LoopbackerDriver::RemoveDeviceClient(AudioServerPlugInDriverRef /*inDri
     return kAudioHardwareNoError;
 }
 
-OSStatus LoopbackerDriver::PerformDeviceConfigurationChange(AudioServerPlugInDriverRef /*inDriver*/,
-                                                            AudioObjectID /*inDeviceObjectID*/,
-                                                            UInt64 /*inChangeAction*/,
+// Change-action tag passed to RequestDeviceConfigurationChange /
+// PerformDeviceConfigurationChange / AbortDeviceConfigurationChange for a
+// channel-count change (the only configuration change this driver supports).
+static const UInt64 kChannelCountChangeAction = 1;
+
+OSStatus LoopbackerDriver::PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver,
+                                                            AudioObjectID inDeviceObjectID,
+                                                            UInt64 inChangeAction,
                                                             void* /*inChangeInfo*/)
 {
+    if (inChangeAction != kChannelCountChangeAction)
+        return kAudioHardwareNoError;
+
+    auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
+
+    UInt32 newCount;
+    {
+        std::lock_guard<std::mutex> lock(driver->mMutex);
+        newCount = dev->pendingChannelCount;
+    }
+
+    // The HAL has stopped IO for this device while this call is in progress,
+    // so buffer reallocation is safe here (and only here, or at Initialize()).
+    dev->ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames,
+                                                     BytesPerFrameForChannelCount(newCount));
+    dev->snapshotBuffer.assign(static_cast<size_t>(kDefaultIOBufferFrames) * newCount, 0.0f);
+    dev->needsSnapshot.store(false, std::memory_order_relaxed);
+    dev->channelCount.store(newCount, std::memory_order_release);
+
+    if (driver->mHost != nullptr) {
+        CFStringRef key = CreateChannelCountStorageKey(dev->uid);
+        SInt32 value = static_cast<SInt32>(newCount);
+        CFNumberRef number = CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
+        driver->mHost->WriteToStorage(driver->mHost, key, number);
+        CFRelease(number);
+        CFRelease(key);
+    }
+
+    // The HAL re-reads stream formats after this call returns; no manual
+    // kAudioStreamPropertyVirtualFormat/PhysicalFormat notification needed.
     return kAudioHardwareNoError;
 }
 
-OSStatus LoopbackerDriver::AbortDeviceConfigurationChange(AudioServerPlugInDriverRef /*inDriver*/,
-                                                          AudioObjectID /*inDeviceObjectID*/,
-                                                          UInt64 /*inChangeAction*/,
+OSStatus LoopbackerDriver::AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver,
+                                                          AudioObjectID inDeviceObjectID,
+                                                          UInt64 inChangeAction,
                                                           void* /*inChangeInfo*/)
 {
+    if (inChangeAction != kChannelCountChangeAction)
+        return kAudioHardwareNoError;
+
+    auto* driver = AsDriver(inDriver);
+    DeviceState* dev = driver->FindDeviceByObjectID(inDeviceObjectID);
+    if (dev == nullptr) return kAudioHardwareBadDeviceError;
+
+    std::lock_guard<std::mutex> lock(driver->mMutex);
+    dev->pendingChannelCount = dev->channelCount.load(std::memory_order_acquire);
     return kAudioHardwareNoError;
 }
 
@@ -281,7 +378,7 @@ OSStatus LoopbackerDriver::AbortDeviceConfigurationChange(AudioServerPlugInDrive
 // Property helpers
 // =============================================================================
 
-static AudioStreamBasicDescription MakeStreamDescription(Float64 sampleRate)
+static AudioStreamBasicDescription MakeStreamDescription(Float64 sampleRate, UInt32 channelCount)
 {
     AudioStreamBasicDescription desc = {};
     desc.mSampleRate       = sampleRate;
@@ -290,17 +387,17 @@ static AudioStreamBasicDescription MakeStreamDescription(Float64 sampleRate)
                            | kAudioFormatFlagsNativeEndian
                            | kAudioFormatFlagIsPacked;
     desc.mBitsPerChannel   = kBitsPerChannel;
-    desc.mChannelsPerFrame = kChannelCount;
-    desc.mBytesPerFrame    = kBytesPerFrame;
+    desc.mChannelsPerFrame = channelCount;
+    desc.mBytesPerFrame    = BytesPerFrameForChannelCount(channelCount);
     desc.mFramesPerPacket  = 1;
-    desc.mBytesPerPacket   = kBytesPerFrame;
+    desc.mBytesPerPacket   = BytesPerFrameForChannelCount(channelCount);
     return desc;
 }
 
-static AudioStreamRangedDescription MakeRangedDescription(Float64 sampleRate)
+static AudioStreamRangedDescription MakeRangedDescription(Float64 sampleRate, UInt32 channelCount)
 {
     AudioStreamRangedDescription ranged = {};
-    ranged.mFormat = MakeStreamDescription(sampleRate);
+    ranged.mFormat = MakeStreamDescription(sampleRate, channelCount);
     ranged.mSampleRateRange.mMinimum = sampleRate;
     ranged.mSampleRateRange.mMaximum = sampleRate;
     return ranged;
@@ -376,6 +473,8 @@ Boolean LoopbackerDriver::HasProperty(AudioServerPlugInDriverRef inDriver,
                 case kAudioDevicePropertyPreferredChannelLayout:
                 case kAudioDevicePropertyBufferFrameSize:
                 case kAudioDevicePropertyBufferFrameSizeRange:
+                case kAudioObjectPropertyCustomPropertyInfoList:
+                case kLoopbackerDevicePropertyChannelCount:
                     return true;
             }
             break;
@@ -439,6 +538,7 @@ OSStatus LoopbackerDriver::IsPropertySettable(AudioServerPlugInDriverRef inDrive
             switch (inAddress->mSelector) {
                 case kAudioDevicePropertyNominalSampleRate:
                 case kAudioDevicePropertyBufferFrameSize:
+                case kLoopbackerDevicePropertyChannelCount:
                     *outIsSettable = true;
                     return kAudioHardwareNoError;
             }
@@ -573,13 +673,19 @@ OSStatus LoopbackerDriver::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyPreferredChannelLayout:
                     *outDataSize = offsetof(AudioChannelLayout, mChannelDescriptions) +
-                                   kChannelCount * sizeof(AudioChannelDescription);
+                                   dev->channelCount.load(std::memory_order_acquire) * sizeof(AudioChannelDescription);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyBufferFrameSize:
                     *outDataSize = sizeof(UInt32);
                     return kAudioHardwareNoError;
                 case kAudioDevicePropertyBufferFrameSizeRange:
                     *outDataSize = sizeof(AudioValueRange);
+                    return kAudioHardwareNoError;
+                case kAudioObjectPropertyCustomPropertyInfoList:
+                    *outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+                    return kAudioHardwareNoError;
+                case kLoopbackerDevicePropertyChannelCount:
+                    *outDataSize = sizeof(CFPropertyListRef);
                     return kAudioHardwareNoError;
             }
             break;
@@ -930,17 +1036,25 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                 }
 
                 case kAudioDevicePropertyPreferredChannelLayout: {
+                    UInt32 ch = dev->channelCount.load(std::memory_order_acquire);
                     UInt32 needed = offsetof(AudioChannelLayout, mChannelDescriptions) +
-                                    kChannelCount * sizeof(AudioChannelDescription);
+                                    ch * sizeof(AudioChannelDescription);
                     if (inDataSize < needed)
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = needed;
                     auto* layout = static_cast<AudioChannelLayout*>(outData);
                     memset(layout, 0, needed);
                     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
-                    layout->mNumberChannelDescriptions = kChannelCount;
-                    layout->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Left;
-                    layout->mChannelDescriptions[1].mChannelLabel = kAudioChannelLabel_Right;
+                    layout->mNumberChannelDescriptions = ch;
+                    // Channel 1 -> Left, channel 2 -> Right, channel 3+ -> numbered
+                    // discrete labels (kAudioChannelLabel_Discrete_<index>).
+                    for (UInt32 i = 0; i < ch; ++i) {
+                        AudioChannelLabel label;
+                        if (i == 0) label = kAudioChannelLabel_Left;
+                        else if (i == 1) label = kAudioChannelLabel_Right;
+                        else label = static_cast<AudioChannelLabel>(kAudioChannelLabel_Discrete_0 + i);
+                        layout->mChannelDescriptions[i].mChannelLabel = label;
+                    }
                     return kAudioHardwareNoError;
                 }
 
@@ -954,6 +1068,29 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     auto* range = static_cast<AudioValueRange*>(outData);
                     range->mMinimum = kDefaultIOBufferFrames;
                     range->mMaximum = kDefaultIOBufferFrames;
+                    return kAudioHardwareNoError;
+                }
+
+                case kAudioObjectPropertyCustomPropertyInfoList: {
+                    UInt32 needed = sizeof(AudioServerPlugInCustomPropertyInfo);
+                    if (inDataSize < needed)
+                        return kAudioHardwareBadPropertySizeError;
+                    *outDataSize = needed;
+                    auto* info = static_cast<AudioServerPlugInCustomPropertyInfo*>(outData);
+                    info->mSelector = kLoopbackerDevicePropertyChannelCount;
+                    info->mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+                    info->mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    return kAudioHardwareNoError;
+                }
+
+                case kLoopbackerDevicePropertyChannelCount: {
+                    if (inDataSize < sizeof(CFPropertyListRef))
+                        return kAudioHardwareBadPropertySizeError;
+                    *outDataSize = sizeof(CFPropertyListRef);
+                    SInt32 value = static_cast<SInt32>(dev->channelCount.load(std::memory_order_acquire));
+                    // +1 retained CFNumber; the caller releases it.
+                    *static_cast<CFPropertyListRef*>(outData) =
+                        CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
                     return kAudioHardwareNoError;
                 }
             }
@@ -1003,7 +1140,7 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     *outDataSize = sizeof(AudioStreamBasicDescription);
                     std::lock_guard<std::mutex> lock(driver->mMutex);
                     *static_cast<AudioStreamBasicDescription*>(outData) =
-                        MakeStreamDescription(dev->sampleRate);
+                        MakeStreamDescription(dev->sampleRate, dev->channelCount.load(std::memory_order_acquire));
                     return kAudioHardwareNoError;
                 }
 
@@ -1014,8 +1151,9 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                         return kAudioHardwareBadPropertySizeError;
                     *outDataSize = needed;
                     auto* descs = static_cast<AudioStreamRangedDescription*>(outData);
+                    UInt32 ch = dev->channelCount.load(std::memory_order_acquire);
                     for (UInt32 i = 0; i < kNumSampleRates; ++i) {
-                        descs[i] = MakeRangedDescription(kSampleRates[i]);
+                        descs[i] = MakeRangedDescription(kSampleRates[i], ch);
                     }
                     return kAudioHardwareNoError;
                 }
@@ -1210,6 +1348,33 @@ OSStatus LoopbackerDriver::SetPropertyData(AudioServerPlugInDriverRef inDriver,
                         driver->mHost->PropertiesChanged(driver->mHost, dev->deviceID, 1, &addr);
                     }
                     return kAudioHardwareNoError;
+                }
+
+                case kLoopbackerDevicePropertyChannelCount: {
+                    if (inDataSize < sizeof(CFPropertyListRef))
+                        return kAudioHardwareBadPropertySizeError;
+                    CFPropertyListRef plist = *static_cast<const CFPropertyListRef*>(inData);
+                    if (plist == nullptr || CFGetTypeID(plist) != CFNumberGetTypeID())
+                        return kAudioHardwareIllegalOperationError;
+
+                    SInt32 requested = 0;
+                    if (!CFNumberGetValue(static_cast<CFNumberRef>(plist), kCFNumberSInt32Type, &requested)
+                            || !IsValidChannelCount(requested))
+                        return kAudioHardwareIllegalOperationError;
+
+                    UInt32 newCount = static_cast<UInt32>(requested);
+                    if (newCount == dev->channelCount.load(std::memory_order_acquire))
+                        return kAudioHardwareNoError; // setting the current value is a no-op
+
+                    if (driver->mHost == nullptr)
+                        return kAudioHardwareIllegalOperationError;
+
+                    {
+                        std::lock_guard<std::mutex> lock(driver->mMutex);
+                        dev->pendingChannelCount = newCount;
+                    }
+                    return driver->mHost->RequestDeviceConfigurationChange(
+                        driver->mHost, dev->deviceID, kChannelCountChangeAction, nullptr);
                 }
             }
             break;
@@ -1410,6 +1575,9 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
 
         case kAudioServerPlugInIOOperationReadInput: {
             auto* samples = static_cast<float*>(ioMainBuffer);
+            // Real-time safe: atomic load only, no allocation/lock/logging.
+            // Only changes while IO is stopped (PerformDeviceConfigurationChange).
+            UInt32 ch = dev->channelCount.load(std::memory_order_acquire);
 
             // Snapshot the ring buffer once per IO cycle. The first reader
             // atomically claims the snapshot; all subsequent readers in the
@@ -1422,8 +1590,8 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                 uint32_t framesRead = dev->ringBuffer->read(
                     dev->snapshotBuffer.data(), inIOBufferFrameSize);
                 if (framesRead < inIOBufferFrameSize) {
-                    uint32_t rem = (inIOBufferFrameSize - framesRead) * kChannelCount;
-                    memset(&dev->snapshotBuffer[framesRead * kChannelCount], 0,
+                    uint32_t rem = (inIOBufferFrameSize - framesRead) * ch;
+                    memset(&dev->snapshotBuffer[framesRead * ch], 0,
                            rem * sizeof(float));
                 }
 
@@ -1431,7 +1599,7 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                 float vol = dev->volume;
                 if (dev->mute) vol = 0.0f;
                 if (vol < 1.0f) {
-                    uint32_t totalSamples = inIOBufferFrameSize * kChannelCount;
+                    uint32_t totalSamples = inIOBufferFrameSize * ch;
                     for (uint32_t i = 0; i < totalSamples; ++i) {
                         dev->snapshotBuffer[i] *= vol;
                     }
@@ -1440,7 +1608,7 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
 
             // All readers get the same snapshot
             memcpy(samples, dev->snapshotBuffer.data(),
-                   static_cast<size_t>(inIOBufferFrameSize) * kBytesPerFrame);
+                   static_cast<size_t>(inIOBufferFrameSize) * BytesPerFrameForChannelCount(ch));
             break;
         }
 

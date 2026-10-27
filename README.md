@@ -35,11 +35,12 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 
 **Audio Routing**
 
-- Virtual stereo loopback device (48kHz / 32-bit float)
-- Route any input device to the virtual output
+- Virtual loopback devices (48kHz / 32-bit float), 2–16 channels per device
+- Route any channel of any input device to any virtual mic channel; add mic channels in pairs with ⊕
 - Monitor output (hear yourself through speakers)
 - Per-channel routing with visual cable connections
-- 8 independent virtual loopback devices
+- 2 independent virtual loopback devices
+- Output routing: send one channel pair of a multichannel device to your speakers while apps record the other channels
 - Scenes system for saving/loading routing configs
 
 **Effects Chain** (9 real-time DSP effects, all processed on the audio thread)
@@ -137,6 +138,12 @@ make uninstall    # Remove driver + app
 4. In your chat/recording app, select **Loopbacker** as the input device.
 5. Open **Effects** (⌘2) to enable broadcast voice processing.
 6. Open **Soundboard** (⌘3) to play audio clips through the virtual device, or **Scenes** (⌘4) to save and switch setups.
+
+### Multichannel example: timecode alongside monitoring
+
+1. In **Routing → Output Routing**, add **Loopbacker 2**, set **Channels** to 4, **Monitor** to 1–2, and **Output** to your speakers.
+2. In DaVinci Resolve (or any app), output to **Loopbacker 2** and put the timecode on channel 3.
+3. Point your timecode-to-MIDI tool at **Loopbacker 2**, channel 3. You hear channels 1–2; channel 3 never reaches the speakers.
 
 ## Project structure
 

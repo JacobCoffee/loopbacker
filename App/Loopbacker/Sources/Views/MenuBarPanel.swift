@@ -93,8 +93,7 @@ struct MenuBarPanel: View {
                         StatusTag(title: "Muted", tint: .signalWarm)
                     }
                 }
-                SignalMeter(level: isLive ? sourceMeterLevel(source) : 0, thickness: 4)
-                    .opacity(isLive ? 1 : 0.5)
+                SourcePeakMeter(key: source.deviceUID, isLive: isLive)
             }
 
             Toggle(source.isEnabled ? "Turn off \(source.name)" : "Turn on \(source.name)", isOn: Binding(
@@ -109,11 +108,6 @@ struct MenuBarPanel: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(source.name), \(source.isMuted ? "muted" : source.isEnabled ? "on" : "off")")
-    }
-
-    private func sourceMeterLevel(_ source: AudioSource) -> Float {
-        let levels = audioRouter.sourceMeterLevels[source.deviceUID] ?? [:]
-        return levels.values.max() ?? 0
     }
 
     // MARK: - Actions

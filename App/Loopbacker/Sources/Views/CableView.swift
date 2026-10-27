@@ -5,6 +5,8 @@ import SwiftUI
 /// following the source's current level; idle or disabled cables stay dim graphite.
 struct CableView: View {
     @EnvironmentObject var routingState: RoutingState
+    // Canvas-only view, so redrawing it at meter rate is cheap.
+    @Environment(MeterLevels.self) private var meters
     let connectorPositions: [ConnectorEnd: CGRect]
 
     var body: some View {
@@ -30,7 +32,7 @@ struct CableView: View {
 
             // Soft bloom under each live source's connectors.
             for source in routingState.sources where source.isEnabled && !source.isMuted {
-                let level = source.channels.map(\.meterLevel).max() ?? 0
+                let level = meters.peak(source: source.deviceUID)
                 guard level > 0.02 else { continue }
                 for channel in source.channels {
                     guard let rect = connectorPositions[.source(sourceId: source.id, channelId: channel.id)] else { continue }
@@ -52,7 +54,7 @@ struct CableView: View {
     private func sourceLevel(_ route: AudioRoute) -> Float {
         guard let source = routingState.sources.first(where: { $0.id == route.sourceId }),
               source.isEnabled, !source.isMuted else { return 0 }
-        return source.channels.map(\.meterLevel).max() ?? 0
+        return meters.peak(source: source.deviceUID)
     }
 
     // MARK: - Cable drawing

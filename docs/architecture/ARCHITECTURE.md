@@ -385,6 +385,77 @@ Both `kAudioDevicePropertyLatency` and `kAudioDevicePropertySafetyOffset` return
 
 **Rationale**: Minimizes the total roundtrip latency reported to apps.
 
+## Per-Device Channel Count (`lbch`)
+
+Each virtual device's channel count is independently configurable (even
+integers 2-16, default 2) via a custom property, not a compile-time constant.
+Input and output streams on a device always share the same count.
+
+- **Property**: selector `kLoopbackerDevicePropertyChannelCount` (FourCC
+  `'lbch'`), scope `kAudioObjectPropertyScopeGlobal`, element
+  `kAudioObjectPropertyElementMain`. Listed in the device's
+  `kAudioObjectPropertyCustomPropertyInfoList` with data type
+  `kAudioServerPlugInCustomPropertyDataTypeCFPropertyList` (a `CFNumber`
+  holding the channel count as `kCFNumberSInt32Type`).
+- **Validation**: `SetPropertyData` rejects anything outside even integers in
+  `[2, kMaxChannelCount]` with `kAudioHardwareIllegalOperationError`. Setting
+  the current value is a no-op that returns `noErr`.
+- **Apply flow (e.g. 2 -> 4 channels)**:
+  1. `SetPropertyData` validates the new count, stores it in
+     `DeviceState::pendingChannelCount` (guarded by `mMutex`), and calls
+     `RequestDeviceConfigurationChange`.
+  2. The HAL stops IO on the device and calls back into
+     `PerformDeviceConfigurationChange`.
+  3. `PerformDeviceConfigurationChange` is the only place (besides
+     `Initialize`) allowed to reallocate: it rebuilds the device's
+     `RingBuffer` and `snapshotBuffer` sized for the new channel count,
+     stores the count atomically on `DeviceState::channelCount`, and writes
+     it to host storage.
+  4. The HAL re-reads `kAudioStreamPropertyVirtualFormat` /
+     `PhysicalFormat` on both streams, which now report the new
+     `mChannelsPerFrame` / `mBytesPerFrame`; no manual format-change
+     notification is sent.
+- **Persistence**: `PerformDeviceConfigurationChange` calls
+  `host->WriteToStorage` with key `"channelCount.<deviceUID>"` and a
+  `CFNumber` value. `Initialize` restores it per device via
+  `host->CopyFromStorage`, falling back to the default (2) if the key is
+  absent or the stored value is invalid.
+- **IO path**: `DoIOOperation` reads `DeviceState::channelCount` with an
+  atomic load (real-time safe — no allocation/lock/logging) to size its
+  `memcpy`/volume-scaling loops; the value only changes while IO is stopped.
+- **Channel layout**: channel 1 -> Left, channel 2 -> Right, channel 3+ ->
+  `kAudioChannelLabel_Discrete_<index>`. `kAudioDevicePropertyPreferredChannelsForStereo`
+  always reports `[1, 2]` regardless of channel count.
+
+### App side
+
+The app sets `lbch` through `VirtualDeviceChannels` and owns the desired counts:
+
+- **Virtual mic** (`LoopbackerDevice_UID`): the Routing canvas's output channels
+  rounded up to a pair (`RoutingState.micChannelCount`). The ⊕/⊖ buttons add or
+  remove a pair.
+- **Output devices** (e.g. `LoopbackerDevice_UID_2`): `OutputDestination.channelCount`,
+  plus `monitorChannel`, the first channel of the pair played to the physical output.
+
+`AudioRouter.setVirtualDeviceChannels` stops the routes that touch the device, sets
+the property, waits (≤2 s) for the HAL to report the new stream configuration, and
+restarts the same routes. Saved counts are pushed before any route starts at launch.
+
+Each `RouteContext` has independent widths: `inputChannels` (every channel of the
+source, capped at 64) and `outputChannels` (the playback device). One block flows:
+
+```
+capture (inputChannels) → source meter → mix matrix (outputChannels × inputChannels)
+  → effects on channels 1–2 → output meter → drift-compensated ring → playback
+```
+
+Output routing captures every channel of the virtual device and mixes the monitor pair
+to the physical output's first two channels, so other channels (a timecode track, for
+example) stay on the device for other apps to record without reaching the speakers.
+
+Meter levels go to an `@Observable` `MeterLevels` store rather than the routing model,
+so 30 Hz meter updates re-render only the meter views.
+
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
@@ -409,7 +480,6 @@ Both `kAudioDevicePropertyLatency` and `kAudioDevicePropertySafetyOffset` return
 
 ## Future Considerations (Out of Scope for v0.1)
 
-- Multiple channel counts (separate binaries like BlackHole)
 - A preferences app / menu bar utility for configuration
 - Volume scaling in the IO path
 - Per-client isolation (separate ring buffers per client)

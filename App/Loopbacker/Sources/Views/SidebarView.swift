@@ -99,7 +99,6 @@ private struct SidebarSourceRow: View {
     let isAppStopped: Bool
 
     private var isLive: Bool { source.isEnabled && !source.isMuted }
-    private var level: Float { source.channels.map(\.meterLevel).max() ?? 0 }
 
     private var enabled: Binding<Bool> {
         Binding(get: { source.isEnabled }, set: { _ in routingState.toggleSource(source.id) })
@@ -118,8 +117,7 @@ private struct SidebarSourceRow: View {
                         .foregroundStyle(source.isEnabled ? .primary : .secondary)
                     if let tag = statusTag { tag }
                 }
-                SignalMeter(level: isLive ? level : 0, thickness: 3)
-                    .opacity(isLive ? 1 : 0.5)
+                SourcePeakMeter(key: source.deviceUID, isLive: isLive, thickness: 3)
             }
 
             Toggle(source.isEnabled ? "Disable \(source.name)" : "Enable \(source.name)", isOn: enabled)
@@ -139,7 +137,6 @@ private struct SidebarSourceRow: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(isLive ? SignalMeter.dbString(level) : (source.isEnabled ? "Muted" : "Off"))
     }
 
     private var statusTag: StatusTag? {

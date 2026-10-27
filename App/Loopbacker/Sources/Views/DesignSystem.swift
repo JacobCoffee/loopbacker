@@ -158,6 +158,23 @@ struct SignalMeter: View {
     }
 }
 
+/// A source's loudest channel, read live from `MeterLevels`. Keep this a leaf: it is the only
+/// view that re-renders at meter rate in a row.
+struct SourcePeakMeter: View {
+    @Environment(MeterLevels.self) private var meters
+    /// Route key (`AudioSource.deviceUID`, or "output:<virtual device UID>").
+    let key: String
+    let isLive: Bool
+    var thickness: CGFloat = 4
+
+    var body: some View {
+        let level = isLive ? meters.peak(source: key) : 0
+        SignalMeter(level: level, thickness: thickness)
+            .opacity(isLive ? 1 : 0.5)
+            .accessibilityValue(isLive ? SignalMeter.dbString(level) : "Off")
+    }
+}
+
 // MARK: - Status tag
 
 /// Small capsule naming a state that needs attention: Muted, Unavailable, Not Running.

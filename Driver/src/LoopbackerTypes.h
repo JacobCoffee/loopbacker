@@ -50,9 +50,27 @@ static const char* kDeviceManufacturer = "JacobCoffee";
 static const char* kDeviceModelUID     = "LoopbackerDevice_ModelUID";
 
 // Audio format constants
-static const uint32_t kChannelCount    = 2;
-static const uint32_t kBitsPerChannel  = 32;
-static const uint32_t kBytesPerFrame   = kChannelCount * (kBitsPerChannel / 8); // 8
+static const uint32_t kDefaultChannelCount = 2;   // default/fallback channel count per device
+static const uint32_t kMaxChannelCount     = 16;  // highest channel count 'lbch' will accept
+static const uint32_t kBitsPerChannel      = 32;  // fixed regardless of channel count
+
+// Bytes per frame for a given channel count (32-bit float samples, interleaved).
+static inline uint32_t BytesPerFrameForChannelCount(uint32_t channelCount)
+{
+    return channelCount * (kBitsPerChannel / 8);
+}
+
+// Custom device property: per-device channel count. Listed in the device's
+// kAudioObjectPropertyCustomPropertyInfoList; data type is CFPropertyListRef
+// holding a CFNumber (kCFNumberSInt32Type). Scope is
+// kAudioObjectPropertyScopeGlobal, element kAudioObjectPropertyElementMain.
+// Valid values are even integers in [2, kMaxChannelCount]; both of the
+// device's streams (input and output) always share this count. Changing it
+// goes through the HAL configuration-change protocol (see
+// LoopbackerDriver::SetPropertyData / PerformDeviceConfigurationChange) and
+// is persisted via host storage under key "channelCount.<deviceUID>".
+static const AudioObjectPropertySelector kLoopbackerDevicePropertyChannelCount =
+    'lbch'; // 0x6C626368
 
 // Supported sample rates — locked to 48kHz to prevent browsers (Firefox/Chrome)
 // from changing the rate and breaking active routes. Browsers resample on their end.
