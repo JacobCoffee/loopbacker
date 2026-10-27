@@ -64,6 +64,7 @@ jobs:
 
           cp App/Loopbacker/.build/release/Loopbacker Loopbacker.app/Contents/MacOS/
           cp App/Loopbacker/Resources/Info.plist        Loopbacker.app/Contents/
+          cp App/Loopbacker/Resources/AppIcon.icns      Loopbacker.app/Contents/Resources/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
           xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
             --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
