@@ -3,55 +3,48 @@ import AppKit
 
 // MARK: - Design tokens (adaptive light/dark)
 
+/// Colors are dynamic `NSColor`s resolved against the drawing view's effective
+/// appearance at render time. Picking a variant in a computed property instead
+/// would freeze whatever was current when a view body last ran, so views that
+/// SwiftUI doesn't re-evaluate after an appearance toggle keep the old palette.
 enum LoopbackerTheme {
-    /// Whether the current theme is dark (reads the user's appearance toggle)
-    static var isDark: Bool {
-        let override = UserDefaults.standard.string(forKey: "appearanceOverride") ?? "system"
-        switch override {
-        case "light": return false
-        case "dark": return true
-        default: return NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        }
+    private static func adaptive(light: NSColor, dark: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        })
+    }
+
+    private static func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+        NSColor(srgbRed: r, green: g, blue: b, alpha: 1)
     }
 
     // Backgrounds
-    static var bgDeep: Color { isDark
-        ? Color(red: 0.08, green: 0.08, blue: 0.14)
-        : Color(red: 0.94, green: 0.94, blue: 0.96) }
-    static var bgSurface: Color { isDark
-        ? Color(red: 0.13, green: 0.13, blue: 0.20)
-        : Color(red: 0.97, green: 0.97, blue: 0.98) }
-    static var bgCard: Color { isDark
-        ? Color(red: 0.16, green: 0.16, blue: 0.24)
-        : Color.white }
-    static var bgCardHover: Color { isDark
-        ? Color(red: 0.19, green: 0.19, blue: 0.28)
-        : Color(red: 0.96, green: 0.97, blue: 0.98) }
-    static var bgInset: Color { isDark
-        ? Color(red: 0.10, green: 0.10, blue: 0.16)
-        : Color(red: 0.91, green: 0.92, blue: 0.94) }
+    static let bgDeep = adaptive(light: rgb(0.94, 0.94, 0.96), dark: rgb(0.08, 0.08, 0.14))
+    static let bgSurface = adaptive(light: rgb(0.97, 0.97, 0.98), dark: rgb(0.12, 0.12, 0.19))
+    static let bgCard = adaptive(light: .white, dark: rgb(0.16, 0.16, 0.24))
+    static let bgCardHover = adaptive(light: rgb(0.96, 0.97, 0.98), dark: rgb(0.19, 0.19, 0.28))
+    static let bgInset = adaptive(light: rgb(0.91, 0.92, 0.94), dark: rgb(0.10, 0.10, 0.16))
 
     // Accent (darker in light mode for contrast)
-    static var accent: Color { isDark
-        ? Color(red: 0.0, green: 0.83, blue: 0.67)
-        : Color(red: 0.0, green: 0.60, blue: 0.46) }
-    static var accentDim: Color { isDark
-        ? Color(red: 0.0, green: 0.50, blue: 0.40)
-        : Color(red: 0.0, green: 0.40, blue: 0.30) }
+    static let accent = adaptive(light: rgb(0.0, 0.60, 0.46), dark: rgb(0.0, 0.83, 0.67))
+    static let accentDim = adaptive(light: rgb(0.0, 0.40, 0.30), dark: rgb(0.0, 0.50, 0.40))
     static var accentGlow: Color { accent.opacity(0.3) }
 
-    // Text
-    static var textPrimary: Color { isDark ? .white : Color(red: 0.10, green: 0.10, blue: 0.15) }
-    static var textSecondary: Color { isDark ? Color(white: 0.55) : Color(white: 0.40) }
-    static var textMuted: Color { isDark ? Color(white: 0.35) : Color(white: 0.60) }
+    // Text (dark-mode neutrals carry the backgrounds' blue tint)
+    static let textPrimary = adaptive(light: rgb(0.10, 0.10, 0.15), dark: rgb(0.93, 0.93, 0.97))
+    static let textSecondary = adaptive(light: rgb(0.40, 0.40, 0.40), dark: rgb(0.62, 0.63, 0.72))
+    static let textMuted = adaptive(light: rgb(0.60, 0.60, 0.60), dark: rgb(0.44, 0.45, 0.55))
 
-    // Borders
-    static var border: Color { isDark ? Color(white: 0.15) : Color(white: 0.82) }
+    // Borders (dark border must sit above bgCard, not below it, to read as an edge)
+    static let border = adaptive(light: rgb(0.82, 0.82, 0.82), dark: rgb(0.24, 0.24, 0.34))
     static var borderActive: Color { accent.opacity(0.5) }
+    static let gridLine = adaptive(
+        light: NSColor(srgbRed: 0.12, green: 0.12, blue: 0.12, alpha: 0.3),
+        dark: NSColor(srgbRed: 0.32, green: 0.32, blue: 0.46, alpha: 0.3))
 
     // Status
     static let danger = Color(red: 0.95, green: 0.30, blue: 0.35)
-    static let warning = Color(red: 0.95, green: 0.75, blue: 0.20)
+    static let warning = adaptive(light: rgb(0.72, 0.50, 0.0), dark: rgb(0.95, 0.75, 0.20))
 
     // Layout
     static let connectorRadius: CGFloat = 5
@@ -174,9 +167,10 @@ struct ChannelStripView: View {
                     .blur(radius: 4)
             }
 
-            // Outer ring
+            // Outer ring (outlined when idle so it reads against bgCard in dark mode)
             Circle()
                 .fill(isConnected || isPending ? LoopbackerTheme.accent : LoopbackerTheme.bgInset)
+                .overlay(Circle().strokeBorder(isConnected || isPending ? Color.clear : LoopbackerTheme.border, lineWidth: 1))
                 .frame(width: 12, height: 12)
 
             // Inner dot

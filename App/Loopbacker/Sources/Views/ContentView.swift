@@ -533,7 +533,7 @@ struct ContentView: View {
     private var gridBackground: some View {
         Canvas { context, size in
             let gridSpacing: CGFloat = 30
-            let lineColor = Color(white: 0.12).opacity(0.3)
+            let lineColor = LoopbackerTheme.gridLine
 
             var x: CGFloat = 0
             while x < size.width {

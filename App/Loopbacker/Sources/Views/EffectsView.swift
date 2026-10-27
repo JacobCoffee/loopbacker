@@ -346,7 +346,7 @@ struct EffectsView: View {
     private var pipelineBackground: some View {
         Canvas { context, size in
             let gridSpacing: CGFloat = 24
-            let lineColor = Color(white: 0.12).opacity(0.15)
+            let lineColor = LoopbackerTheme.gridLine.opacity(0.5)
 
             var x: CGFloat = 0
             while x < size.width {
@@ -1057,7 +1057,7 @@ struct EffectsView: View {
             // Block order indicator
             Text("\(index + 1)")
                 .font(.system(size: 7, weight: .bold, design: .monospaced))
-                .foregroundColor(LoopbackerTheme.textMuted.opacity(0.4))
+                .foregroundColor(LoopbackerTheme.textMuted)
                 .padding(.top, 4)
         }
     }
@@ -1788,13 +1788,13 @@ struct EffectsView: View {
             HStack {
                 Text(formatDisplayValue(range.lowerBound, unit: unit))
                     .font(.system(size: 8, design: .monospaced))
-                    .foregroundColor(LoopbackerTheme.textMuted.opacity(0.5))
+                    .foregroundColor(LoopbackerTheme.textMuted)
 
                 Spacer()
 
                 Text(formatDisplayValue(range.upperBound, unit: unit))
                     .font(.system(size: 8, design: .monospaced))
-                    .foregroundColor(LoopbackerTheme.textMuted.opacity(0.5))
+                    .foregroundColor(LoopbackerTheme.textMuted)
             }
         }
         .padding(.horizontal, 12)
