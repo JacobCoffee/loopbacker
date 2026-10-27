@@ -4,43 +4,43 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Loopbacker</string>
 	<key>CFBundleExecutable</key>
 	<string>Loopbacker</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.jacobcoffee.loopbacker</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>Loopbacker</string>
-	<key>CFBundleDisplayName</key>
-	<string>Loopbacker</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.3.1</string>
+	<string>4.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>11</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon.icns</string>
-	<key>CFBundleIconName</key>
-	<string>AppIcon</string>
 	<key>NSAccentColorName</key>
 	<string>AccentColor</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSSupportsAutomaticTermination</key>
-	<true/>
-	<key>NSSupportsSuddenTermination</key>
-	<false/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Jacob Coffee. All rights reserved.</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.music</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Loopbacker needs microphone access to route audio between devices.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Loopbacker uses Screen Recording permission to capture audio from individual applications (e.g. browser tabs playing music).</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<true/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 </dict>
 </plist>
