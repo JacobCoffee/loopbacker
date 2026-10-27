@@ -2,6 +2,10 @@ APP_BUNDLE := Loopbacker.app
 BUILD_DIR := build
 APP_CONTENTS := $(BUILD_DIR)/$(APP_BUNDLE)/Contents
 SWIFT_BIN := App/Loopbacker/.build/release/Loopbacker
+# First Apple Development identity in the keychain, or ad-hoc ("-") without one. A real
+# identity keeps the designated requirement stable across rebuilds, so privacy grants such
+# as Screen & System Audio Recording survive reinstalls. Override: make SIGN_IDENTITY="…"
+SIGN_IDENTITY ?= $(or $(shell security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $$2; exit}'),-)
 
 .DEFAULT_GOAL := help
 
@@ -37,7 +41,8 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
 	cp -R Driver/build/Loopbacker.driver $(APP_CONTENTS)/Resources/
-	codesign --force --deep --sign "Apple Development: Jacob Coffee (NBMD22TJZJ)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
+	codesign --force --deep --sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
+	codesign --verify --deep --strict $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."
 
 # --- Install targets ---
