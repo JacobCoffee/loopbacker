@@ -6,12 +6,9 @@ struct SourceCardView: View {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var appCaptureService: AppCaptureService
-    @State private var isHovering = false
     @State private var showOptions = false
 
-    private var hasActiveRoutes: Bool {
-        routingState.routes.contains { $0.sourceId == source.id }
-    }
+    private var isLive: Bool { source.isEnabled && !source.isMuted }
 
     /// Device source whose CoreAudio UID isn't among the current system devices
     /// (unplugged, or re-enumerated under a different driver with no unique name match).
@@ -21,257 +18,141 @@ struct SourceCardView: View {
         return !audioDeviceManager.systemDevices.contains { $0.uid == source.deviceUID }
     }
 
+    private var isNotRunning: Bool {
+        source.isAppCapture && !appCaptureService.isAppRunning(bundleID: source.appBundleID)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
             header
 
-            Divider()
-                .background(LoopbackerTheme.border)
+            Divider().opacity(0.5)
 
-            // Channel strips
             VStack(spacing: 4) {
                 ForEach(source.channels) { channel in
                     ChannelStripView(
                         channel: channel,
                         side: .source,
-                        isSourceEnabled: source.isEnabled && !source.isMuted,
+                        isSourceEnabled: isLive,
                         connectorEnd: .source(sourceId: source.id, channelId: channel.id)
                     )
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
-            // Options disclosure
-            if showOptions {
-                optionsSection
-            }
-
-            optionsToggle
+            optionsDisclosure
         }
-        .background(
-            RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
-                .fill(isHovering ? LoopbackerTheme.bgCardHover : LoopbackerTheme.bgCard)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
-                .strokeBorder(
-                    source.isEnabled && hasActiveRoutes
-                        ? LoopbackerTheme.borderActive
-                        : LoopbackerTheme.border,
-                    lineWidth: source.isEnabled && hasActiveRoutes ? 1.5 : 0.5
-                )
-        )
-        .shadow(
-            color: source.isEnabled && hasActiveRoutes
-                ? LoopbackerTheme.accentGlow.opacity(0.15)
-                : Color.clear,
-            radius: 8
-        )
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovering = hovering
-            }
-        }
+        .glassPanel(tint: isLive ? .loopbacker.opacity(0.08) : nil)
     }
 
     // MARK: - Header
 
     private var header: some View {
         HStack(spacing: 10) {
-            // Device icon
             ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(source.isEnabled && !source.isMuted ? LoopbackerTheme.accent.opacity(0.15) : LoopbackerTheme.bgInset)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isLive ? Color.loopbacker.opacity(0.18) : Color.secondary.opacity(0.12))
                     .frame(width: 32, height: 32)
 
                 Image(systemName: source.icon)
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(source.isEnabled && !source.isMuted ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
+                    .foregroundStyle(isLive ? Color.loopbacker : .secondary)
             }
 
-            // Device name
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(source.name)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(source.isEnabled ? LoopbackerTheme.textPrimary : LoopbackerTheme.textMuted)
+                        .font(.headline)
+                        .foregroundStyle(source.isEnabled ? .primary : .secondary)
+                        .lineLimit(1)
 
                     if source.isMuted {
-                        Text("MUTED")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundColor(LoopbackerTheme.warning)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(LoopbackerTheme.warning.opacity(0.15))
-                            .clipShape(Capsule())
+                        StatusTag(title: "Muted", tint: .signalWarm, symbol: "speaker.slash.fill")
                     }
-
-                    if source.isAppCapture && !appCaptureService.isAppRunning(bundleID: source.appBundleID) {
-                        Text("NOT RUNNING")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(LoopbackerTheme.bgInset)
-                            .clipShape(Capsule())
+                    if isNotRunning {
+                        StatusTag(title: "Not Running", tint: .secondary)
                     }
-
                     if isDeviceMissing {
-                        Text("UNAVAILABLE")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundColor(LoopbackerTheme.warning)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(LoopbackerTheme.warning.opacity(0.15))
-                            .clipShape(Capsule())
+                        StatusTag(title: "Unavailable", tint: .signalWarm, symbol: "exclamationmark.triangle.fill")
                             .help("No audio device with this source's ID is connected. Reconnect it, or remove and re-add the source.")
                     }
                 }
 
                 Text(source.isAppCapture ? "App Audio" : "\(source.channels.count) channel\(source.channels.count == 1 ? "" : "s")")
-                    .font(.system(size: 10, weight: .regular))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
-            // On/Off toggle
-            enableToggle
+            Toggle(source.isEnabled ? "Disable \(source.name)" : "Enable \(source.name)", isOn: Binding(
+                get: { source.isEnabled },
+                set: { _ in withAnimation(.easeInOut(duration: 0.2)) { routingState.toggleSource(source.id) } }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .labelsHidden()
+            .help(source.isEnabled ? "Disable this audio source (stops routing)" : "Enable this audio source (starts routing)")
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, Metrics.panelPadding)
         .padding(.vertical, 10)
     }
 
-    // MARK: - Custom toggle
+    // MARK: - Options disclosure
 
-    private var enableToggle: some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                routingState.toggleSource(source.id)
-            }
-        }) {
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(source.isEnabled ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-                    .frame(width: 6, height: 6)
-                    .shadow(color: source.isEnabled ? LoopbackerTheme.accentGlow : .clear, radius: 3)
-
-                Text(source.isEnabled ? "ON" : "OFF")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(source.isEnabled ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule()
-                    .fill(source.isEnabled ? LoopbackerTheme.accent.opacity(0.12) : LoopbackerTheme.bgInset)
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(
-                        source.isEnabled ? LoopbackerTheme.accent.opacity(0.3) : LoopbackerTheme.border,
-                        lineWidth: 0.5
-                    )
-            )
+    private var optionsDisclosure: some View {
+        DisclosureGroup(isExpanded: $showOptions) {
+            optionsSection
+        } label: {
+            Text("Options")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .tooltip(source.isEnabled ? "Disable this audio source (stops routing)" : "Enable this audio source (starts routing)")
+        .padding(.horizontal, Metrics.panelPadding)
+        .padding(.vertical, 8)
+        .help(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
     }
 
-    // MARK: - Options section
-
     private var optionsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Divider()
-                .background(LoopbackerTheme.border)
-
-            // Monitor output picker (not available for app capture sources)
+        VStack(alignment: .leading, spacing: 10) {
             if !source.isAppCapture {
                 HStack(spacing: 6) {
-                    Image(systemName: "speaker.wave.2")
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textSecondary)
-
-                    Text("Monitor:")
-                        .font(.system(size: 11))
-                        .foregroundColor(LoopbackerTheme.textSecondary)
-
+                    Text("Monitor")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                     monitorPicker
                 }
-                .tooltip("Hear this source through a physical output (speakers/headphones)")
+                .help("Hear this source through a physical output (speakers/headphones)")
             }
 
-            // Mute toggle
-            HStack {
-                Text("Mute")
-                    .font(.system(size: 11))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { routingState.muteSource(source.id) }
+                } label: {
+                    Label(source.isMuted ? "Muted" : "Mute", systemImage: source.isMuted ? "speaker.slash.fill" : "speaker.wave.1")
+                        .font(.caption)
+                }
+                .buttonStyle(.glass)
+                .tint(source.isMuted ? Color.signalWarm : nil)
+                .controlSize(.small)
+                .help(source.isMuted ? "Unmute this source to resume audio routing" : "Mute this source (silences output without disconnecting routes)")
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { routingState.soloSource(source.id) }
+                } label: {
+                    Label("Solo", systemImage: "headphones")
+                        .font(.caption)
+                }
+                .buttonStyle(.glass)
+                .tint(nil)
+                .controlSize(.small)
+                .help("Mute all other sources and listen to only this one")
 
                 Spacer()
-
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        routingState.muteSource(source.id)
-                    }
-                }) {
-                    HStack(spacing: 3) {
-                        Image(systemName: source.isMuted ? "speaker.slash.fill" : "speaker.wave.1")
-                            .font(.system(size: 9, weight: .semibold))
-                        Text(source.isMuted ? "MUTED" : "UNMUTED")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    }
-                    .foregroundColor(source.isMuted ? LoopbackerTheme.warning : LoopbackerTheme.textSecondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule().fill(source.isMuted ? LoopbackerTheme.warning.opacity(0.12) : LoopbackerTheme.bgInset)
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(
-                            source.isMuted ? LoopbackerTheme.warning.opacity(0.3) : LoopbackerTheme.border,
-                            lineWidth: 0.5
-                        )
-                    )
-                }
-                .buttonStyle(.plain)
-                .tooltip(source.isMuted ? "Unmute this source to resume audio routing" : "Mute this source (silences output without disconnecting routes)")
-            }
-
-            // Solo button
-            HStack {
-                Text("Solo")
-                    .font(.system(size: 11))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
-
-                Spacer()
-
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        routingState.soloSource(source.id)
-                    }
-                }) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "headphones")
-                            .font(.system(size: 9, weight: .semibold))
-                        Text("SOLO")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    }
-                    .foregroundColor(LoopbackerTheme.accent)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(LoopbackerTheme.accent.opacity(0.12)))
-                    .overlay(
-                        Capsule().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5)
-                    )
-                }
-                .buttonStyle(.plain)
-                .tooltip("Mute all other sources and listen to only this one")
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 4)
+        .padding(.top, 2)
     }
 
     // MARK: - Monitor output picker
@@ -300,29 +181,7 @@ struct SourceCardView: View {
             }
         }
         .pickerStyle(.menu)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .tint(LoopbackerTheme.accent)
-    }
-
-    // MARK: - Options toggle button
-
-    private var optionsToggle: some View {
-        HStack(spacing: 4) {
-            Image(systemName: showOptions ? "chevron.up" : "chevron.down")
-                .font(.system(size: 8, weight: .bold))
-            Text("Options")
-                .font(.system(size: 10, weight: .medium))
-        }
-        .foregroundColor(LoopbackerTheme.textMuted)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-        .background(LoopbackerTheme.bgInset.opacity(0.5))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                showOptions.toggle()
-            }
-        }
-        .tooltip(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
+        .labelsHidden()
+        .tint(.loopbacker)
     }
 }

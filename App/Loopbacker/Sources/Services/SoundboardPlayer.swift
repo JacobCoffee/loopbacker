@@ -9,7 +9,11 @@ private let sbLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category:
 /// Plays audio files through the Loopbacker virtual device so they appear
 /// in Discord, Zoom, OBS, etc. Each sound gets its own AUHAL output unit;
 /// CoreAudio handles mixing multiple simultaneous sounds on the device side.
-class SoundboardPlayer: ObservableObject {
+///
+/// Playback bookkeeping lives on the main actor. Decoding and unit setup run on
+/// `SoundboardEngine` so slow files and CoreAudio queries never block the UI.
+@MainActor
+final class SoundboardPlayer: ObservableObject {
     @Published var playingIDs: Set<UUID> = []
     @Published var meterLevel: Float = 0.0  // global output level for UI
 
@@ -17,13 +21,14 @@ class SoundboardPlayer: ObservableObject {
     var globalVolume: Float = 1.0
 
     private var activePlaybacks: [UUID: PlaybackContext] = [:]
-    // No persistent cache — decode fresh each first play to avoid stale sample rates
-    private var decodedCache: [Data: DecodedBuffer] = [:]
-    private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.soundboard", qos: .userInteractive)
+    /// Sounds whose units are still being prepared; removing an ID cancels its start.
+    private var startingIDs: Set<UUID> = []
+    private let engine = SoundboardEngine()
 
     // MARK: - Decoded audio buffer
 
-    fileprivate struct DecodedBuffer {
+    /// Immutable once decoded; render callbacks only read `samples`.
+    fileprivate struct DecodedBuffer: @unchecked Sendable {
         let samples: UnsafeMutablePointer<Float>  // interleaved stereo float32
         let frameCount: UInt32
         let channelCount: UInt32
@@ -48,7 +53,9 @@ class SoundboardPlayer: ObservableObject {
         }
     }
 
-    fileprivate class PlaybackContext {
+    /// Built by the engine, then owned by the main actor. Render callbacks reach the
+    /// states through retained raw pointers, never through this object.
+    fileprivate final class PlaybackContext: @unchecked Sendable {
         var speakerUnit: AudioComponentInstance?
         var loopbackUnit: AudioComponentInstance?
         var speakerState: RenderState?
@@ -64,33 +71,130 @@ class SoundboardPlayer: ObservableObject {
     // MARK: - Public API
 
     func play(item: SoundboardItem) {
-        // Toggle: if already playing, stop it
-        if activePlaybacks[item.id] != nil {
+        // Toggle: a second press stops the sound, including while it is still being prepared.
+        if activePlaybacks[item.id] != nil || startingIDs.contains(item.id) {
             stop(id: item.id)
             return
         }
 
-        queue.async { [weak self] in
-            self?.startPlayback(item: item)
+        startingIDs.insert(item.id)
+        let volume = globalVolume
+        Task {
+            let ctx = await engine.prepare(item: item, globalVolume: volume)
+            let stillWanted = startingIDs.remove(item.id) != nil
+            guard let ctx else { return }
+            guard stillWanted else {
+                Self.teardown(ctx)
+                return
+            }
+
+            activePlaybacks[item.id] = ctx
+            playingIDs.insert(item.id)
+            if let unit = ctx.speakerUnit { AudioOutputUnitStart(unit) }
+            if let unit = ctx.loopbackUnit { AudioOutputUnitStart(unit) }
+            sbLogger.info("Playing: \(item.name) (loopback: \(ctx.loopbackUnit != nil))")
+            pollForCompletion(id: item.id)
         }
     }
 
     func stop(id: UUID) {
-        queue.async { [weak self] in
-            self?.stopPlayback(id: id)
-        }
+        startingIDs.remove(id)
+        guard let ctx = activePlaybacks.removeValue(forKey: id) else { return }
+        Self.teardown(ctx)
+        playingIDs.remove(id)
+        updateMeter()
     }
 
     func stopAll() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            for id in Array(self.activePlaybacks.keys) {
-                self.stopPlayback(id: id)
-            }
+        startingIDs.removeAll()
+        for id in Array(activePlaybacks.keys) {
+            stop(id: id)
         }
     }
 
     // MARK: - Internal playback
+
+    private func pollForCompletion(id: UUID) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.0 / 30.0))
+            guard let self, let ctx = activePlaybacks[id] else { return }
+            if ctx.done {
+                stop(id: id)
+            } else {
+                updateMeter()
+                pollForCompletion(id: id)
+            }
+        }
+    }
+
+    /// Stops both units and drops the render states they retained.
+    private static func teardown(_ ctx: PlaybackContext) {
+        for (unit, state) in [(ctx.speakerUnit, ctx.speakerState), (ctx.loopbackUnit, ctx.loopbackState)] {
+            if let unit {
+                AudioOutputUnitStop(unit)
+                AudioUnitUninitialize(unit)
+                AudioComponentInstanceDispose(unit)
+            }
+            if let state {
+                Unmanaged.passUnretained(state).release()
+            }
+        }
+    }
+
+    /// Update the published meter level from active playbacks
+    private func updateMeter() {
+        var maxLevel: Float = 0
+        for (_, ctx) in activePlaybacks {
+            if ctx.meterLevel > maxLevel { maxLevel = ctx.meterLevel }
+        }
+        meterLevel = maxLevel
+    }
+}
+
+// MARK: - Engine (decode + unit setup)
+
+/// Off-main half of the soundboard: decodes files and builds stopped output units.
+private actor SoundboardEngine {
+    typealias DecodedBuffer = SoundboardPlayer.DecodedBuffer
+    typealias RenderState = SoundboardPlayer.RenderState
+    typealias PlaybackContext = SoundboardPlayer.PlaybackContext
+
+    /// Decoded files keyed by bookmark; buffers stay alive for the app's lifetime.
+    private var decodedCache: [Data: DecodedBuffer] = [:]
+
+    /// Returns a context with initialized, not-yet-started units, or nil if the speaker unit fails.
+    func prepare(item: SoundboardItem, globalVolume: Float) -> PlaybackContext? {
+        guard let decoded = getOrDecodeBuffer(item: item) else {
+            sbLogger.error("Failed to decode audio for \(item.name)")
+            return nil
+        }
+
+        let ctx = PlaybackContext(itemID: item.id)
+
+        // Speaker state + unit (so user hears the sound)
+        let spkState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
+        guard let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) else {
+            sbLogger.error("Failed to create speaker output unit")
+            return nil
+        }
+        ctx.speakerUnit = speakerUnit
+        ctx.speakerState = spkState
+
+        // Loopback state + unit (so Discord/Zoom hears it) — independent read position
+        if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
+            let lbState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
+            if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
+                ctx.loopbackUnit = lbUnit
+                ctx.loopbackState = lbState
+            } else {
+                sbLogger.warning("Failed to create loopback unit — sound won't appear in Discord/Zoom")
+            }
+        } else {
+            sbLogger.warning("Loopbacker virtual device not found — sound plays on speakers only")
+        }
+
+        return ctx
+    }
 
     /// Helper: create an AudioUnit with a render callback, optionally targeting a specific device
     private func createOutputUnit(state: RenderState, deviceID: AudioObjectID?, decoded: DecodedBuffer) -> AudioComponentInstance? {
@@ -135,115 +239,19 @@ class SoundboardPlayer: ObservableObject {
                                       kAudioUnitScope_Input, 0,
                                       &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
         guard status == noErr else {
-            Unmanaged<PlaybackContext>.fromOpaque(contextPtr).release()
+            Unmanaged<RenderState>.fromOpaque(contextPtr).release()
             AudioComponentInstanceDispose(unit)
             return nil
         }
 
         status = AudioUnitInitialize(unit)
         guard status == noErr else {
-            Unmanaged<PlaybackContext>.fromOpaque(contextPtr).release()
+            Unmanaged<RenderState>.fromOpaque(contextPtr).release()
             AudioComponentInstanceDispose(unit)
             return nil
         }
 
         return unit
-    }
-
-    private func startPlayback(item: SoundboardItem) {
-        guard let decoded = getOrDecodeBuffer(item: item) else {
-            sbLogger.error("Failed to decode audio for \(item.name)")
-            return
-        }
-
-        let ctx = PlaybackContext(itemID: item.id)
-
-        // Speaker state + unit (so user hears the sound)
-        let spkState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
-        guard let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) else {
-            sbLogger.error("Failed to create speaker output unit")
-            return
-        }
-        ctx.speakerUnit = speakerUnit
-        ctx.speakerState = spkState
-
-        // Loopback state + unit (so Discord/Zoom hears it) — independent read position
-        if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
-            let lbState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
-            if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
-                ctx.loopbackUnit = lbUnit
-                ctx.loopbackState = lbState
-                sbLogger.info("Loopback unit created for virtual device")
-            } else {
-                sbLogger.warning("Failed to create loopback unit — sound won't appear in Discord/Zoom")
-            }
-        } else {
-            sbLogger.warning("Loopbacker virtual device not found — sound plays on speakers only")
-        }
-
-        activePlaybacks[item.id] = ctx
-
-        DispatchQueue.main.async { [weak self] in
-            self?.playingIDs.insert(item.id)
-        }
-
-        AudioOutputUnitStart(speakerUnit)
-        if let lb = ctx.loopbackUnit { AudioOutputUnitStart(lb) }
-
-        sbLogger.info("Playing: \(item.name)")
-        print("[Soundboard] Playing: \(item.name) (speaker + loopback:\(ctx.loopbackUnit != nil))")
-        pollForCompletion(id: item.id)
-    }
-
-    private func pollForCompletion(id: UUID) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30.0) { [weak self] in
-            guard let self else { return }
-            guard let ctx = self.activePlaybacks[id] else { return }
-            if ctx.done {
-                self.stop(id: id)
-            } else {
-                self.updateMeter()
-                self.pollForCompletion(id: id)
-            }
-        }
-    }
-
-    private func stopPlayback(id: UUID) {
-        guard let ctx = activePlaybacks.removeValue(forKey: id) else { return }
-
-        // Tear down speaker unit + state
-        if let unit = ctx.speakerUnit {
-            AudioOutputUnitStop(unit)
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
-        }
-        if let state = ctx.speakerState {
-            Unmanaged.passUnretained(state).release()
-        }
-
-        // Tear down loopback unit + state
-        if let unit = ctx.loopbackUnit {
-            AudioOutputUnitStop(unit)
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
-        }
-        if let state = ctx.loopbackState {
-            Unmanaged.passUnretained(state).release()
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            self?.playingIDs.remove(id)
-            self?.updateMeter()
-        }
-    }
-
-    /// Update the published meter level from active playbacks
-    private func updateMeter() {
-        var maxLevel: Float = 0
-        for (_, ctx) in activePlaybacks {
-            if ctx.meterLevel > maxLevel { maxLevel = ctx.meterLevel }
-        }
-        meterLevel = maxLevel
     }
 
     // MARK: - Audio file decoding

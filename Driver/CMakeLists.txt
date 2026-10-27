@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
+# Must precede project() so the toolchain picks it up.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS version" FORCE)
 project(Loopbacker VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

@@ -1,80 +1,35 @@
 import SwiftUI
 
-enum AppTab: String, CaseIterable {
-    case routing = "Routing"
-    case effects = "Effects"
-    case soundboard = "Soundboard"
-
-    var icon: String {
-        switch self {
-        case .routing: return "point.3.connected.trianglepath.dotted"
-        case .effects: return "waveform.badge.magnifyingglass"
-        case .soundboard: return "music.quarternote.3"
-        }
-    }
-}
-
+/// Main window: glass sidebar + section detail, unified toolbar, and the routing sync that keeps
+/// the audio engine in step with `RoutingState`.
 struct ContentView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var appCaptureService: AppCaptureService
+    @EnvironmentObject var driverInstaller: DriverInstaller
+
+    @SceneStorage("studioSection") private var section: StudioSection = .routing
     @State private var showSourcePicker = false
-    @State private var connectorPositions: [ConnectorEnd: CGRect] = [:]
-    @State private var selectedTab: AppTab = .routing
-    @AppStorage("appearanceOverride") private var appearanceOverride: String = "system"
+    @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
 
-    private var colorSchemeOverride: ColorScheme? {
-        switch appearanceOverride {
-        case "light": return .light
-        case "dark": return .dark
-        default: return nil
-        }
-    }
-
-    private var appearanceIcon: String {
-        switch appearanceOverride {
-        case "light": return "sun.max.fill"
-        case "dark": return "moon.fill"
-        default: return "circle.lefthalf.filled"
-        }
-    }
-
-    /// Force NSWindow appearance so NSColor(name:) adaptive theme colors resolve correctly
-    private func applyAppearance(_ value: String) {
-        let nsAppearance: NSAppearance?
-        switch value {
-        case "light": nsAppearance = NSAppearance(named: .aqua)
-        case "dark": nsAppearance = NSAppearance(named: .darkAqua)
-        default: nsAppearance = nil
-        }
-        for window in NSApplication.shared.windows {
-            window.appearance = nsAppearance
-        }
-    }
-
-    private var appearanceTooltip: String {
-        switch appearanceOverride {
-        case "light": return "Light mode (click for dark)"
-        case "dark": return "Dark mode (click for auto)"
-        default: return "Auto appearance (click for light)"
-        }
+    private var actions: StudioActions {
+        StudioActions(routingState: routingState, audioRouter: audioRouter,
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            headerBar
-            tabContent
-            ToolbarView()
+        NavigationSplitView {
+            SidebarView(section: $section)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
+        } detail: {
+            detail
+                .navigationTitle(section.title)
         }
-        .background(LoopbackerTheme.bgDeep)
-        .preferredColorScheme(colorSchemeOverride)
-        .onChange(of: appearanceOverride) { _, newValue in
-            applyAppearance(newValue)
-        }
+        .tint(.loopbacker)
+        .focusedSceneValue(\.studioSection, $section)
+        .onChange(of: appearance) { _, mode in mode.apply() }
         .onAppear {
-            // Apply initial appearance override
-            applyAppearance(appearanceOverride)
             audioDeviceManager.populateInitialSources(into: routingState)
             // Apply saved effects preset to the audio router
             audioRouter.currentEffectsPreset = routingState.effectsPreset
@@ -112,6 +67,57 @@ struct ContentView: View {
         .onChange(of: routingState.effectsPreset) { _, newPreset in
             audioRouter.currentEffectsPreset = newPreset
             audioRouter.updateEffectsPreset(newPreset)
+        }
+    }
+
+    // MARK: - Detail
+
+    @ViewBuilder
+    private var detail: some View {
+        switch section {
+        case .routing:
+            RoutingCanvasView(onAddSource: { showSourcePicker = true })
+                .toolbar {
+                    routingToolbar
+                    GlobalToolbar()
+                }
+        case .effects:
+            EffectsView()
+        case .soundboard:
+            SoundboardView()
+        case .scenes:
+            ScenesView()
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private var routingToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                showSourcePicker = true
+            } label: {
+                Label("Add Source", systemImage: "plus")
+            }
+            .help("Add an input device or app as a source")
+            .popover(isPresented: $showSourcePicker, arrowEdge: .bottom) {
+                SourcePickerView { showSourcePicker = false }
+            }
+
+            Button {
+                actions.autoRouteStereo()
+            } label: {
+                Label("Auto-Route Stereo", systemImage: "arrow.left.arrow.right")
+            }
+            .help("Auto-route the first stereo input to outputs 1 & 2")
+
+            Button {
+                actions.stopAllRouting()
+            } label: {
+                Label("Stop All Routing", systemImage: "stop.circle")
+            }
+            .help("Stop all audio routing and disconnect every route (keeps sources)")
         }
     }
 
@@ -220,586 +226,56 @@ struct ContentView: View {
             }
         }
     }
+}
 
-    // MARK: - Header bar with integrated tab switcher
+// MARK: - Global toolbar
 
-    private var headerBar: some View {
-        HStack(spacing: 12) {
-            if let logoURL = Bundle.main.url(forResource: "logo", withExtension: "png"),
-               let nsImage = NSImage(contentsOf: logoURL) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .frame(width: 36, height: 36)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
+/// App-wide toolbar items. Each section appends this after its own items so section actions
+/// sit first and Reconnect / More stay anchored at the trailing edge.
+struct GlobalToolbar: ToolbarContent {
+    @EnvironmentObject var routingState: RoutingState
+    @EnvironmentObject var audioDeviceManager: AudioDeviceManager
+    @EnvironmentObject var audioRouter: AudioRouter
+    @EnvironmentObject var driverInstaller: DriverInstaller
+    @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
 
-            Text("Loopbacker")
-                .font(.system(size: 18, weight: .bold))
-                .foregroundColor(LoopbackerTheme.textPrimary)
-
-            // Tab switcher -- integrated into header
-            tabSwitcher
-                .padding(.leading, 8)
-
-            Spacer()
-
-            // Pending connection hint
-            if routingState.pendingConnector != nil {
-                HStack(spacing: 4) {
-                    Image(systemName: "hand.tap")
-                        .font(.system(size: 10))
-                    Text("Click a channel to connect, or Esc to cancel")
-                        .font(.system(size: 10, weight: .medium))
-                }
-                .foregroundColor(LoopbackerTheme.accent)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(LoopbackerTheme.accent.opacity(0.1))
-                .clipShape(Capsule())
-                .transition(.opacity)
-            }
-
-            // Appearance toggle
-            Button(action: {
-                switch appearanceOverride {
-                case "system": appearanceOverride = "light"
-                case "light": appearanceOverride = "dark"
-                default: appearanceOverride = "system"
-                }
-            }) {
-                Image(systemName: appearanceIcon)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(LoopbackerTheme.textMuted)
-                    .frame(width: 28, height: 28)
-                    .background(LoopbackerTheme.bgCard)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(LoopbackerTheme.border, lineWidth: 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .tooltip(appearanceTooltip)
-
-            HStack(spacing: 4) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 10))
-                Text("48 kHz / 32-bit")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-            }
-            .foregroundColor(LoopbackerTheme.textMuted)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(LoopbackerTheme.bgCard)
-            .clipShape(Capsule())
-            .overlay(Capsule().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
-            .tooltip("Virtual device audio format: 48 kHz sample rate, 32-bit float")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .background(LoopbackerTheme.bgSurface)
-        .overlay(
-            Rectangle().fill(LoopbackerTheme.border).frame(height: 0.5),
-            alignment: .bottom
-        )
+    private var actions: StudioActions {
+        StudioActions(routingState: routingState, audioRouter: audioRouter,
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
     }
 
-    // MARK: - Tab switcher
+    var body: some ToolbarContent {
+        ToolbarSpacer(.fixed, placement: .primaryAction)
 
-    private var tabSwitcher: some View {
-        HStack(spacing: 2) {
-            ForEach(AppTab.allCases, id: \.self) { tab in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        selectedTab = tab
-                    }
-                }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: tab.icon)
-                            .font(.system(size: 10, weight: .semibold))
-                        Text(tab.rawValue.uppercased())
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .tracking(1.0)
-                    }
-                    .foregroundColor(selectedTab == tab ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .contentShape(RoundedRectangle(cornerRadius: 6))
-                    .background(
-                        ZStack {
-                            if selectedTab == tab {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(LoopbackerTheme.accent.opacity(0.1))
-                                RoundedRectangle(cornerRadius: 6)
-                                    .strokeBorder(LoopbackerTheme.accent.opacity(0.25), lineWidth: 0.5)
-                            } else {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(Color.clear)
-                            }
-                        }
-                    )
-                }
-                .buttonStyle(.plain)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                actions.reconnect()
+            } label: {
+                Label("Reconnect", systemImage: "arrow.clockwise")
             }
-        }
-        .padding(3)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(LoopbackerTheme.bgInset)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(LoopbackerTheme.border, lineWidth: 0.5)
-        )
-    }
+            .help("Reconnect audio (fixes glitches after sleep)")
 
-    // MARK: - Tab content
-
-    @ViewBuilder
-    private var tabContent: some View {
-        switch selectedTab {
-        case .routing:
-            routingArea
-                .coordinateSpace(name: "routing")
-                .transition(.opacity)
-        case .effects:
-            EffectsView()
-                .transition(.opacity)
-        case .soundboard:
-            SoundboardView()
-                .transition(.opacity)
-        }
-    }
-
-    // MARK: - Main routing area
-
-    private var routingArea: some View {
-        ZStack {
-            gridBackground
-                .onTapGesture {
-                    // Cancel pending connection when clicking empty space
-                    withAnimation { routingState.cancelPendingConnection() }
-                }
-
-            HStack(alignment: .top, spacing: 0) {
-                sourcesColumn
-                    .frame(minWidth: 280, idealWidth: 340, maxWidth: 420)
-
-                Spacer(minLength: 80)
-
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .trailing, spacing: 20) {
-                        outputColumn
-                            .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
-
-                        outputRoutingSection
-                            .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+            Menu {
+                Button("Rescan Devices", systemImage: "arrow.triangle.2.circlepath") { actions.rescanDevices() }
+                Button("Play Test Tone", systemImage: "tuningfork") { actions.playTestTone() }
+                Button("Copy Debug Snapshot", systemImage: "doc.on.clipboard") { actions.copyDebugSnapshot() }
+                Divider()
+                Picker("Appearance", systemImage: appearance.symbol, selection: $appearance) {
+                    ForEach(AppearanceMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.symbol).tag(mode)
                     }
                 }
-            }
-            .padding(20)
-
-            CableView(connectorPositions: connectorPositions)
-                .allowsHitTesting(false)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onPreferenceChange(ConnectorPositionKey.self) { positions in
-            self.connectorPositions = positions
-        }
-        .onExitCommand {
-            routingState.cancelPendingConnection()
-        }
-    }
-
-    // MARK: - Sources column
-
-    private var sourcesColumn: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                sectionHeader(title: "Sources", icon: "waveform.path", tip: "Audio input devices to capture from")
-
-                Spacer()
-
-                if !routingState.sources.isEmpty {
-                    let deviceCount = routingState.sources.filter { !$0.isAppCapture }.count
-                    let appCount = routingState.sources.filter { $0.isAppCapture }.count
-                    let parts = [
-                        deviceCount > 0 ? "\(deviceCount) device\(deviceCount == 1 ? "" : "s")" : nil,
-                        appCount > 0 ? "\(appCount) app\(appCount == 1 ? "" : "s")" : nil
-                    ].compactMap { $0 }
-                    Text(parts.joined(separator: ", "))
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textMuted)
+                Divider()
+                Button(driverInstaller.isInstalled ? "Uninstall Driver…" : "Install Driver…",
+                       systemImage: driverInstaller.isInstalled ? "minus.circle" : "arrow.down.circle") {
+                    actions.toggleDriver()
                 }
-
-                Button(action: { showSourcePicker = true }) {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundColor(LoopbackerTheme.accent)
-                        .shadow(color: LoopbackerTheme.accentGlow, radius: 4)
-                }
-                .buttonStyle(.plain)
-                .tooltip("Add an audio input device as a source for routing")
-                .popover(isPresented: $showSourcePicker) {
-                    sourcePickerPopover
-                }
+                .disabled(driverInstaller.isProcessing)
+                Button("Quit and Stop Routing", systemImage: "power") { AppDelegate.forceQuit() }
+            } label: {
+                Label("More", systemImage: "ellipsis")
             }
-
-            if routingState.sources.isEmpty {
-                emptySourcesPlaceholder
-            } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(spacing: 10) {
-                        ForEach($routingState.sources) { $source in
-                            SourceCardView(source: $source)
-                                .contextMenu {
-                                    Button {
-                                        withAnimation {
-                                            routingState.removeSource(source.id)
-                                        }
-                                    } label: {
-                                        Label("Remove \(source.name)", systemImage: "trash")
-                                    }
-                                }
-                        }
-                    }
-                }
-            }
+            .help("Devices, test tone, appearance, driver")
         }
-    }
-
-    private var emptySourcesPlaceholder: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "plus.circle.dashed")
-                .font(.system(size: 28))
-                .foregroundColor(LoopbackerTheme.textMuted)
-
-            Text("Click + to add an audio source")
-                .font(.system(size: 12))
-                .foregroundColor(LoopbackerTheme.textMuted)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 40)
-    }
-
-    // MARK: - Output column
-
-    private var outputColumn: some View {
-        VStack(alignment: .trailing, spacing: 12) {
-            HStack {
-                Spacer()
-                sectionHeader(title: "Output Channels", icon: "speaker.wave.2", tip: "Virtual device channels that apps like Discord see")
-            }
-
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(spacing: 10) {
-                    OutputChannelView()
-                }
-            }
-        }
-    }
-
-    // MARK: - Output routing section
-
-    private var outputRoutingSection: some View {
-        VStack(alignment: .trailing, spacing: 12) {
-            HStack {
-                Spacer()
-                sectionHeader(title: "Output Routing", icon: "arrow.right.circle", tip: "Route app audio from virtual devices to physical outputs")
-            }
-
-            OutputRoutingView()
-        }
-    }
-
-    // MARK: - Section header
-
-    private func sectionHeader(title: String, icon: String, tip: String = "") -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(LoopbackerTheme.accent)
-
-            Text(title.uppercased())
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundColor(LoopbackerTheme.textSecondary)
-                .tracking(1.5)
-        }
-        .tooltip(tip.isEmpty ? title : tip)
-    }
-
-    // MARK: - Grid background
-
-    private var gridBackground: some View {
-        Canvas { context, size in
-            let gridSpacing: CGFloat = 30
-            let lineColor = LoopbackerTheme.gridLine
-
-            var x: CGFloat = 0
-            while x < size.width {
-                var path = Path()
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x, y: size.height))
-                context.stroke(path, with: .color(lineColor), lineWidth: 0.5)
-                x += gridSpacing
-            }
-
-            var y: CGFloat = 0
-            while y < size.height {
-                var path = Path()
-                path.move(to: CGPoint(x: 0, y: y))
-                path.addLine(to: CGPoint(x: size.width, y: y))
-                context.stroke(path, with: .color(lineColor), lineWidth: 0.5)
-                y += gridSpacing
-            }
-
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let gradient = Gradient(colors: [
-                Color(red: 0.0, green: 0.83, blue: 0.67).opacity(0.03),
-                Color.clear
-            ])
-            context.fill(
-                Path(ellipseIn: CGRect(
-                    x: center.x - 300, y: center.y - 200,
-                    width: 600, height: 400
-                )),
-                with: .radialGradient(gradient, center: center, startRadius: 0, endRadius: 300)
-            )
-        }
-    }
-
-    // MARK: - Source picker popover
-
-    private var sourcePickerPopover: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("ADD SOURCE")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(LoopbackerTheme.textSecondary)
-                .tracking(1.5)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
-
-            Divider().background(LoopbackerTheme.border)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    // Section 1: Hardware devices
-                    Text("DEVICES")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                        .tracking(1.0)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
-                        .padding(.bottom, 4)
-
-                    let inputDevices = audioDeviceManager.systemDevices.filter { $0.isInput && !$0.name.contains("Loopbacker") }
-
-                    if inputDevices.isEmpty {
-                        HStack {
-                            Spacer()
-                            Text("No input devices found")
-                                .font(.system(size: 11))
-                                .foregroundColor(LoopbackerTheme.textMuted)
-                                .padding(.vertical, 8)
-                            Spacer()
-                        }
-                    } else {
-                        VStack(spacing: 2) {
-                            ForEach(inputDevices) { device in
-                                devicePickerRow(device)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-
-                    Divider().background(LoopbackerTheme.border).padding(.vertical, 4)
-
-                    // Section 2: App audio capture
-                    Text("APP AUDIO")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                        .tracking(1.0)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 4)
-
-                    if !appCaptureService.permissionGranted {
-                        permissionRequestRow
-                    } else if appCaptureService.availableApps.isEmpty {
-                        HStack {
-                            Spacer()
-                            VStack(spacing: 4) {
-                                Image(systemName: "app.dashed")
-                                    .font(.system(size: 16))
-                                    .foregroundColor(LoopbackerTheme.textMuted)
-                                Text("No apps detected")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(LoopbackerTheme.textMuted)
-                                Button("Refresh") {
-                                    Task { await appCaptureService.refreshApps() }
-                                }
-                                .font(.system(size: 10))
-                                .buttonStyle(.plain)
-                                .foregroundColor(LoopbackerTheme.accent)
-                            }
-                            .padding(.vertical, 8)
-                            Spacer()
-                        }
-                    } else {
-                        VStack(spacing: 2) {
-                            ForEach(appCaptureService.availableApps) { app in
-                                appPickerRow(app)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-            }
-            .frame(maxHeight: 400)
-        }
-        .frame(width: 300)
-        .background(LoopbackerTheme.bgCard)
-        .onAppear {
-            Task { await appCaptureService.refreshApps() }
-        }
-    }
-
-    private var permissionRequestRow: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "lock.shield")
-                    .font(.system(size: 14))
-                    .foregroundColor(LoopbackerTheme.accent)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Screen Recording Permission")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(LoopbackerTheme.textPrimary)
-                    Text("Required to capture audio from apps")
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-            }
-
-            HStack(spacing: 8) {
-                Button("Grant Access") {
-                    Task {
-                        let granted = await appCaptureService.checkPermission()
-                        if granted {
-                            await appCaptureService.refreshApps()
-                        }
-                    }
-                }
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(LoopbackerTheme.accent)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(LoopbackerTheme.accent.opacity(0.1))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-                .buttonStyle(.plain)
-
-                Button("Open Settings") {
-                    appCaptureService.openPermissionSettings()
-                }
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(LoopbackerTheme.textSecondary)
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-    }
-
-    private func appPickerRow(_ app: CaptureApp) -> some View {
-        let alreadyAdded = routingState.sources.contains { $0.appBundleID == app.id }
-
-        return Button(action: {
-            guard !alreadyAdded else { return }
-            let newSource = AudioSource.fromApp(app)
-            withAnimation(.easeInOut(duration: 0.2)) {
-                routingState.sources.append(newSource)
-                routingState.save()
-            }
-            showSourcePicker = false
-        }) {
-            HStack(spacing: 10) {
-                if let icon = app.icon {
-                    Image(nsImage: icon)
-                        .resizable()
-                        .frame(width: 20, height: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                } else {
-                    Image(systemName: "app.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.accent)
-                        .frame(width: 20, height: 20)
-                }
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(app.name)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.textPrimary)
-                    Text("App Audio")
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-
-                Spacer()
-
-                if alreadyAdded {
-                    Text("Added")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(alreadyAdded)
-    }
-
-    private func devicePickerRow(_ device: SystemAudioDevice) -> some View {
-        let alreadyAdded = routingState.sources.contains { $0.name == device.name }
-
-        return Button(action: {
-            guard !alreadyAdded else { return }
-            let newSource = audioDeviceManager.createSource(from: device)
-            withAnimation(.easeInOut(duration: 0.2)) {
-                routingState.sources.append(newSource)
-                routingState.save()
-            }
-            showSourcePicker = false
-        }) {
-            HStack(spacing: 10) {
-                Image(systemName: device.isInput ? "mic.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 12))
-                    .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.accent)
-                    .frame(width: 20)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(device.name)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(alreadyAdded ? LoopbackerTheme.textMuted : LoopbackerTheme.textPrimary)
-
-                    Text("\(device.inputChannelCount) in / \(device.outputChannelCount) out")
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-
-                Spacer()
-
-                if alreadyAdded {
-                    Text("Added")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(alreadyAdded)
     }
 }

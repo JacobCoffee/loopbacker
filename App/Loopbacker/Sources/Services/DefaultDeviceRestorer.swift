@@ -7,6 +7,7 @@ private let logger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "
 /// Records the system's default input/output devices on launch and restores them
 /// on quit if they are still set to a Loopbacker virtual device.
 /// This prevents the user from being stuck on a non-functional device after quitting.
+@MainActor
 final class DefaultDeviceRestorer {
     static let shared = DefaultDeviceRestorer()
 

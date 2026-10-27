@@ -2,7 +2,8 @@ import Foundation
 import CoreAudio
 import Combine
 
-class AudioDeviceManager: ObservableObject {
+@MainActor
+final class AudioDeviceManager: ObservableObject {
     @Published var systemDevices: [SystemAudioDevice] = []
     @Published var loopbackerDevicePresent: Bool = false
 
@@ -17,14 +18,7 @@ class AudioDeviceManager: ObservableObject {
         // main thread for seconds when coreaudiod is still starting up (e.g.,
         // right after a driver install). This prevents "Application Not Responding."
         installDeviceChangeListener()
-        Self.enumerationQueue.async { [weak self] in
-            guard let self else { return }
-            let devices = self.fetchDevices()
-            DispatchQueue.main.async {
-                self.systemDevices = devices
-                self.loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
-            }
-        }
+        enumerateDevices()
     }
 
     /// Call once after routingState is available -- just stores the reference.
@@ -35,7 +29,7 @@ class AudioDeviceManager: ObservableObject {
         self.routingState = state
     }
 
-    deinit {
+    isolated deinit {
         removeDeviceChangeListener()
     }
 
@@ -43,20 +37,23 @@ class AudioDeviceManager: ObservableObject {
 
     /// Background queue for device enumeration -- CoreAudio property queries
     /// can block and should not run on the main thread.
-    private static let enumerationQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.deviceenum", qos: .userInitiated)
+    private nonisolated static let enumerationQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.deviceenum", qos: .userInitiated)
 
     func enumerateDevices() {
-        Self.enumerationQueue.async { [weak self] in
-            guard let self else { return }
-            let devices = self.fetchDevices()
-            DispatchQueue.main.async {
-                self.systemDevices = devices
-                self.loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
-            }
+        Task {
+            let devices = await Self.loadDevices()
+            systemDevices = devices
+            loopbackerDevicePresent = devices.contains { $0.uid.contains("Loopbacker") || $0.name.contains("Loopbacker") }
         }
     }
 
-    private func fetchDevices() -> [SystemAudioDevice] {
+    private nonisolated static func loadDevices() async -> [SystemAudioDevice] {
+        await withCheckedContinuation { continuation in
+            enumerationQueue.async { continuation.resume(returning: fetchDevices()) }
+        }
+    }
+
+    private nonisolated static func fetchDevices() -> [SystemAudioDevice] {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -109,7 +106,7 @@ class AudioDeviceManager: ObservableObject {
 
     // MARK: - Property helpers
 
-    private func getStringProperty(_ deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+    private nonisolated static func getStringProperty(_ deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -125,15 +122,15 @@ class AudioDeviceManager: ObservableObject {
         return cf.takeUnretainedValue() as String
     }
 
-    private func getDeviceName(_ deviceID: AudioDeviceID) -> String? {
+    private nonisolated static func getDeviceName(_ deviceID: AudioDeviceID) -> String? {
         getStringProperty(deviceID, selector: kAudioDevicePropertyDeviceNameCFString)
     }
 
-    private func getDeviceUID(_ deviceID: AudioDeviceID) -> String? {
+    private nonisolated static func getDeviceUID(_ deviceID: AudioDeviceID) -> String? {
         getStringProperty(deviceID, selector: kAudioDevicePropertyDeviceUID)
     }
 
-    private func getChannelCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+    private nonisolated static func getChannelCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
             mScope: scope,
@@ -169,8 +166,9 @@ class AudioDeviceManager: ObservableObject {
             mElement: kAudioObjectPropertyElementMain
         )
 
+        // Delivered on the main queue (see below).
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.enumerateDevices()
+            MainActor.assumeIsolated { self?.enumerateDevices() }
         }
         self.propertyListenerBlock = block
 

@@ -18,67 +18,61 @@ struct OutputRoutingView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            // Header with +/- buttons
-            HStack {
-                Spacer()
+        VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            header
 
-                if activeCount > 0 {
-                    Text("\(activeCount) device\(activeCount == 1 ? "" : "s")")
-                        .font(.system(size: 10))
-                        .foregroundColor(LoopbackerTheme.textMuted)
-                }
-
-                // Remove button
-                if activeCount > 0 {
-                    Button(action: removeLastDevice) {
-                        Image(systemName: "minus")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(LoopbackerTheme.textSecondary)
-                            .frame(width: 22, height: 22)
-                            .background(LoopbackerTheme.bgInset)
-                            .clipShape(Circle())
-                            .overlay(Circle().strokeBorder(LoopbackerTheme.border, lineWidth: 0.5))
+            GlassEffectContainer(spacing: Metrics.panelSpacing) {
+                VStack(spacing: Metrics.panelSpacing) {
+                    ForEach(routingState.outputDestinations) { dest in
+                        outputCard(dest: dest)
                     }
-                    .buttonStyle(.plain)
-                    .tooltip("Remove the last virtual output device and stop its routing")
-                }
 
-                // Add button
-                if activeCount < Self.allVirtualDevices.count {
-                    Button(action: addNextDevice) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(LoopbackerTheme.accent)
-                            .frame(width: 22, height: 22)
-                            .background(LoopbackerTheme.accent.opacity(0.1))
-                            .clipShape(Circle())
-                            .overlay(Circle().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
+                    if activeCount == 0 {
+                        EmptyStateView(
+                            title: "No Output Routes",
+                            message: "Click + to add an output route",
+                            symbol: "arrow.right.circle.dashed"
+                        )
+                        .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.plain)
-                    .tooltip("Add a new virtual output device (Loopbacker \(activeCount + 2)) for routing to a physical output")
                 }
             }
+        }
+    }
 
-            // Device cards
-            ForEach(routingState.outputDestinations) { dest in
-                outputCard(dest: dest)
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("Output Routing")
+                .font(.headline)
+
+            Spacer()
+
+            if activeCount > 0 {
+                Text("\(activeCount) device\(activeCount == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            if activeCount == 0 {
-                HStack {
-                    Spacer()
-                    VStack(spacing: 6) {
-                        Image(systemName: "arrow.right.circle.dashed")
-                            .font(.system(size: 22))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                        Text("Click + to add an output route")
-                            .font(.system(size: 11))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                    }
-                    .padding(.vertical, 20)
-                    Spacer()
+            if activeCount > 0 {
+                Button(action: removeLastDevice) {
+                    Image(systemName: "minus.circle")
                 }
+                .buttonStyle(.borderless)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .help("Remove the last virtual output device and stop its routing")
+                .accessibilityLabel("Remove last output device")
+            }
+
+            if activeCount < Self.allVirtualDevices.count {
+                Button(action: addNextDevice) {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.borderless)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .help("Add a new virtual output device (Loopbacker \(activeCount + 2)) for routing to a physical output")
+                .accessibilityLabel("Add output device")
             }
         }
     }
@@ -101,7 +95,6 @@ struct OutputRoutingView: View {
 
     private func removeLastDevice() {
         guard let last = routingState.outputDestinations.last else { return }
-        // Stop routing if active
         audioRouter.stopOutputRouting(virtualDeviceUID: last.virtualDeviceUID)
         withAnimation(.easeInOut(duration: 0.2)) {
             routingState.removeOutputDestination(id: last.id)
@@ -115,90 +108,59 @@ struct OutputRoutingView: View {
         let isActive = dest.isEnabled && !dest.physicalOutputUID.isEmpty
 
         VStack(alignment: .leading, spacing: 0) {
-            // Header
             HStack(spacing: 10) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isActive ? LoopbackerTheme.accent.opacity(0.15) : LoopbackerTheme.bgInset)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isActive ? Color.loopbacker.opacity(0.18) : Color.secondary.opacity(0.12))
                         .frame(width: 32, height: 32)
 
                     Image(systemName: "arrow.right.circle.fill")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(isActive ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
+                        .foregroundStyle(isActive ? Color.loopbacker : .secondary)
                 }
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(dest.virtualDeviceName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(LoopbackerTheme.textPrimary)
-
+                        .font(.headline)
                     Text("Virtual Device")
-                        .font(.system(size: 10, weight: .regular))
-                        .foregroundColor(LoopbackerTheme.textSecondary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
-                Spacer()
+                Spacer(minLength: 8)
 
-                enableToggle(dest: dest)
+                Toggle(dest.isEnabled ? "Disable output routing for \(dest.virtualDeviceName)" : "Enable output routing for \(dest.virtualDeviceName)", isOn: Binding(
+                    get: { dest.isEnabled },
+                    set: { _ in toggleEnable(dest: dest) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .help(dest.isEnabled ? "Disable output routing for this virtual device" : "Enable output routing for this virtual device")
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
-            Divider().background(LoopbackerTheme.border)
+            Divider().opacity(0.5)
 
-            // Output device picker
             HStack(spacing: 8) {
-                Image(systemName: "speaker.wave.2")
-                    .font(.system(size: 11))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
-
-                Text("Output:")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(LoopbackerTheme.textSecondary)
-
+                Text("Output")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 outputPicker(dest: dest)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
-            // Meter bar
             if isActive {
                 let level = outputRouteMeterLevel(dest)
-                HStack(spacing: 6) {
-                    Image(systemName: "waveform")
-                        .font(.system(size: 9))
-                        .foregroundColor(level > 0.01 ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(LoopbackerTheme.bgInset)
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(LoopbackerTheme.accent)
-                                .frame(width: geo.size.width * CGFloat(level))
-                        }
-                    }
-                    .frame(height: 4)
-                }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                SignalMeter(level: level, axis: .horizontal, thickness: 4)
+                    .frame(height: 10)
+                    .padding(.horizontal, Metrics.panelPadding)
+                    .padding(.bottom, 10)
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
-                .fill(LoopbackerTheme.bgCard)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: LoopbackerTheme.cardCornerRadius)
-                .strokeBorder(
-                    isActive ? LoopbackerTheme.borderActive : LoopbackerTheme.border,
-                    lineWidth: isActive ? 1.5 : 0.5
-                )
-        )
-        .shadow(
-            color: isActive ? LoopbackerTheme.accentGlow.opacity(0.15) : Color.clear,
-            radius: 8
-        )
+        .glassPanel()
     }
 
     // MARK: - Output device picker
@@ -220,53 +182,25 @@ struct OutputRoutingView: View {
             }
         }
         .pickerStyle(.menu)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .tint(LoopbackerTheme.accent)
-        .tooltip("Select the physical audio output device for this virtual device")
+        .labelsHidden()
+        .tint(.loopbacker)
+        .help("Select the physical audio output device for this virtual device")
     }
 
     // MARK: - Enable toggle
 
-    private func enableToggle(dest: OutputDestination) -> some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                routingState.toggleOutputDestination(id: dest.id)
-                if dest.isEnabled {
-                    audioRouter.stopOutputRouting(virtualDeviceUID: dest.virtualDeviceUID)
-                } else {
-                    if !dest.physicalOutputUID.isEmpty {
-                        audioRouter.startOutputRouting(
-                            virtualDeviceUID: dest.virtualDeviceUID,
-                            physicalOutputUID: dest.physicalOutputUID
-                        )
-                    }
-                }
-            }
-        }) {
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(dest.isEnabled ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-                    .frame(width: 6, height: 6)
-                    .shadow(color: dest.isEnabled ? LoopbackerTheme.accentGlow : .clear, radius: 3)
-
-                Text(dest.isEnabled ? "ON" : "OFF")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(dest.isEnabled ? LoopbackerTheme.accent : LoopbackerTheme.textMuted)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule().fill(dest.isEnabled ? LoopbackerTheme.accent.opacity(0.12) : LoopbackerTheme.bgInset)
-            )
-            .overlay(
-                Capsule().strokeBorder(
-                    dest.isEnabled ? LoopbackerTheme.accent.opacity(0.3) : LoopbackerTheme.border,
-                    lineWidth: 0.5
+    private func toggleEnable(dest: OutputDestination) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            routingState.toggleOutputDestination(id: dest.id)
+            if dest.isEnabled {
+                audioRouter.stopOutputRouting(virtualDeviceUID: dest.virtualDeviceUID)
+            } else if !dest.physicalOutputUID.isEmpty {
+                audioRouter.startOutputRouting(
+                    virtualDeviceUID: dest.virtualDeviceUID,
+                    physicalOutputUID: dest.physicalOutputUID
                 )
-            )
+            }
         }
-        .buttonStyle(.plain)
-        .tooltip(dest.isEnabled ? "Disable output routing for this virtual device" : "Enable output routing for this virtual device")
     }
 
     private func outputRouteMeterLevel(_ dest: OutputDestination) -> Float {
@@ -277,7 +211,6 @@ struct OutputRoutingView: View {
     // MARK: - Helpers
 
     private func updateDestination(dest: OutputDestination, physicalOutputUID: String, physicalOutputName: String) {
-        // Stop old route
         if !dest.physicalOutputUID.isEmpty {
             audioRouter.stopOutputRouting(virtualDeviceUID: dest.virtualDeviceUID)
         }
@@ -288,7 +221,6 @@ struct OutputRoutingView: View {
             routingState.save()
         }
 
-        // Start new route
         if !physicalOutputUID.isEmpty, dest.isEnabled {
             audioRouter.startOutputRouting(virtualDeviceUID: dest.virtualDeviceUID, physicalOutputUID: physicalOutputUID)
         }

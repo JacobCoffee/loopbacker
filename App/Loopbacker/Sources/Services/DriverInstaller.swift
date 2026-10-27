@@ -1,7 +1,8 @@
 import Foundation
 import Combine
 
-class DriverInstaller: ObservableObject {
+@MainActor
+final class DriverInstaller: ObservableObject {
     @Published var isInstalled: Bool = false
     @Published var isProcessing: Bool = false
     @Published var statusMessage: String = ""
@@ -25,10 +26,8 @@ class DriverInstaller: ObservableObject {
         // Find the driver build relative to the app bundle, or fall back to known build paths
         let driverSource = findDriverBundle()
         guard let driverSource else {
-            DispatchQueue.main.async {
-                self.isProcessing = false
-                self.statusMessage = "Driver bundle not found. Run 'make driver' first."
-            }
+            isProcessing = false
+            statusMessage = "Driver bundle not found. Run 'make driver' first."
             return
         }
 
@@ -43,15 +42,14 @@ class DriverInstaller: ObservableObject {
         killall -9 coreaudiod" with administrator privileges
         """
 
-        runAppleScript(script) { [weak self] success in
-            DispatchQueue.main.async {
-                self?.isProcessing = false
-                if success {
-                    self?.isInstalled = true
-                    self?.statusMessage = "Driver installed successfully"
-                } else {
-                    self?.statusMessage = "Installation failed"
-                }
+        Task {
+            let success = await Self.runAppleScript(script)
+            isProcessing = false
+            if success {
+                isInstalled = true
+                statusMessage = "Driver installed successfully"
+            } else {
+                statusMessage = "Installation failed"
             }
         }
     }
@@ -66,15 +64,14 @@ class DriverInstaller: ObservableObject {
         killall -9 coreaudiod" with administrator privileges
         """
 
-        runAppleScript(script) { [weak self] success in
-            DispatchQueue.main.async {
-                self?.isProcessing = false
-                if success {
-                    self?.isInstalled = false
-                    self?.statusMessage = "Driver uninstalled"
-                } else {
-                    self?.statusMessage = "Uninstall failed"
-                }
+        Task {
+            let success = await Self.runAppleScript(script)
+            isProcessing = false
+            if success {
+                isInstalled = false
+                statusMessage = "Driver uninstalled"
+            } else {
+                statusMessage = "Uninstall failed"
             }
         }
     }
@@ -103,21 +100,22 @@ class DriverInstaller: ObservableObject {
         return nil
     }
 
-    private func runAppleScript(_ source: String, completion: @escaping (Bool) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", source]
+    /// Runs osascript off the main thread; the admin prompt blocks until the user answers.
+    private nonisolated static func runAppleScript(_ source: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", source]
+                process.standardError = Pipe()
 
-            let pipe = Pipe()
-            process.standardError = pipe
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-                completion(process.terminationStatus == 0)
-            } catch {
-                completion(false)
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    continuation.resume(returning: process.terminationStatus == 0)
+                } catch {
+                    continuation.resume(returning: false)
+                }
             }
         }
     }

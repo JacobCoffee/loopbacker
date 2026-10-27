@@ -33,8 +33,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Key = sourceDeviceUID (or "app:<bundle>" for app captures).
     private var pendingMixMatrices: [String: [(srcCh: Int, dstCh: Int)]] = [:]
 
-    /// Holds the CoreAudio resources for a single source -> destination route
-    fileprivate class RouteContext {
+    /// Holds the CoreAudio resources for a single source -> destination route.
+    ///
+    /// Configuration fields are mutated only on `queue`. The real-time callbacks (and the
+    /// SCStream capture queue for app routes) reach it through unretained pointers and touch
+    /// only the pre-allocated buffers and the SPSC `ring`, so it is shared by hand, not by
+    /// the compiler's checking.
+    fileprivate final class RouteContext: @unchecked Sendable {
         var inputUnit: AudioComponentInstance?
         var outputUnit: AudioComponentInstance?
         var captureDeviceUID: String
@@ -44,11 +49,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         var channelCount: UInt32
         var sampleRate: Float64
 
-        // Ring buffer for passing audio from input callback to output callback
-        var ringBuffer: UnsafeMutablePointer<Float>?
-        var ringBufferFrames: UInt32 = 4096  // ~85ms at 48kHz - enough cushion for jitter
-        var writePos: UInt32 = 0
-        var readPos: UInt32 = 0
+        // Ring passing audio from the input callback to the output callback. The two callbacks
+        // run on different device clocks; the ring resamples to absorb the drift.
+        // Default: 4096 frames (~85 ms) with a 1024-frame (~21 ms) target latency.
+        var ring: DriftCompensatedRing
 
         // Pre-allocated render buffer (avoid malloc in real-time callback)
         var renderBuffer: UnsafeMutablePointer<Float>?
@@ -96,13 +100,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             mixMatrix?[2] = 0.0
             mixMatrix?[3] = 1.0
 
-            let totalSamples = Int(ringBufferFrames * channelCount)
-            ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
-            ringBuffer?.initialize(repeating: 0.0, count: totalSamples)
-
-            // Pre-advance writePos so output side has a cushion of silence
-            // before real data arrives — prevents underruns during startup
-            writePos = 1024  // ~21ms cushion at 48kHz
+            ring = DriftCompensatedRing(capacityFrames: 4096, channels: Int(channelCount),
+                                        targetFill: 1024, sampleRate: sampleRate)
 
             // Pre-allocate render buffer for max expected IO size
             let renderSamples = Int(renderBufferFrames * channelCount)
@@ -114,7 +113,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         deinit {
-            if let buf = ringBuffer { buf.deallocate() }
             if let buf = renderBuffer { buf.deallocate() }
             if let buf = meterLevelsPtr { buf.deallocate() }
             if let buf = outMeterLevelsPtr { buf.deallocate() }
@@ -122,49 +120,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         func writeToRing(_ data: UnsafePointer<Float>, frames: UInt32) {
-            guard let ring = ringBuffer else { return }
-            let mask = ringBufferFrames - 1
-            let chCount = channelCount
-            for i in 0..<frames {
-                let ringIdx = Int((writePos + i) & mask) * Int(chCount)
-                let srcIdx = Int(i) * Int(chCount)
-                for ch in 0..<Int(chCount) {
-                    ring[ringIdx + ch] = data[srcIdx + ch]
-                }
-            }
-            writePos = writePos &+ frames
+            ring.write(data, frames: frames)
         }
 
-        func readFromRing(_ data: UnsafeMutablePointer<Float>, frames: UInt32) -> UInt32 {
-            guard let ring = ringBuffer else {
-                // No ring buffer -- fill with silence
-                let totalSamples = Int(frames * channelCount)
-                for j in 0..<totalSamples { data[j] = 0.0 }
-                return 0
-            }
-            let mask = ringBufferFrames - 1
-            let chCount = channelCount
-            let available = writePos &- readPos
-            let toRead = min(frames, available)
-
-            for i in 0..<toRead {
-                let ringIdx = Int((readPos + i) & mask) * Int(chCount)
-                let dstIdx = Int(i) * Int(chCount)
-                for ch in 0..<Int(chCount) {
-                    data[dstIdx + ch] = ring[ringIdx + ch]
-                }
-            }
-            readPos = readPos &+ toRead
-
-            // Zero-fill remainder
-            if toRead < frames {
-                let remaining = Int((frames - toRead) * chCount)
-                let offset = Int(toRead * chCount)
-                for j in 0..<remaining {
-                    data[offset + j] = 0.0
-                }
-            }
-            return toRead
+        func readFromRing(_ data: UnsafeMutablePointer<Float>, frames: UInt32) {
+            ring.read(into: data, frames: frames)
         }
 
         func computeRMS(from buffer: UnsafePointer<Float>, frames: UInt32) {
@@ -397,20 +357,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             )
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
 
-            // App capture needs a much larger ring buffer than device routing.
-            // SCStream delivers audio on its own schedule with jitter, unlike
-            // the synchronized AUHAL input/output pair used for device routing.
-            // 16384 frames = ~340ms at 48kHz — enough cushion for jitter.
-            let appRingFrames: UInt32 = 16384  // must be power of 2
-            let appRingSamples = Int(appRingFrames * channelCount)
-            ctx.ringBuffer?.deallocate()
-            ctx.ringBufferFrames = appRingFrames
-            ctx.ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: appRingSamples)
-            ctx.ringBuffer?.initialize(repeating: 0.0, count: appRingSamples)
-
-            // Pre-advance writePos so the output side has a cushion before
-            // SCStream starts delivering. This prevents underruns during startup.
-            ctx.writePos = 2048  // ~42ms of silence cushion
+            // App capture needs a much larger ring than device routing: SCStream delivers
+            // bursty chunks on its own schedule. 16384 frames (~340 ms) of capacity with a
+            // 2048-frame (~42 ms) target latency absorbs the jitter.
+            ctx.ring = DriftCompensatedRing(capacityFrames: 16384, channels: Int(channelCount),
+                                            targetFill: 2048, sampleRate: sampleRate)
 
             // Allocate a larger render buffer for app capture (SCStream can deliver large chunks)
             let largeBufferFrames: UInt32 = 8192
@@ -440,7 +391,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             }
 
             // Start SCStream capture, writing into this context's ring buffer
-            let ringWriter: (UnsafePointer<Float>, UInt32, UInt32) -> Void = { [weak ctx] buffer, frames, chCount in
+            let ringWriter: AppAudioWriter = { [weak ctx] buffer, frames, chCount in
                 guard let ctx = ctx, let renderBuf = ctx.renderBuffer else { return }
 
                 // Copy to render buffer for effects processing
@@ -472,7 +423,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 ctx.writeToRing(renderBuf, frames: frames)
             }
 
-            Task { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
                     try await appCaptureService.startCapture(
@@ -498,7 +449,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         queue.async { [weak self] in
             self?.stopAppCaptureInternal(bundleID: bundleID)
         }
-        Task {
+        Task { @MainActor in
             await appCaptureService.stopCapture(bundleID: bundleID)
         }
     }
@@ -632,9 +583,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             newSourceLevels["output:\(uid)"] = channelLevels
         }
 
+        let sourceLevels = newSourceLevels
+        let outputLevels = newOutputLevels
         DispatchQueue.main.async { [weak self] in
-            self?.sourceMeterLevels = newSourceLevels
-            self?.outputMeterLevels = newOutputLevels
+            self?.sourceMeterLevels = sourceLevels
+            self?.outputMeterLevels = outputLevels
         }
     }
 
@@ -946,12 +899,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             logger.info("Test tone started")
 
             // Stop after duration
+            let playback = TestTonePlayback(unit: unit, state: toneState)
             DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
-                AudioOutputUnitStop(unit)
-                AudioUnitUninitialize(unit)
-                AudioComponentInstanceDispose(unit)
-                toneState.deinitialize(count: 1)
-                toneState.deallocate()
+                playback.stop()
                 logger.info("Test tone stopped")
             }
         }
@@ -1324,6 +1274,21 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     }
 }
 
+/// A running test-tone unit and its callback state. Created on the router queue, then handed
+/// to the main queue exactly once to stop and free it.
+private struct TestTonePlayback: @unchecked Sendable {
+    let unit: AudioComponentInstance
+    let state: UnsafeMutablePointer<TestToneState>
+
+    func stop() {
+        AudioOutputUnitStop(unit)
+        AudioUnitUninitialize(unit)
+        AudioComponentInstanceDispose(unit)
+        state.deinitialize(count: 1)
+        state.deallocate()
+    }
+}
+
 // MARK: - Sample rate change listener (C function)
 
 private func sampleRateChangeListener(
@@ -1414,7 +1379,7 @@ private func outputRenderCallback(
     }
 
     // Read from the ring buffer into the output
-    _ = ctx.readFromRing(outputBuffer, frames: inNumberFrames)
+    ctx.readFromRing(outputBuffer, frames: inNumberFrames)
 
     return noErr
 }

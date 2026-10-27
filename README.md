@@ -15,14 +15,18 @@
 <p align="center">
   <a href="https://github.com/JacobCoffee/loopbacker/actions/workflows/ci.yml"><img src="https://github.com/JacobCoffee/loopbacker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/JacobCoffee/loopbacker/releases"><img src="https://img.shields.io/github/v/release/JacobCoffee/loopbacker?include_prereleases" alt="Release"></a>
-  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-blue" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/platform-macOS%2026%2B-blue" alt="macOS 26+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue" alt="FSL-1.1-MIT"></a>
 </p>
 
 ---
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Loopbacker screenshot" width="800">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/routing-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/routing-light.png">
+    <img src="docs/screenshots/routing-dark.png" alt="Loopbacker routing canvas: a MOTU M2 source cabled into the virtual mic, with live meters" width="800">
+  </picture>
 </p>
 
 Loopbacker creates a virtual audio device on macOS that captures audio from any app and makes it available as a mic input. Route desktop audio into Discord, OBS, Zoom, or any recording app. It also has a full audio effects chain for broadcast voice processing, and a soundboard for playing audio clips through the virtual device.
@@ -54,6 +58,10 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 
 The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gist.github.com/jtrv/47542c8be6345951802eebcf9dc7da31) -- the same signal chain used by podcasters and streamers on Linux, ported to native macOS with zero dependencies.
 
+<p align="center">
+  <img src="docs/screenshots/effects-dark.png" alt="Effects section: vertical insert chain beside the parametric EQ editor" width="720">
+</p>
+
 **Soundboard**
 
 - Play audio files (MP3, WAV, M4A, AIFF, FLAC, CAF) through the virtual device
@@ -63,12 +71,22 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 - Global volume control
 - Sounds appear in Discord/Zoom/OBS as if they're your mic
 
+<p align="center">
+  <img src="docs/screenshots/soundboard-light.png" alt="Soundboard section: a grid of sound pads" width="720">
+</p>
+
 **UI**
 
-- Three tabs: Routing, Effects, Soundboard
-- Snaking pipeline view with animated cable connections
-- Adaptive light/dark theme with in-app toggle
-- Menu bar quick access panel
+- macOS 26 Liquid Glass design, light and dark, with an in-app appearance override
+- Sidebar with Routing, Effects, Soundboard, and Scenes (⌘1–⌘4), plus every source's live level and on/off switch
+- Routing canvas where cables glow with the signal running through them
+- Effects shown as a vertical insert chain, like a channel strip
+- Menu bar panel with live meters, per-source switches, Reconnect, and Test Tone
+- Audio menu with keyboard shortcuts: Reconnect (⌘R), Stop All Routing (⇧⌘.), Test Tone (⌥⌘T)
+
+<p align="center">
+  <img src="docs/screenshots/menubar-dark.png" alt="Menu bar panel with engine status, per-source meters and switches, Reconnect, and Test Tone" width="300">
+</p>
 
 ## How it works
 
@@ -113,12 +131,12 @@ make uninstall    # Remove driver + app
 
 ## Usage
 
-1. Open **Loopbacker.app** and click **Install Driver** (requires admin).
-2. Add your microphone as a source in the **Routing** tab.
-3. Connect source channels to output channels by clicking the connector dots.
+1. Open **Loopbacker.app** and click **Install Driver** at the bottom of the sidebar (requires admin).
+2. Add your microphone as a source with **+** in the toolbar or next to **Sources** in the sidebar.
+3. In **Routing**, click a source channel's port, then an output channel's port, to connect them.
 4. In your chat/recording app, select **Loopbacker** as the input device.
-5. Switch to the **Effects** tab to enable broadcast voice processing.
-6. Switch to the **Soundboard** tab to play audio clips through the virtual device.
+5. Open **Effects** (⌘2) to enable broadcast voice processing.
+6. Open **Soundboard** (⌘3) to play audio clips through the virtual device, or **Scenes** (⌘4) to save and switch setups.
 
 ## Project structure
 
@@ -126,7 +144,7 @@ make uninstall    # Remove driver + app
 loopbacker/
 ├── Driver/          CoreAudio HAL plugin (C++17, CMake)
 │   └── src/         Lock-free ring buffer, driver vtable, device management
-├── App/             SwiftUI companion app (Swift 5.9)
+├── App/             SwiftUI companion app (Swift 6 language mode, macOS 26)
 │   └── Sources/
 │       ├── Models/      AudioSource, AudioRoute, EffectsPreset, SoundboardItem
 │       ├── Services/    AudioRouter, AudioEffectsChain, SoundboardPlayer
@@ -137,7 +155,7 @@ loopbacker/
 
 ## Requirements
 
-- macOS 14+ (Sonoma or later)
+- macOS 26+ (Tahoe or later)
 - Apple Silicon or Intel (universal binary)
 - CMake 3.20+
 

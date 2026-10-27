@@ -18,9 +18,14 @@ struct CaptureApp: Identifiable, Equatable {
     }
 }
 
+/// Receives (interleaved Float32 samples, frame count, channel count) on the capture queue.
+typealias AppAudioWriter = @Sendable (UnsafePointer<Float>, UInt32, UInt32) -> Void
+
 /// Manages ScreenCaptureKit-based audio capture from running applications.
 /// Each active capture delivers Float32 interleaved audio into a caller-provided ring buffer writer.
-class AppCaptureService: NSObject, ObservableObject {
+/// Bookkeeping lives on the main actor; sample buffers arrive on `captureQueue`.
+@MainActor
+final class AppCaptureService: NSObject, ObservableObject {
     @Published var availableApps: [CaptureApp] = []
     @Published var permissionGranted: Bool = false
 
@@ -40,11 +45,11 @@ class AppCaptureService: NSObject, ObservableObject {
     func checkPermission() async -> Bool {
         do {
             _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            await MainActor.run { permissionGranted = true }
+            permissionGranted = true
             return true
         } catch {
             logger.warning("Screen Recording permission not granted: \(error.localizedDescription)")
-            await MainActor.run { permissionGranted = false }
+            permissionGranted = false
             return false
         }
     }
@@ -92,9 +97,7 @@ class AppCaptureService: NSObject, ObservableObject {
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
-            await MainActor.run {
-                self.availableApps = apps
-            }
+            availableApps = apps
         } catch {
             logger.error("Failed to enumerate apps: \(error.localizedDescription)")
         }
@@ -112,7 +115,7 @@ class AppCaptureService: NSObject, ObservableObject {
     /// to call from a non-main, non-RT queue.
     func startCapture(
         bundleID: String,
-        ringBufferWriter: @escaping (UnsafePointer<Float>, UInt32, UInt32) -> Void,
+        ringBufferWriter: @escaping AppAudioWriter,
         sampleRate: Float64,
         channelCount: UInt32
     ) async throws {
@@ -225,21 +228,25 @@ private class AppCaptureStreamDelegate: NSObject, SCStreamDelegate {
         self.service = service
     }
 
+    // SCStream calls this on its own queue.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        service?.handleStreamError(bundleID: bundleID, error: error)
+        let bundleID = bundleID
+        Task { @MainActor [weak service] in
+            service?.handleStreamError(bundleID: bundleID, error: error)
+        }
     }
 }
 
 // MARK: - Stream output delegate
 
 /// Receives audio sample buffers from SCStream and forwards them to the ring buffer.
-private class AppStreamDelegate: NSObject, SCStreamOutput {
+private final class AppStreamDelegate: NSObject, SCStreamOutput {
     let bundleID: String
-    let ringBufferWriter: (UnsafePointer<Float>, UInt32, UInt32) -> Void
+    let ringBufferWriter: AppAudioWriter
     let expectedChannelCount: UInt32
 
     init(bundleID: String,
-         ringBufferWriter: @escaping (UnsafePointer<Float>, UInt32, UInt32) -> Void,
+         ringBufferWriter: @escaping AppAudioWriter,
          expectedChannelCount: UInt32) {
         self.bundleID = bundleID
         self.ringBufferWriter = ringBufferWriter

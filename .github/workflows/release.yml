@@ -14,7 +14,7 @@ env:
 jobs:
   build-and-release:
     name: Build, Sign & Release
-    runs-on: macos-14
+    runs-on: macos-26
 
     steps:
       - name: Checkout
@@ -65,6 +65,9 @@ jobs:
           cp App/Loopbacker/.build/release/Loopbacker Loopbacker.app/Contents/MacOS/
           cp App/Loopbacker/Resources/Info.plist        Loopbacker.app/Contents/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
+          xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
+            --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
+            --output-partial-info-plist "$RUNNER_TEMP/assets-partial.plist" >/dev/null
 
       # ── Code Signing ─────────────────────────────────────────────
       - name: Import signing certificate

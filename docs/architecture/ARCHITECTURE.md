@@ -389,7 +389,7 @@ Both `kAudioDevicePropertyLatency` and `kAudioDevicePropertySafetyOffset` return
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Clock drift vs. real hardware | Glitches when aggregating with MOTU M2 | Use `kAudioDeviceClockAlgorithmRaw` and keep timestamps precise. For aggregate device use, the host handles drift compensation. |
+| Clock drift vs. real hardware | Glitches when aggregating with MOTU M2 | Use `kAudioDeviceClockAlgorithmRaw` and keep timestamps precise. For aggregate device use, the host handles drift compensation. The app's own routes (input AUHAL on one device, output AUHAL on another) bridge clocks through `DriftCompensatedRing`, which resamples by up to ±0.1% to hold the ring at its target fill; a measured M2 runs ~45 ppm slow vs. the host clock, which drained the old plain ring into continuous crackle within minutes. |
 | Ring buffer overrun/underrun | Silence or stale audio | 65536-frame buffer provides >1s headroom. Log (to stderr/syslog) on wrap. |
 | coreaudiod crash on bad property response | System-wide audio failure | Extensive testing of every property the host queries. Return `kAudioHardwareUnknownPropertyError` for anything unexpected. |
 | Code signing on macOS 13+ | Plugin may not load | Ad-hoc signing (`codesign -s -`) is sufficient for local use. Distribution requires a Developer ID. |

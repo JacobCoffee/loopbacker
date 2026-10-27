@@ -3,175 +3,144 @@ import SwiftUI
 struct ScenesView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioRouter: AudioRouter
+
     @State private var presetNames: [String] = []
     @State private var newPresetName: String = ""
-    @State private var showSaveField = false
+    @State private var showSavePopover = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("SCENES / PRESETS")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(LoopbackerTheme.textSecondary)
-                .tracking(1.5)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
-
-            Divider().background(LoopbackerTheme.border)
-
-            // Save new preset
-            if showSaveField {
-                saveField
-            } else {
-                Button(action: { showSaveField = true }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(LoopbackerTheme.accent)
-
-                        Text("Save Current Config")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(LoopbackerTheme.textPrimary)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .tooltip("Save the current routing configuration as a named preset")
-            }
-
-            Divider().background(LoopbackerTheme.border)
-
-            // Preset list
+        Group {
             if presetNames.isEmpty {
-                HStack {
-                    Spacer()
-                    VStack(spacing: 6) {
-                        Image(systemName: "square.stack.3d.up")
-                            .font(.system(size: 20))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                        Text("No saved presets")
-                            .font(.system(size: 11))
-                            .foregroundColor(LoopbackerTheme.textMuted)
-                    }
-                    .padding(.vertical, 16)
-                    Spacer()
-                }
+                emptyState
             } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(presetNames, id: \.self) { name in
-                            presetRow(name: name)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .frame(maxHeight: 260)
+                sceneList
             }
         }
-        .frame(width: 260)
-        .background(LoopbackerTheme.bgCard)
+        .navigationSubtitle("\(presetNames.count) saved")
+        .toolbar { toolbarContent }
+        .popover(isPresented: $showSavePopover, arrowEdge: .bottom) {
+            savePopoverContent
+        }
         .onAppear {
             presetNames = PresetManager.list()
         }
     }
 
-    // MARK: - Save field
+    // MARK: - Toolbar
 
-    private var saveField: some View {
-        HStack(spacing: 6) {
-            TextField("Preset name", text: $newPresetName)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(LoopbackerTheme.textPrimary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(LoopbackerTheme.bgInset)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .strokeBorder(LoopbackerTheme.border, lineWidth: 0.5)
-                )
-                .onSubmit {
-                    savePreset()
-                }
-
-            Button(action: savePreset) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(newPresetName.isEmpty ? LoopbackerTheme.textMuted : LoopbackerTheme.accent)
-            }
-            .buttonStyle(.plain)
-            .disabled(newPresetName.isEmpty)
-            .tooltip("Confirm and save this preset")
-
-            Button(action: {
-                showSaveField = false
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
                 newPresetName = ""
-            }) {
-                Image(systemName: "xmark.circle")
-                    .font(.system(size: 14))
-                    .foregroundColor(LoopbackerTheme.textMuted)
+                showSavePopover = true
+            } label: {
+                Label("Save Current Config", systemImage: "plus.circle")
             }
-            .buttonStyle(.plain)
-            .tooltip("Cancel saving preset")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        GlobalToolbar()
     }
 
-    // MARK: - Preset row
+    private var savePopoverContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Save Scene")
+                .font(.headline)
 
-    private func presetRow(name: String) -> some View {
-        HStack(spacing: 8) {
+            TextField("Preset name", text: $newPresetName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 220)
+                .onSubmit { savePreset() }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { showSavePopover = false }
+                    .buttonStyle(.glass)
+                    .tint(nil)
+                Button("Save") { savePreset() }
+                    .buttonStyle(.glassProminent)
+                    .tint(.loopbacker)
+                    .disabled(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+    }
+
+    // MARK: - Scene list
+
+    private var sceneList: some View {
+        List {
+            ForEach(presetNames, id: \.self) { name in
+                sceneRow(name: name)
+            }
+        }
+        .listStyle(.inset)
+        .scrollContentBackground(.hidden)
+    }
+
+    private func sceneRow(name: String) -> some View {
+        HStack(spacing: 12) {
             Image(systemName: "square.stack.3d.up")
-                .font(.system(size: 11))
-                .foregroundColor(LoopbackerTheme.accent)
-                .frame(width: 18)
+                .foregroundStyle(Color.loopbacker)
+                .frame(width: 20)
 
             Text(name)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(LoopbackerTheme.textPrimary)
+                .font(.body.weight(.medium))
                 .lineLimit(1)
 
             Spacer()
 
-            Button(action: { loadPreset(name: name) }) {
-                Text("Load")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(LoopbackerTheme.accent)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(LoopbackerTheme.accent.opacity(0.12)))
-                    .overlay(Capsule().strokeBorder(LoopbackerTheme.accent.opacity(0.3), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .tooltip("Load the '\(name)' preset, replacing current config")
+            Button("Load") { loadPreset(name: name) }
+                .buttonStyle(.glass)
+                .tint(.loopbacker)
+                .help("Load the '\(name)' scene, replacing the current configuration")
 
-            Button(action: { deletePreset(name: name) }) {
+            Button(role: .destructive) {
+                deletePreset(name: name)
+            } label: {
                 Image(systemName: "trash")
-                    .font(.system(size: 10))
-                    .foregroundColor(LoopbackerTheme.danger)
             }
-            .buttonStyle(.plain)
-            .tooltip("Delete the '\(name)' preset")
+            .buttonStyle(.borderless)
+            .help("Delete the '\(name)' scene")
+            .accessibilityLabel("Delete \(name)")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
         .contentShape(Rectangle())
+        .contextMenu {
+            Button("Load") { loadPreset(name: name) }
+            Button("Delete", role: .destructive) { deletePreset(name: name) }
+        }
+        .swipeActions {
+            Button("Delete", role: .destructive) { deletePreset(name: name) }
+        }
+    }
+
+    // MARK: - Empty state
+
+    private var emptyState: some View {
+        EmptyStateView(
+            title: "No Scenes",
+            message: "Save the current sources, routes and outputs as a scene to switch setups in one click.",
+            symbol: "square.stack.3d.up"
+        ) {
+            Button("Save Current") {
+                newPresetName = ""
+                showSavePopover = true
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.loopbacker)
+        }
     }
 
     // MARK: - Actions
 
     private func savePreset() {
-        guard !newPresetName.isEmpty else { return }
+        let trimmed = newPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
         let data = routingState.exportConfig()
-        PresetManager.save(name: newPresetName, data: data)
+        PresetManager.save(name: trimmed, data: data)
         presetNames = PresetManager.list()
         newPresetName = ""
-        showSaveField = false
+        showSavePopover = false
     }
 
     private func loadPreset(name: String) {

@@ -33,6 +33,9 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp App/Loopbacker/Resources/Info.plist $(APP_CONTENTS)/Info.plist
 	cp App/Loopbacker/Resources/AppIcon.icns $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/logo.png $(APP_CONTENTS)/Resources/
+	xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile $(APP_CONTENTS)/Resources \
+		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
+		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
 	cp -R Driver/build/Loopbacker.driver $(APP_CONTENTS)/Resources/
 	codesign --force --deep --sign "Apple Development: Jacob Coffee (NBMD22TJZJ)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."
