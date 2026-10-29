@@ -112,38 +112,17 @@ struct SignalMeter: View {
 
     private var clamped: CGFloat { CGFloat(min(max(level, 0), 1)) }
 
-    private var gradient: Gradient {
-        Gradient(stops: [
-            .init(color: .loopbacker, location: 0),
-            .init(color: .loopbacker, location: 0.68),
-            .init(color: .signalWarm, location: 0.80),
-            .init(color: .signalWarm, location: 0.88),
-            .init(color: .signalHot, location: 0.95),
-        ])
-    }
-
-    // A Canvas redraws without touching layout. The previous mask-and-frame meter re-laid out the
-    // window on every level change, and its 80 ms level animation kept that going at the display
-    // rate. Meter ballistics (decay) already happen in the router.
+    // Core Animation layers rather than SwiftUI drawing: a level change only resizes a mask
+    // layer, which the render server composites. A SwiftUI Canvas or shape re-rasterized the
+    // meter on the main thread on every 30 Hz tick, and a frame-based mask re-laid out the window.
+    // Meter ballistics (decay) already happen in the router.
     var body: some View {
         let horizontal = axis == .horizontal
-        Canvas { context, size in
-            context.fill(Capsule().path(in: CGRect(origin: .zero, size: size)), with: .style(.quaternary))
-            let length = horizontal ? size.width : size.height
-            let filled = max(clamped * length, clamped > 0 ? thickness : 0)
-            guard filled > 0 else { return }
-            let fill = horizontal
-                ? CGRect(x: 0, y: 0, width: filled, height: size.height)
-                : CGRect(x: 0, y: size.height - filled, width: size.width, height: filled)
-            context.fill(Capsule().path(in: fill),
-                         with: .linearGradient(gradient,
-                                               startPoint: horizontal ? .zero : CGPoint(x: 0, y: size.height),
-                                               endPoint: horizontal ? CGPoint(x: size.width, y: 0) : .zero))
-        }
-        .frame(width: horizontal ? nil : thickness, height: horizontal ? thickness : nil)
-        .accessibilityElement()
-        .accessibilityLabel("Level")
-        .accessibilityValue(Self.dbString(level))
+        MeterBar(level: clamped, horizontal: horizontal, minimumFill: thickness)
+            .frame(width: horizontal ? nil : thickness, height: horizontal ? thickness : nil)
+            .accessibilityElement()
+            .accessibilityLabel("Level")
+            .accessibilityValue(Self.dbString(level))
     }
 
     /// "-12 dB" style readout for a normalized level; "Silent" at the floor.
@@ -159,8 +138,152 @@ struct SignalMeter: View {
     }
 }
 
-/// A source's loudest channel, read live from `MeterLevels`. Keep this a leaf: it is the only
-/// view that re-renders at meter rate in a row.
+/// A meter that follows `MeterLevels` by itself. `read` returns the current level; the meter
+/// observes whatever it reads and redraws its layers on change, so a 30 Hz meter tick never
+/// touches SwiftUI: no body evaluation, no layout pass, no re-rasterization. Driving the meter
+/// through SwiftUI cost ~16% of a core with the Routing page's meters moving.
+struct LiveSignalMeter: View {
+    var thickness: CGFloat = 6
+    let read: @MainActor () -> Float
+
+    var body: some View {
+        MeterBar(level: 0, horizontal: true, minimumFill: thickness, read: read)
+            .frame(height: thickness)
+    }
+}
+
+/// The meter's layers: a quaternary capsule track and a full-length zone gradient, masked to the
+/// filled length. Driven either by `level` or, when set, by observing `read`.
+private struct MeterBar: NSViewRepresentable {
+    var level: CGFloat
+    var horizontal: Bool
+    var minimumFill: CGFloat
+    var read: (@MainActor () -> Float)? = nil
+
+    func makeNSView(context: Context) -> MeterBarView { MeterBarView() }
+
+    func updateNSView(_ view: MeterBarView, context: Context) {
+        view.update(level: level, horizontal: horizontal, minimumFill: minimumFill)
+        view.observe(read)
+    }
+}
+
+private final class MeterBarView: NSView {
+    private let track = CALayer()
+    private let fill = CAGradientLayer()
+    private let fillMask = CALayer()
+    private var level: CGFloat = 0
+    private var horizontal = true
+    private var minimumFill: CGFloat = 0
+    private var read: (@MainActor () -> Float)?
+    private var generation = 0
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        fill.locations = [0, 0.68, 0.80, 0.88, 0.95]
+        fillMask.backgroundColor = CGColor(gray: 0, alpha: 1)
+        fill.mask = fillMask
+        layer?.addSublayer(track)
+        layer?.addSublayer(fill)
+        applyColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .levelIndicator }
+    override func accessibilityLabel() -> String? { "Level" }
+    override func accessibilityValue() -> Any? { SignalMeter.dbString(Float(level)) }
+
+    func update(level: CGFloat, horizontal: Bool, minimumFill: CGFloat) {
+        let reshape = horizontal != self.horizontal || minimumFill != self.minimumFill
+        self.horizontal = horizontal
+        self.minimumFill = minimumFill
+        if read == nil { setLevel(level) }
+        if reshape { needsLayout = true }
+    }
+
+    /// Starts following `read` (or stops, for nil). Each call starts a new observation chain
+    /// and retires the previous one, so repeated SwiftUI updates never stack up refreshes.
+    func observe(_ read: (@MainActor () -> Float)?) {
+        self.read = read
+        generation &+= 1
+        let current = generation
+        // Not inline: this runs inside SwiftUI's update, which would also record the level
+        // read and re-run the update on every change, the cost this view exists to avoid.
+        DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.refresh(current) } }
+    }
+
+    private func refresh(_ chain: Int) {
+        guard chain == generation, let read else { return }
+        let value = withObservationTracking { read() } onChange: { [weak self] in
+            // Called as the level is about to change; read it once the write has landed.
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.refresh(chain) } }
+        }
+        setLevel(CGFloat(min(max(value, 0), 1)))
+    }
+
+    private func setLevel(_ level: CGFloat) {
+        guard level != self.level else { return }
+        self.level = level
+        applyLevel()
+    }
+
+    override func layout() {
+        super.layout()
+        withoutAnimation {
+            let radius = min(bounds.width, bounds.height) / 2
+            track.frame = bounds
+            track.cornerRadius = radius
+            fill.frame = bounds
+            fillMask.cornerRadius = radius
+            // Unflipped layer coordinates: a vertical meter fills from the bottom up.
+            fill.startPoint = horizontal ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 0.5, y: 0)
+            fill.endPoint = horizontal ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0.5, y: 1)
+        }
+        applyLevel()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyLevel() {
+        let length = horizontal ? bounds.width : bounds.height
+        let filled = level > 0 ? min(max(level * length, minimumFill), length) : 0
+        withoutAnimation {
+            fillMask.frame = horizontal
+                ? CGRect(x: 0, y: 0, width: filled, height: bounds.height)
+                : CGRect(x: 0, y: 0, width: bounds.width, height: filled)
+        }
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let green = NSColor(Color.loopbacker).cgColor
+            let warm = NSColor(Color.signalWarm).cgColor
+            let hot = NSColor(Color.signalHot).cgColor
+            withoutAnimation {
+                track.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+                fill.colors = [green, green, warm, warm, hot]
+            }
+        }
+    }
+
+    private func withoutAnimation(_ body: () -> Void) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        body()
+        CATransaction.commit()
+    }
+}
+
+/// A source's loudest channel, read live from `MeterLevels`.
 struct SourcePeakMeter: View {
     @Environment(MeterLevels.self) private var meters
     /// Route key (`AudioSource.deviceUID`, or "output:<virtual device UID>").
@@ -169,10 +292,10 @@ struct SourcePeakMeter: View {
     var thickness: CGFloat = 4
 
     var body: some View {
-        let level = isLive ? meters.peak(source: key) : 0
-        SignalMeter(level: level, thickness: thickness)
-            .opacity(isLive ? 1 : 0.5)
-            .accessibilityValue(isLive ? SignalMeter.dbString(level) : "Off")
+        LiveSignalMeter(thickness: thickness) { [meters, key, isLive] in
+            isLive ? meters.peak(source: key) : 0
+        }
+        .opacity(isLive ? 1 : 0.5)
     }
 }
 

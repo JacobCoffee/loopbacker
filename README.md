@@ -45,10 +45,10 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 
 **Noise Suppression**
 
-- On-device neural noise removal for mic inputs, using [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz model through Core ML
+- On-device neural noise removal for mic inputs, using [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz model, run inline on the audio thread through BNNS Graph
 - Runs before the effects chain, independent of its bypass and presets; toggle it from the Effects section or the menu bar
 - Max Reduction control (-60 to -6 dB) to keep some room tone instead of dead silence
-- Adds about 80 ms of latency at a 512-frame buffer (40 ms of it is the model's lookahead)
+- Adds a constant 60 ms of latency at any buffer size (40 ms of it is the model's lookahead)
 - Applies to mic → virtual mic and monitor routes, not app captures
 
 **Effects Chain** (9 real-time DSP effects, all processed on the audio thread)
@@ -115,7 +115,7 @@ Mic / App Output                        Discord / OBS / Zoom
                   Loopbacker Virtual Device
 ```
 
-A CoreAudio HAL plugin provides the virtual device. The SwiftUI app handles routing, effects processing, and driver installation. The effects chain runs on the real-time audio thread with no allocations or locks. Noise suppression runs its Core ML model on a separate worker thread; the audio thread only exchanges samples with it through lock-free rings.
+A CoreAudio HAL plugin provides the virtual device. The SwiftUI app handles routing, effects processing, and driver installation. The effects chain and noise suppression run on the real-time audio thread with no allocations or locks; the noise model executes through BNNS Graph with preallocated, wired buffers.
 
 ## Install
 

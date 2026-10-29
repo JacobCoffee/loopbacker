@@ -454,51 +454,101 @@ Output routing captures every channel of the virtual device and mixes the monito
 to the physical output's first two channels, so other channels (a timecode track, for
 example) stay on the device for other apps to record without reaching the speakers.
 
-Meter levels go to an `@Observable` `MeterLevels` store rather than the routing model,
-so 30 Hz meter updates re-render only the meter views.
+Meter levels go to an `@Observable` `MeterLevels` store rather than the routing model, split
+per route and per channel (`SourceLevelStore`, `ChannelLevelBox`) and quantized to 1/256, so a
+30 Hz meter tick re-renders only the meters and cables whose own level visibly moved. Once
+every level has decayed to zero and that has been shown, ticks do nothing until signal returns.
 
 ## Noise Suppression
 
-`NoiseSuppressor` runs CEVA's DPDFNet2 48 kHz model (Apache-2.0) through Core ML on the
-CPU. Only routes fed by a physical input get one (mic → virtual mic, mic → monitor); app
+`NoiseSuppressor` runs CEVA's DPDFNet2 48 kHz model (Apache-2.0) on the CPU through BNNS
+Graph. Only routes fed by a physical input use it (mic → virtual mic, mic → monitor); app
 captures and output routes don't. It is created on the router queue the first time it is
-enabled for a route and kept for the route's lifetime.
+enabled and kept for the route's lifetime.
 
-Core ML allocates and locks, so inference runs on a dedicated worker thread. The audio
-callback downmixes channels 1–2 to mono, pushes it into a lock-free SPSC ring, wakes the
-worker, and pulls enhanced mono from a second ring back into channels 1–2. The worker does
-the 20 ms Vorbis-window STFT (10 ms hop), one model call per hop with a ping-pong recurrent
-state written into preallocated Core ML outputs, ISTFT/overlap-add, and blends the dry signal
-(delayed by the model's 4-hop lookahead) back in at the user's max-reduction level.
+BNNS Graph executes a compiled graph with caller-provided workspace and buffers, with no
+allocation, locks or thread hops, so inference runs inline in the capture callback: ~0.75 ms
+per 10 ms hop on an M4 Max (p99 ~1.3 ms per 512-frame callback). The callback downmixes
+channels 1–2 to mono, runs the 20 ms Vorbis-window STFT (10 ms hop), one model execution per
+hop with a ping-pong recurrent state, ISTFT/overlap-add, and blends the dry signal (delayed by
+the model's 4-hop lookahead) back in at the user's max-reduction level. The workspace and
+every buffer the callback touches live in one `mlock`ed mapping; the compiled graph is read
+into wired memory too, since a file mapping could page-fault from disk mid-callback.
 
-Latency is ~40 ms of model lookahead plus the analysis window and about one IO buffer of
-cushion: ~80 ms end to end at a 512-frame buffer. While the cushion fills, after an underrun,
-and when switching off, the callback crossfades to the dry signal over 10 ms. The model only
-runs at 48 kHz; a monitor route on a device at another rate logs and stays dry.
+Compiling the model takes ~1.5 s, so the compiled graph is cached in
+`~/Library/Caches/<bundle id>/`, keyed by a hash of the model and the OS build.
+
+The virtual mic route and the monitor route of the same mic share one suppressor. They mix
+identically, and the HAL calls both input callbacks back to back on the device's IO thread
+with the same sample time, so the first computes the block and the second copies it (a busy
+flag leaves a block dry if two threads ever collided).
+
+Latency is a constant 60 ms (2879 samples) regardless of buffer size: 40 ms of model lookahead
+plus up to 20 ms waiting for the second half of a hop's analysis window. Switching on passes
+the dry signal until real output arrives, then crossfades over 10 ms; switching off crossfades
+back. The model only runs at 48 kHz; a monitor route on a device at another rate logs and stays
+dry.
 
 `scripts/convert-dpdfnet.py` rebuilds `App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc` from
 pinned upstream code and weights. It replaces the DPRNN blocks' bidirectional `nn.GRU`s with
 an unrolled equivalent: Core ML's `gru` op applies the reset gate differently from PyTorch, so
 coremltools lowers `nn.GRU` to `WhileLoop`s that Core ML interprets step by step, which was
 three quarters of inference time. Unrolled, a hop takes ~0.7 ms of CPU instead of ~1.3 ms on an
-M4 Max (hot cache). The script then checks Core ML against the unmodified upstream PyTorch model
-over ~500 stateful frames (~127 dB SNR). fp16 compute and the Neural Engine were tried: fp16
-breaks the output (~9 dB SNR), and the Neural Engine gives nothing for an fp32 model.
+M4 Max (hot cache). Weights are stored as fp16 (`constexpr_cast` back to fp32), halving the
+model to 7 MB; compute stays fp32, and BNNS expands the weights once at compile time, so speed
+is unchanged. The script checks the result against the unmodified upstream PyTorch model over
+~500 stateful frames (~61 dB SNR, set by the fp16 weights; ~127 dB with fp32 weights). fp16
+compute and the Neural Engine were tried: fp16 compute breaks the output (~9 dB SNR), and the
+Neural Engine gives nothing for an fp32 model.
 
 ## UI Cost
 
 SwiftUI work on the main thread is kept off the per-display-frame path:
 
-- **Meters** (`SignalMeter`) draw with a `Canvas`, so a level change redraws the meter without
-  invalidating layout, and they don't animate between levels (the router's 30 Hz decay is the
-  ballistics). The previous mask-and-frame meter re-laid out the window on each change, and its
-  80 ms level animation kept that running at the display rate.
+- **Meters** (`LiveSignalMeter`, used by channel strips and source peaks) are Core Animation
+  layers (a gradient masked to the filled length) that observe their `MeterLevels` value
+  themselves with `withObservationTracking`. A 30 Hz tick resizes a mask layer: no SwiftUI body
+  evaluation, layout pass or re-rasterization. Driving meters through SwiftUI cost ~16% of a core
+  on the Routing page with every meter moving. `SignalMeter(level:)` uses the same layers for
+  value-driven meters (Soundboard). There is no animation between levels; the router's 30 Hz
+  decay is the ballistics.
+- **Cables** (`CableView`) quantize each source's glow to 16 steps and redraw their `Canvas`
+  (blurred glow over the whole routing area) only when a step changes.
 - **Looping animations** (`LiveDot`'s halo, `SignalLineConnector`'s travelling dot) are
   `CAAnimation`s on a `LoopingDot` layer. A repeating SwiftUI animation re-runs the view graph
   and window layout every display frame; Core Animation runs it in the render server.
 - **Hidden windows**: closing the main window only hides it, and SwiftUI keeps its view graph
   alive. The meter timer publishes only while a window that shows meters is on screen (the menu
   bar icon's own window always reports visible and is ignored).
+
+## Benchmarks
+
+`scripts/bench/` holds the tooling used to measure noise-suppression and audio-thread cost
+on a given machine, independent of the app's own UI.
+
+- **`model-bench.sh`** (wraps `model-bench.swift` + `count.c`) runs the shipped
+  `DPDFNet2_48k.mlmodelc` through BNNS Graph the way the audio thread runs it: single-thread
+  compile, pointer arguments into a preallocated page-aligned workspace, and a ping-ponged
+  recurrent state -- no Core ML worker thread, no per-hop allocation. It reports compile time,
+  hot ms/hop, and paced per-hop wall/CPU time (one hop every 10 ms on a time-constraint
+  thread, matching the audio IO cadence), with a malloc/free interposer (`count.c`, loaded via
+  `DYLD_INSERT_LIBRARIES`) confirming the execute path allocates nothing on the heap. `--coreml`
+  additionally reports parity (SNR) against running the same frames through Core ML. On an M4
+  Max: ~1.4 s single-thread compile, 0.55 ms/hop hot, paced median/p99/max ~0.7/1.9/2.3 ms, 0
+  allocations.
+- **`tone.swift`** plays a quiet 440 Hz tone with level swinging -40..-20 dBFS at 1.5 Hz to a
+  named output device via `AudioQueue`, so meters and any level-dependent processing keep
+  moving during a measurement without needing real program audio.
+- **`perthread.py`** parses a `sample` report and prints each thread's active (non-idle) % of
+  a core plus its top leaf (innermost sampled) frames, filtering out known idle leaf frames
+  (kernel waits, `start_wqthread`, etc.) so blocked threads don't look busy.
+- **`app-bench.sh`** relaunches a given `Loopbacker.app` build and records process-level CPU
+  (`ps` cumulative cputime delta over wall time) and per-thread CPU with the app in the
+  background (window open but not activated, so usually covered: meters don't publish), and
+  optionally (`--visible`, which steals focus and sends ⌘1/⌘2) Routing- and Effects-page-visible
+  states. It picks out the main thread, any thread named "noise", and the summed CPU of threads
+  named `HALB`/`IOThread`/`com.apple.audio`, where noise suppression now runs. Results append
+  to a TSV for comparing runs.
 
 ## Risks and Mitigations
 

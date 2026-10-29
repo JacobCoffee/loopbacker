@@ -5,9 +5,41 @@ import SwiftUI
 /// following the source's current level; idle or disabled cables stay dim graphite.
 struct CableView: View {
     @EnvironmentObject var routingState: RoutingState
-    // Canvas-only view, so redrawing it at meter rate is cheap.
     @Environment(MeterLevels.self) private var meters
     let connectorPositions: [ConnectorEnd: CGRect]
+
+    /// Glow levels per source are quantized to this many steps. The canvas (blurred glow over
+    /// the whole routing area) is the most expensive thing to redraw, so it redraws only when a
+    /// step changes rather than on every 30 Hz meter tick.
+    static let glowSteps = 16
+
+    var body: some View {
+        CableCanvas(routes: routingState.routes, sources: routingState.sources,
+                    pending: routingState.pendingConnector, positions: connectorPositions,
+                    glow: glowSteps())
+            .equatable()
+            // CRITICAL: hit testing must be off so clicks pass through to cards/buttons
+            .allowsHitTesting(false)
+    }
+
+    /// Source ID → glow step (0 = no signal, else 1...glowSteps) for live sources.
+    private func glowSteps() -> [UUID: Int] {
+        var steps: [UUID: Int] = [:]
+        for source in routingState.sources where source.isEnabled && !source.isMuted {
+            let level = meters.peak(source: source.deviceUID)
+            guard level > 0 else { continue }
+            steps[source.id] = max(1, Int((min(level, 1) * Float(Self.glowSteps)).rounded()))
+        }
+        return steps
+    }
+}
+
+private struct CableCanvas: View, Equatable {
+    let routes: [AudioRoute]
+    let sources: [AudioSource]
+    let pending: ConnectorEnd?
+    let positions: [ConnectorEnd: CGRect]
+    let glow: [UUID: Int]
 
     var body: some View {
         Canvas { context, size in
@@ -16,45 +48,40 @@ struct CableView: View {
             let accent = Color.loopbacker
             let idle = Color.secondary
 
-            for route in routingState.routes {
+            for route in routes {
                 let sourceEnd = ConnectorEnd.source(sourceId: route.sourceId, channelId: route.sourceChannelId)
                 let outputEnd = ConnectorEnd.output(channelId: route.outputChannelId)
 
-                guard let sourceRect = connectorPositions[sourceEnd],
-                      let outputRect = connectorPositions[outputEnd] else { continue }
+                guard let sourceRect = positions[sourceEnd],
+                      let outputRect = positions[outputEnd] else { continue }
 
                 let start = CGPoint(x: sourceRect.midX, y: sourceRect.midY)
                 let end = CGPoint(x: outputRect.midX, y: outputRect.midY)
 
                 drawCable(context: &context, from: start, to: end,
-                          level: sourceLevel(route), accent: accent, idle: idle)
+                          level: level(route.sourceId), accent: accent, idle: idle)
             }
 
             // Soft bloom under each live source's connectors.
-            for source in routingState.sources where source.isEnabled && !source.isMuted {
-                let level = meters.peak(source: source.deviceUID)
+            for source in sources {
+                let level = level(source.id)
                 guard level > 0.02 else { continue }
                 for channel in source.channels {
-                    guard let rect = connectorPositions[.source(sourceId: source.id, channelId: channel.id)] else { continue }
+                    guard let rect = positions[.source(sourceId: source.id, channelId: channel.id)] else { continue }
                     drawBloom(context: &context, at: CGPoint(x: rect.midX, y: rect.midY), level: level, accent: accent)
                 }
             }
 
             // Pending connection pulse indicator.
-            if let pending = routingState.pendingConnector,
-               let pendingRect = connectorPositions[pending] {
+            if let pending, let pendingRect = positions[pending] {
                 let pendingPoint = CGPoint(x: pendingRect.midX, y: pendingRect.midY)
                 drawPendingIndicator(context: &context, at: pendingPoint, accent: accent)
             }
         }
-        // CRITICAL: hit testing must be off so clicks pass through to cards/buttons
-        .allowsHitTesting(false)
     }
 
-    private func sourceLevel(_ route: AudioRoute) -> Float {
-        guard let source = routingState.sources.first(where: { $0.id == route.sourceId }),
-              source.isEnabled, !source.isMuted else { return 0 }
-        return meters.peak(source: source.deviceUID)
+    private func level(_ sourceId: UUID) -> Float {
+        Float(glow[sourceId] ?? 0) / Float(CableView.glowSteps)
     }
 
     // MARK: - Cable drawing

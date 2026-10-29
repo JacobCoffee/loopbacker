@@ -109,8 +109,8 @@ struct ChannelStripView: View {
 
 // MARK: - Live meter
 
-/// The only part of a strip that reads `MeterLevels`, so 30 Hz meter updates re-render
-/// just this view rather than the card around it.
+/// The only part of a strip that reads `MeterLevels`. The meter follows the level itself, so
+/// 30 Hz meter updates never re-render this view or the card around it.
 private struct ChannelLevelMeter: View {
     @Environment(MeterLevels.self) private var meters
     let side: ChannelStripView.StripSide
@@ -118,13 +118,12 @@ private struct ChannelLevelMeter: View {
     let isLive: Bool
 
     var body: some View {
-        SignalMeter(level: isLive ? level : 0, axis: .horizontal, thickness: 6)
-    }
-
-    private var level: Float {
-        switch side {
-        case .source(let key): meters.level(source: key, channel: channel)
-        case .output: meters.output(channel: channel)
+        LiveSignalMeter(thickness: 6) { [meters, side, channel, isLive] in
+            guard isLive else { return 0 }
+            switch side {
+            case .source(let key): return meters.level(source: key, channel: channel)
+            case .output: return meters.output(channel: channel)
+            }
         }
     }
 }

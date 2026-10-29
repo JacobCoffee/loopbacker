@@ -130,7 +130,7 @@ struct EffectsView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Noise Suppression")
                         .font(.headline)
-                    Text("Removes background noise from mic inputs with an on-device neural model. Runs before the effects chain, even when it's bypassed. Adds about 80 ms of latency.")
+                    Text("Removes background noise from mic inputs with an on-device neural model. Runs before the effects chain, even when it's bypassed. Adds 60 ms of latency.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

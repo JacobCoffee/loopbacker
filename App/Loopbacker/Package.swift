@@ -19,7 +19,6 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("CoreML"),
                 .linkedFramework("Accelerate")
             ]
         )

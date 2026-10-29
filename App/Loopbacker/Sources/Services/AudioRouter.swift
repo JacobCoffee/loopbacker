@@ -26,6 +26,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     private var activeOutputRoutes: [String: RouteContext] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
+    /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
+    /// publishing work (see `updatePublishedMeters`) instead of re-checking and re-pushing zeros.
+    private var wasSilentMeters = false
 
     /// Upper bound on channels a single route captures or plays (keeps the mix matrix small
     /// for very wide interfaces).
@@ -80,7 +83,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// already-processed virtual device.
         let isVoiceInput: Bool
         /// Created on `queue` the first time suppression is enabled, then kept until the route
-        /// is gone, so the audio thread never races its release. Stopped in `deinit`.
+        /// is gone, so the audio thread never races its release. Shared with the other voice
+        /// route on the same capture device (virtual mic + monitor), which runs the same mix.
         var noiseSuppressor: NoiseSuppressor?
 
         // Meter levels -- C buffers written on the RT thread, read and decayed on main.
@@ -127,7 +131,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         deinit {
-            noiseSuppressor?.stop()
             renderBuffer.deallocate()
             mixBuffer.deallocate()
             meterLevelsPtr.deallocate()
@@ -157,10 +160,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         /// Run one captured block (already in `renderBuffer`) through the route and enqueue it.
-        func processCapturedBlock(frames: UInt32) {
+        /// - Parameter sampleTime: the block's HAL input sample time, when the callback has one.
+        func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
-            noiseSuppressor?.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
+            noiseSuppressor?.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
             effectsChain?.process(mixBuffer, frames: frames, channels: outputChannels)
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
@@ -618,12 +622,17 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Must run on `queue`. Loads the model (~150 ms) the first time a route is switched on.
+    /// Must run on `queue`. The first suppressor compiles the model (~1.5 s once per app or OS
+    /// update, then cached); voice routes on the same capture device share one suppressor.
     private func applyNoiseSuppression(to ctx: RouteContext) {
         guard ctx.isVoiceInput else { return }
         let settings = noiseSuppression
         if settings.isEnabled && ctx.noiseSuppressor == nil {
-            ctx.noiseSuppressor = NoiseSuppressor.make(sampleRate: ctx.sampleRate)
+            let sibling = (Array(activeRoutes.values) + Array(activeOutputRoutes.values)).first {
+                $0 !== ctx && $0.isVoiceInput && $0.captureDeviceUID == ctx.captureDeviceUID
+                    && $0.sampleRate == ctx.sampleRate && $0.noiseSuppressor != nil
+            }
+            ctx.noiseSuppressor = sibling?.noiseSuppressor ?? NoiseSuppressor.make(sampleRate: ctx.sampleRate)
         }
         ctx.noiseSuppressor?.setMaxReduction(dB: settings.maxReductionDB)
         ctx.noiseSuppressor?.setEnabled(settings.isEnabled)
@@ -638,25 +647,39 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     }
 
     /// Runs on the main run loop (the meter timer is scheduled there).
+    ///
+    /// The decay in `drainLevels` clamps a buffer to exact `0` once it crosses the floor, so
+    /// once a tick publishes an all-silent snapshot every later tick reads the same zeros until
+    /// real audio returns. `isEverythingSilent` is a read-only pass over the raw buffers (no
+    /// allocation); when it agrees with `wasSilentMeters` this tick skips draining, building the
+    /// per-route dictionaries, and walking `NSApp.windows` entirely.
     private func updatePublishedMeters() {
+        guard !(wasSilentMeters && isEverythingSilent()) else { return }
+
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevels: [Int: Float] = [:]
+        var sawNonZero = false
 
         for (uid, ctx) in activeRoutes {
-            newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels)
+            newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
             // Output meter takes post-mix levels (max across sources).
-            for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels) {
+            for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
                 newOutputLevels[ch] = max(newOutputLevels[ch] ?? 0.0, level)
             }
         }
 
         // Output routes report the virtual device channels they capture.
         for (uid, ctx) in activeOutputRoutes {
-            newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels)
+            newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
         }
+
+        // Skip later silent ticks only once these zeros are on screen; a hidden window must still
+        // get them when it reappears, or it would keep showing the last levels it saw.
+        wasSilentMeters = false
 
         let sourceLevels = newSourceLevels
         let outputLevels = newOutputLevels
+        let routesEmpty = activeRoutes.isEmpty
         MainActor.assumeIsolated {
             // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
             // publish re-renders the cables and meters of a window nobody sees. Publish only while
@@ -666,19 +689,58 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 $0.isVisible && $0.occlusionState.contains(.visible) && $0.className != "NSStatusBarWindow"
             }
             guard showing else { return }
-            meters.publish(sources: sourceLevels, outputs: outputLevels)
+            wasSilentMeters = !sawNonZero
+
+            // Routing changes are rare (user-driven), so only pay for the `Set` and the removal
+            // scan when the route count actually moved; the common tick (nothing started or
+            // stopped) skips it.
+            if meters.sourceCount != sourceLevels.count {
+                meters.retainSources(Set(sourceLevels.keys))
+            }
+            for (key, channels) in sourceLevels {
+                meters.updateSource(key, channels: channels)
+            }
+            // Every active route shares the same virtual output device, so its channel set never
+            // changes while any route is running — only clear it on the empty transition so a
+            // stale post-mix peak doesn't linger once nothing writes it anymore.
+            if routesEmpty {
+                meters.clearOutputs()
+            } else {
+                meters.updateOutputs(outputLevels)
+            }
         }
     }
 
-    /// Snapshot 1-based channel levels and decay the RT-written meter buffer.
-    private static func drainLevels(_ levels: UnsafeMutablePointer<Float>, count: UInt32) -> [Int: Float] {
+    /// Snapshot 1-based channel levels, decay the RT-written meter buffer in place, and note
+    /// whether any channel was non-zero before decay (feeds `wasSilentMeters` for the next tick).
+    private static func drainLevels(
+        _ levels: UnsafeMutablePointer<Float>, count: UInt32, sawNonZero: inout Bool
+    ) -> [Int: Float] {
         var snapshot: [Int: Float] = [:]
         for i in 0..<Int(count) {
             let level = levels[i]
+            if level != 0 { sawNonZero = true }
             snapshot[i + 1] = level
             levels[i] = level < 0.001 / 0.85 ? 0.0 : level * 0.85
         }
         return snapshot
+    }
+
+    /// Cheap, read-only check: true only when every RT-written buffer already reads exactly `0`
+    /// (the decay in `drainLevels` clamps there, so this needs no epsilon).
+    private func isEverythingSilent() -> Bool {
+        func allZero(_ levels: UnsafeMutablePointer<Float>, count: UInt32) -> Bool {
+            for i in 0..<Int(count) where levels[i] != 0 { return false }
+            return true
+        }
+        for ctx in activeRoutes.values {
+            if !allZero(ctx.meterLevelsPtr, count: ctx.inputChannels) { return false }
+            if !allZero(ctx.outMeterLevelsPtr, count: ctx.outputChannels) { return false }
+        }
+        for ctx in activeOutputRoutes.values {
+            if !allZero(ctx.meterLevelsPtr, count: ctx.inputChannels) { return false }
+        }
+        return true
     }
 
     // MARK: - Internal routing (input -> loopbacker)
@@ -1443,8 +1505,9 @@ private func inputRenderCallback(
     let status = AudioUnitRender(inputUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
     guard status == noErr else { return status }
 
-    // Meter, mix to the playback width, run effects, meter again, and enqueue.
-    ctx.processCapturedBlock(frames: inNumberFrames)
+    // Meter, mix to the playback width, denoise, run effects, meter again, and enqueue.
+    let hasSampleTime = inTimeStamp.pointee.mFlags.contains(.sampleTimeValid)
+    ctx.processCapturedBlock(frames: inNumberFrames, sampleTime: hasSampleTime ? inTimeStamp.pointee.mSampleTime : nil)
 
     return noErr
 }
