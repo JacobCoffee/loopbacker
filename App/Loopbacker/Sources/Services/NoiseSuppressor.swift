@@ -107,16 +107,14 @@ final class NoiseSuppressor: @unchecked Sendable {
     private let fifo: UnsafeMutablePointer<Float>
     private let cachedBlock: UnsafeMutablePointer<Float>
 
-    /// Loads (compiling on first use) the bundled model, or returns nil (and logs why) when the
-    /// route can't be suppressed. Blocks for the compile (~1.5 s) the first time after an app
-    /// or OS update; later launches map the cached compiled graph.
-    static func make(sampleRate: Float64) -> NoiseSuppressor? {
+    /// A suppressor for a route at `sampleRate`, or nil (logged) when it can't be suppressed.
+    /// Cheap once `model` is loaded: one context, buffers, and a warm-up hop.
+    static func make(sampleRate: Float64, model: NoiseSuppressionModel) -> NoiseSuppressor? {
         guard sampleRate == Self.sampleRate else {
             nsLogger.error("Noise suppression needs 48 kHz; route runs at \(sampleRate) Hz")
             return nil
         }
-        guard let graph = CompiledGraph.shared() else { return nil }
-        return NoiseSuppressor(graph: graph)
+        return NoiseSuppressor(graph: model.graph)
     }
 
     private init?(graph: CompiledGraph) {
@@ -393,10 +391,76 @@ final class NoiseSuppressor: @unchecked Sendable {
     }
 }
 
-/// The bundled model compiled for BNNS Graph, shared by every suppressor (each has its own
-/// context). Compiling takes ~1.5 s, so the result is cached in Caches, keyed by the model's
-/// contents and the OS build. The graph lives in wired memory for the life of the process:
-/// a file mapping could be evicted and then page-fault from disk on the IO thread.
+/// The DPDFNet model compiled for BNNS Graph. One instance serves every suppressor made from it
+/// (each gets its own context).
+final class NoiseSuppressionModel: Sendable {
+    fileprivate let graph: CompiledGraph
+
+    private init(graph: CompiledGraph) {
+        self.graph = graph
+    }
+
+    /// Loads the compiled model at `url` (an `.mlmodelc`). Slow: ~1.5 s to compile the first
+    /// time per model and OS build, ~30 ms from the cache after that. Never call it on the
+    /// audio thread or the routing queue.
+    static func load(from url: URL) -> NoiseSuppressionModel? {
+        CompiledGraph.load(model: url).map(NoiseSuppressionModel.init)
+    }
+
+    private enum BundledState {
+        case idle
+        case loading([@Sendable (Bool) -> Void])
+        case done(NoiseSuppressionModel?)
+    }
+
+    private static let bundledState = Mutex<BundledState>(.idle)
+
+    /// The model shipped in the app bundle, or nil until `loadBundled` has finished.
+    static var bundled: NoiseSuppressionModel? {
+        bundledState.withLock { state in
+            if case .done(let model) = state { return model }
+            return nil
+        }
+    }
+
+    /// Loads the bundled model on a background queue (once; later calls join or reuse it) and
+    /// then calls `done` with whether it loaded.
+    static func loadBundled(then done: @escaping @Sendable (Bool) -> Void) {
+        let start: Bool = bundledState.withLock { state in
+            switch state {
+            case .idle:
+                state = .loading([done])
+                return true
+            case .loading(let waiting):
+                state = .loading(waiting + [done])
+                return false
+            case .done(let model):
+                let loaded = model != nil
+                DispatchQueue.global(qos: .userInitiated).async { done(loaded) }
+                return false
+            }
+        }
+        guard start else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var model: NoiseSuppressionModel?
+            if let url = Bundle.main.url(forResource: "DPDFNet2_48k", withExtension: "mlmodelc") {
+                model = load(from: url)
+            } else {
+                nsLogger.error("DPDFNet2_48k.mlmodelc missing from the app bundle")
+            }
+            let waiting: [@Sendable (Bool) -> Void] = bundledState.withLock { state in
+                defer { state = .done(model) }
+                if case .loading(let waiting) = state { return waiting }
+                return []
+            }
+            for callback in waiting { callback(model != nil) }
+        }
+    }
+}
+
+/// A model compiled for BNNS Graph. Compiling takes ~1.5 s, so the result is cached in Caches,
+/// keyed by the model's contents and the OS build. The graph lives in wired memory for the life
+/// of the process: a file mapping could be evicted and then page-fault from disk on the IO thread.
 private struct CompiledGraph: @unchecked Sendable {
     let graph: bnns_graph_t
     let stateSize: Int
@@ -408,21 +472,7 @@ private struct CompiledGraph: @unchecked Sendable {
     let specOutPosition: Int
     let stateOutPosition: Int
 
-    private static let loaded = Mutex<CompiledGraph?>(nil)
-
-    static func shared() -> CompiledGraph? {
-        loaded.withLock { cached in
-            if let cached { return cached }
-            cached = load()
-            return cached
-        }
-    }
-
-    private static func load() -> CompiledGraph? {
-        guard let model = Bundle.main.url(forResource: "DPDFNet2_48k", withExtension: "mlmodelc") else {
-            nsLogger.error("DPDFNet2_48k.mlmodelc missing from the app bundle")
-            return nil
-        }
+    static func load(model: URL) -> CompiledGraph? {
         guard let data = try? Data(contentsOf: model.appending(path: "metadata.json")),
               let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let meta = json.first?["userDefinedMetadata"] as? [String: String],

@@ -21,6 +21,11 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("Accelerate")
             ]
+        ),
+        .testTarget(
+            name: "LoopbackerTests",
+            dependencies: ["Loopbacker"],
+            path: "Tests/LoopbackerTests"
         )
     ]
 )

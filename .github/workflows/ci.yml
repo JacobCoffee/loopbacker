@@ -32,3 +32,8 @@ jobs:
         run: |
           cd App/Loopbacker
           swift build -c release
+
+      - name: Test Swift app
+        run: |
+          cd App/Loopbacker
+          swift test

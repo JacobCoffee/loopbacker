@@ -617,13 +617,19 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.noiseSuppression = settings
-            for ctx in self.activeRoutes.values { self.applyNoiseSuppression(to: ctx) }
-            for ctx in self.activeOutputRoutes.values { self.applyNoiseSuppression(to: ctx) }
+            self.applyNoiseSuppressionToAllRoutes()
         }
     }
 
-    /// Must run on `queue`. The first suppressor compiles the model (~1.5 s once per app or OS
-    /// update, then cached); voice routes on the same capture device share one suppressor.
+    /// Must run on `queue`.
+    private func applyNoiseSuppressionToAllRoutes() {
+        for ctx in activeRoutes.values { applyNoiseSuppression(to: ctx) }
+        for ctx in activeOutputRoutes.values { applyNoiseSuppression(to: ctx) }
+    }
+
+    /// Must run on `queue`. Voice routes on the same capture device share one suppressor. The
+    /// model loads in the background the first time (~1.5 s compile after an app or OS update,
+    /// ~30 ms from cache), so routes start right away and suppression fades in once it's ready.
     private func applyNoiseSuppression(to ctx: RouteContext) {
         guard ctx.isVoiceInput else { return }
         let settings = noiseSuppression
@@ -632,7 +638,16 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 $0 !== ctx && $0.isVoiceInput && $0.captureDeviceUID == ctx.captureDeviceUID
                     && $0.sampleRate == ctx.sampleRate && $0.noiseSuppressor != nil
             }
-            ctx.noiseSuppressor = sibling?.noiseSuppressor ?? NoiseSuppressor.make(sampleRate: ctx.sampleRate)
+            if let shared = sibling?.noiseSuppressor {
+                ctx.noiseSuppressor = shared
+            } else if let model = NoiseSuppressionModel.bundled {
+                ctx.noiseSuppressor = NoiseSuppressor.make(sampleRate: ctx.sampleRate, model: model)
+            } else {
+                NoiseSuppressionModel.loadBundled { [weak self] loaded in
+                    guard loaded, let self else { return }
+                    self.queue.async { self.applyNoiseSuppressionToAllRoutes() }
+                }
+            }
         }
         ctx.noiseSuppressor?.setMaxReduction(dB: settings.maxReductionDB)
         ctx.noiseSuppressor?.setEnabled(settings.isEnabled)
