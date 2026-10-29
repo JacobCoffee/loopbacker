@@ -658,6 +658,14 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let sourceLevels = newSourceLevels
         let outputLevels = newOutputLevels
         MainActor.assumeIsolated {
+            // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
+            // publish re-renders the cables and meters of a window nobody sees. Publish only while
+            // a window that shows meters (main window, menu bar panel) is on screen. The menu bar
+            // icon's own window always reports visible, so it doesn't count.
+            let showing = NSApp.windows.contains {
+                $0.isVisible && $0.occlusionState.contains(.visible) && $0.className != "NSStatusBarWindow"
+            }
+            guard showing else { return }
             meters.publish(sources: sourceLevels, outputs: outputLevels)
         }
     }

@@ -122,24 +122,25 @@ struct SignalMeter: View {
         ])
     }
 
+    // A Canvas redraws without touching layout. The previous mask-and-frame meter re-laid out the
+    // window on every level change, and its 80 ms level animation kept that going at the display
+    // rate. Meter ballistics (decay) already happen in the router.
     var body: some View {
-        GeometryReader { geo in
-            let horizontal = axis == .horizontal
-            let length = horizontal ? geo.size.width : geo.size.height
+        let horizontal = axis == .horizontal
+        Canvas { context, size in
+            context.fill(Capsule().path(in: CGRect(origin: .zero, size: size)), with: .style(.quaternary))
+            let length = horizontal ? size.width : size.height
             let filled = max(clamped * length, clamped > 0 ? thickness : 0)
-            ZStack(alignment: horizontal ? .leading : .bottom) {
-                Capsule().fill(.quaternary)
-                Capsule()
-                    .fill(LinearGradient(gradient: gradient,
-                                         startPoint: horizontal ? .leading : .bottom,
-                                         endPoint: horizontal ? .trailing : .top))
-                    .mask(alignment: horizontal ? .leading : .bottom) {
-                        Capsule().frame(width: horizontal ? filled : nil, height: horizontal ? nil : filled)
-                    }
-            }
+            guard filled > 0 else { return }
+            let fill = horizontal
+                ? CGRect(x: 0, y: 0, width: filled, height: size.height)
+                : CGRect(x: 0, y: size.height - filled, width: size.width, height: filled)
+            context.fill(Capsule().path(in: fill),
+                         with: .linearGradient(gradient,
+                                               startPoint: horizontal ? .zero : CGPoint(x: 0, y: size.height),
+                                               endPoint: horizontal ? CGPoint(x: size.width, y: 0) : .zero))
         }
-        .frame(width: axis == .vertical ? thickness : nil, height: axis == .horizontal ? thickness : nil)
-        .animation(.linear(duration: 0.08), value: level)
+        .frame(width: horizontal ? nil : thickness, height: horizontal ? thickness : nil)
         .accessibilityElement()
         .accessibilityLabel("Level")
         .accessibilityValue(Self.dbString(level))
@@ -205,7 +206,6 @@ struct LiveDot: View {
     var isLive: Bool = false
     var size: CGFloat = 8
 
-    @State private var breathe = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -214,21 +214,126 @@ struct LiveDot: View {
             .frame(width: size, height: size)
             .background {
                 if isLive {
-                    Circle()
-                        .fill(color.opacity(0.35))
-                        .scaleEffect(breathe && !reduceMotion ? 2.2 : 1.4)
-                        .opacity(breathe && !reduceMotion ? 0 : 1)
+                    if reduceMotion {
+                        Circle().fill(color.opacity(0.35)).scaleEffect(1.4)
+                    } else {
+                        LoopingDot(color: color.opacity(0.35), diameter: size, loop: .breathe)
+                    }
                 }
             }
-            .onAppear { startBreathing() }
-            .onChange(of: isLive) { _, _ in startBreathing() }
             .accessibilityHidden(true)
     }
+}
 
-    private func startBreathing() {
-        breathe = false
-        guard isLive, !reduceMotion else { return }
-        withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { breathe = true }
+// MARK: - Looping dot
+
+/// A dot looped by Core Animation. A repeating SwiftUI animation re-runs the view graph and the
+/// window's layout every display frame; a CAAnimation runs in the render server and leaves the
+/// main thread idle, on screen or not.
+struct LoopingDot: NSViewRepresentable {
+    enum Loop {
+        /// Centered; grows from 1.4× to 2.2× while fading out, every 1.6 s.
+        case breathe
+        /// Falls from the top edge to the bottom edge while fading out, every 0.6 s.
+        case fall
+    }
+
+    var color: Color
+    var diameter: CGFloat
+    var loop: Loop
+
+    func makeNSView(context: Context) -> LoopingDotView { LoopingDotView(loop: loop) }
+
+    func updateNSView(_ view: LoopingDotView, context: Context) {
+        view.color = color
+        view.diameter = diameter
+    }
+}
+
+final class LoopingDotView: NSView {
+    private let dot = CALayer()
+    private let loop: LoopingDot.Loop
+    private var animatedSize: CGSize?
+
+    var color: Color = .clear {
+        didSet { if color != oldValue { applyColor() } }
+    }
+    var diameter: CGFloat = 4 {
+        didSet { if diameter != oldValue { needsLayout = true } }
+    }
+
+    init(loop: LoopingDot.Loop) {
+        self.loop = loop
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.addSublayer(dot)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dot.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
+        dot.cornerRadius = diameter / 2
+        dot.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+        // The fall's endpoints depend on the bounds; restarting on every layout would reset the phase.
+        if bounds.size != animatedSize { restart() }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        restart()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColor()
+    }
+
+    private func applyColor() {
+        var resolved: CGColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance { resolved = NSColor(color).cgColor }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dot.backgroundColor = resolved
+        CATransaction.commit()
+    }
+
+    private func restart() {
+        dot.removeAllAnimations()
+        animatedSize = nil
+        guard window != nil else { return }
+        animatedSize = bounds.size
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1.0
+        fade.toValue = 0.0
+        let move: CABasicAnimation
+        let group = CAAnimationGroup()
+        switch loop {
+        case .breathe:
+            move = CABasicAnimation(keyPath: "transform.scale")
+            move.fromValue = 1.4
+            move.toValue = 2.2
+            group.duration = 1.6
+            group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        case .fall:
+            // Unflipped layer coordinates: maxY is the top edge.
+            move = CABasicAnimation(keyPath: "position.y")
+            move.fromValue = bounds.maxY
+            move.toValue = bounds.minY
+            group.duration = 0.6
+            group.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        }
+        group.animations = [move, fade]
+        group.repeatCount = .infinity
+        dot.add(group, forKey: "loop")
     }
 }
 

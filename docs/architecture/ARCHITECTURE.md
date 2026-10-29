@@ -477,7 +477,28 @@ and when switching off, the callback crossfades to the dry signal over 10 ms. Th
 runs at 48 kHz; a monitor route on a device at another rate logs and stays dry.
 
 `scripts/convert-dpdfnet.py` rebuilds `App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc` from
-pinned upstream code and weights and checks Core ML against PyTorch over 300 stateful frames.
+pinned upstream code and weights. It replaces the DPRNN blocks' bidirectional `nn.GRU`s with
+an unrolled equivalent: Core ML's `gru` op applies the reset gate differently from PyTorch, so
+coremltools lowers `nn.GRU` to `WhileLoop`s that Core ML interprets step by step, which was
+three quarters of inference time. Unrolled, a hop takes ~0.7 ms of CPU instead of ~1.3 ms on an
+M4 Max (hot cache). The script then checks Core ML against the unmodified upstream PyTorch model
+over ~500 stateful frames (~127 dB SNR). fp16 compute and the Neural Engine were tried: fp16
+breaks the output (~9 dB SNR), and the Neural Engine gives nothing for an fp32 model.
+
+## UI Cost
+
+SwiftUI work on the main thread is kept off the per-display-frame path:
+
+- **Meters** (`SignalMeter`) draw with a `Canvas`, so a level change redraws the meter without
+  invalidating layout, and they don't animate between levels (the router's 30 Hz decay is the
+  ballistics). The previous mask-and-frame meter re-laid out the window on each change, and its
+  80 ms level animation kept that running at the display rate.
+- **Looping animations** (`LiveDot`'s halo, `SignalLineConnector`'s travelling dot) are
+  `CAAnimation`s on a `LoopingDot` layer. A repeating SwiftUI animation re-runs the view graph
+  and window layout every display frame; Core Animation runs it in the render server.
+- **Hidden windows**: closing the main window only hides it, and SwiftUI keeps its view graph
+  alive. The meter timer publishes only while a window that shows meters is on screen (the menu
+  bar icon's own window always reports visible and is ignored).
 
 ## Risks and Mitigations
 

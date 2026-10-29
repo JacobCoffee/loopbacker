@@ -89,7 +89,6 @@ struct ChainTerminalTile: View {
 struct SignalLineConnector: View {
     var active: Bool
 
-    @State private var travel = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let length: CGFloat = 12
@@ -102,28 +101,13 @@ struct SignalLineConnector: View {
                 .shadow(color: active ? Color.loopbacker.opacity(0.6) : .clear, radius: 3)
 
             if active && !reduceMotion {
-                Circle()
-                    .fill(Color.loopbacker)
-                    .frame(width: 4, height: 4)
-                    .offset(y: travel ? length - 2 : -2)
-                    .opacity(travel ? 0 : 1)
+                LoopingDot(color: .loopbacker, diameter: 4, loop: .fall)
             }
         }
         .frame(width: 22, height: length)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, 12)
-        .onAppear { startTravel() }
-        .onChange(of: active) { _, _ in startTravel() }
-        .onChange(of: reduceMotion) { _, _ in startTravel() }
         .accessibilityHidden(true)
-    }
-
-    private func startTravel() {
-        travel = false
-        guard active, !reduceMotion else { return }
-        withAnimation(.easeIn(duration: 0.6).repeatForever(autoreverses: false)) {
-            travel = true
-        }
     }
 }
 
