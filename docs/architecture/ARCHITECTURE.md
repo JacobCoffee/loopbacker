@@ -475,8 +475,10 @@ the model's 4-hop lookahead) back in at the user's max-reduction level. The work
 every buffer the callback touches live in one `mlock`ed mapping; the compiled graph is read
 into wired memory too, since a file mapping could page-fault from disk mid-callback.
 
-Compiling the model takes ~1.5 s, so the compiled graph is cached in
-`~/Library/Caches/<bundle id>/`, keyed by a hash of the model and the OS build.
+Compiling the model takes ~1.5 s, so the compiled graph (`NoiseSuppressionModel`) is cached in
+`~/Library/Caches/<bundle id>/`, keyed by a hash of the model and the OS build; loading from
+the cache takes ~30 ms. Either way it loads on a background queue: routes start immediately,
+and the router attaches suppressors when the model is ready, which then fade in as usual.
 
 The virtual mic route and the monitor route of the same mic share one suppressor. They mix
 identically, and the HAL calls both input callbacks back to back on the device's IO thread
@@ -512,8 +514,13 @@ SwiftUI work on the main thread is kept off the per-display-frame path:
   on the Routing page with every meter moving. `SignalMeter(level:)` uses the same layers for
   value-driven meters (Soundboard). There is no animation between levels; the router's 30 Hz
   decay is the ballistics.
-- **Cables** (`CableView`) quantize each source's glow to 16 steps and redraw their `Canvas`
-  (blurred glow over the whole routing area) only when a step changes.
+- **Cables** (`CableView`) are Core Animation layers, same as the meters: SwiftUI supplies
+  structure (routes, which sources are enabled/muted, connector positions) and only reshapes
+  layers when it changes, while each live source's glow is driven separately by observing
+  `MeterLevels` inside the `NSView`, quantized to 16 steps. The glow is a wide low-opacity stroke
+  layer plus a native `shadowRadius`/`shadowOpacity` for softness, not a Gaussian blur filter,
+  which previously forced the whole routing canvas to be re-rasterized on the main thread on
+  every step change (~6% of a core with all meters moving).
 - **Looping animations** (`LiveDot`'s halo, `SignalLineConnector`'s travelling dot) are
   `CAAnimation`s on a `LoopingDot` layer. A repeating SwiftUI animation re-runs the view graph
   and window layout every display frame; Core Animation runs it in the render server.
