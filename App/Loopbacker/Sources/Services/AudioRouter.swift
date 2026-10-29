@@ -8,6 +8,16 @@ import os.log
 
 private let logger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "AudioRouter")
 
+/// Async load state for one model-backed noise suppression engine (DPDFNet, FastEnhancer): a
+/// weak hold on the compiled model while any kernel uses it, plus flags so a route doesn't
+/// retrigger the load while one's in flight or retry one that failed. Touched only on
+/// `AudioRouter.queue`.
+private final class NoiseModelLoadState<Model: AnyObject & Sendable>: @unchecked Sendable {
+    weak var model: Model?
+    var isLoading = false
+    var loadFailed = false
+}
+
 /// Routes audio from real input devices to the Loopbacker virtual output device,
 /// providing real-time meter levels back to the UI.
 class AudioRouter: ObservableObject, @unchecked Sendable {
@@ -21,11 +31,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Noise suppression settings and opted-out capture devices; read and written only on `queue`.
     private var noiseSuppression = NoiseSuppressionSettings()
     private var noiseExcludedDevices: Set<String> = []
-    /// The DPDFNet model while any kernel uses it. Kernels hold it strongly, so it's freed with
-    /// the last one (engine switched, suppression off, opted out, or route stopped). Queue only.
-    private weak var dpdfnetModel: NoiseSuppressionModel?
-    private var dpdfnetLoading = false
-    private var dpdfnetLoadFailed = false
+    /// A model-backed engine's compiled model while any kernel uses it. Kernels hold it
+    /// strongly, so it's freed once the last one is gone (engine switched, suppression off,
+    /// opted out, or route stopped). Queue only.
+    private let dpdfnetState = NoiseModelLoadState<NoiseSuppressionModel>()
+    private let fastEnhancerState = NoiseModelLoadState<FastEnhancerModel>()
 
     // MARK: - Internal state
 
@@ -665,8 +675,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     /// Must run on `queue`. Gives `ctx` a suppressor running the selected engine, or takes it
     /// away. Voice routes on the same capture device share one suppressor. Suppressors nobody
-    /// wants (off, opted out, or the other engine) fade out and are freed, and with them the
-    /// DPDFNet model once nothing uses it.
+    /// wants (off, opted out, or the other engine) fade out and are freed, and with them a
+    /// model-backed engine's model once nothing uses it.
     private func applyNoiseSuppression(to ctx: RouteContext) {
         guard ctx.isVoiceInput, !ctx.noiseDetaching else { return }
         let settings = noiseSuppression
@@ -719,32 +729,49 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Must run on `queue`. Nil while the DPDFNet model is still loading: the load runs in the
-    /// background (~1.5 s compile after an app or OS update, ~30 ms from cache) and re-applies
-    /// the settings when done, so routes start right away and suppression fades in later.
+    /// Must run on `queue`. Nil while a model-backed engine's model is still loading: the load
+    /// runs in the background (~1.5 s compile after an app or OS update, ~30 ms from cache) and
+    /// re-applies the settings when done, so routes start right away and suppression fades in
+    /// later. RNNoise needs no model, so it never returns nil once the frame size matches.
     private func makeNoiseKernel(_ engine: NoiseSuppressionEngine) -> (any DenoiseKernel)? {
         switch engine {
         case .rnnoise:
             return RNNoiseKernel.make()
         case .dpdfnet:
-            if let model = dpdfnetModel { return DPDFNetKernel(model: model) }
-            guard !dpdfnetLoading, !dpdfnetLoadFailed else { return nil }
-            dpdfnetLoading = true
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let model = NoiseSuppressionModel.loadBundled()
-                guard let self else { return }
-                self.queue.async {
-                    self.dpdfnetLoading = false
-                    guard let model else {
-                        self.dpdfnetLoadFailed = true
-                        return
-                    }
-                    self.dpdfnetModel = model
-                    self.applyNoiseSuppressionToAllRoutes()
-                }
-            }
-            return nil
+            return modelBackedKernel(state: dpdfnetState,
+                                      makeKernel: { DPDFNetKernel(model: $0) },
+                                      load: { NoiseSuppressionModel.loadBundled() })
+        case .fastenhancer:
+            return modelBackedKernel(state: fastEnhancerState,
+                                      makeKernel: { FastEnhancerKernel(model: $0) },
+                                      load: { FastEnhancerModel.loadBundled() })
         }
+    }
+
+    /// Must run on `queue`. Returns a kernel from `state`'s model if it's already loaded;
+    /// otherwise kicks off a background load (once) and returns nil until it lands.
+    private func modelBackedKernel<Model: AnyObject & Sendable>(
+        state: NoiseModelLoadState<Model>,
+        makeKernel: (Model) -> (any DenoiseKernel)?,
+        load: @escaping @Sendable () -> Model?
+    ) -> (any DenoiseKernel)? {
+        if let model = state.model { return makeKernel(model) }
+        guard !state.isLoading, !state.loadFailed else { return nil }
+        state.isLoading = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let model = load()
+            guard let self else { return }
+            self.queue.async {
+                state.isLoading = false
+                guard let model else {
+                    state.loadFailed = true
+                    return
+                }
+                state.model = model
+                self.applyNoiseSuppressionToAllRoutes()
+            }
+        }
+        return nil
     }
 
     // MARK: - Meter timer

@@ -93,6 +93,7 @@ struct GlobalToolbar: ToolbarContent {
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var driverInstaller: DriverInstaller
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
+    @ObservedObject private var loginItem = LoginItem.shared
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
@@ -115,6 +116,14 @@ struct GlobalToolbar: ToolbarContent {
                 Button("Play Test Tone", systemImage: "tuningfork") { actions.playTestTone() }
                 Button("Copy Debug Snapshot", systemImage: "doc.on.clipboard") { actions.copyDebugSnapshot() }
                 Divider()
+                Toggle("Open at Login", systemImage: "power.circle", isOn: Binding(
+                    get: { loginItem.isEnabled },
+                    set: { loginItem.setEnabled($0) }
+                ))
+                if loginItem.needsApproval {
+                    Button("Allow Open at Login in System Settings…", systemImage: "gear") { loginItem.openSystemSettings() }
+                }
+                Divider()
                 Picker("Appearance", systemImage: appearance.symbol, selection: $appearance) {
                     ForEach(AppearanceMode.allCases) { mode in
                         Label(mode.title, systemImage: mode.symbol).tag(mode)
@@ -130,7 +139,7 @@ struct GlobalToolbar: ToolbarContent {
             } label: {
                 Label("More", systemImage: "ellipsis")
             }
-            .help("Devices, test tone, appearance, driver")
+            .help("Devices, test tone, open at login, appearance, driver")
         }
     }
 }

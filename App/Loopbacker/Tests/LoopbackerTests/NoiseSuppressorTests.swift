@@ -2,8 +2,8 @@ import Foundation
 import Testing
 @testable import Loopbacker
 
-/// The model shipped in `Resources`, loaded once (compiling it takes ~1.5 s the first time per
-/// OS build; later runs read the cached graph).
+/// The models shipped in `Resources`, loaded once (compiling takes ~1.5 s the first time per OS
+/// build; later runs read the cached graph).
 private let model: NoiseSuppressionModel = {
     let url = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -14,15 +14,27 @@ private let model: NoiseSuppressionModel = {
     return model
 }()
 
+private let fastEnhancerModel: FastEnhancerModel = {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appending(path: "Resources/FastEnhancer_S_48k.mlmodelc")
+    guard let model = FastEnhancerModel.load(from: url) else {
+        fatalError("could not load \(url.path)")
+    }
+    return model
+}()
+
 private let block = 512
 private let rate: Float = 48_000
 
 /// Input sample → output sample delay: the kernel's delay plus up to a hop waiting for a hop to
 /// fill. DPDFNet: 40 ms of model lookahead plus a hop for the second half of the analysis
-/// window. RNNoise: two hops of analysis and overlap-add.
+/// window. FastEnhancer: one hop of STFT analysis/synthesis framing, no model lookahead.
+/// RNNoise: two hops of analysis and overlap-add.
 private func delay(_ engine: NoiseSuppressionEngine) -> Int {
     switch engine {
     case .dpdfnet: 2879
+    case .fastenhancer: 1023
     case .rnnoise: 1439
     }
 }
@@ -30,6 +42,7 @@ private func delay(_ engine: NoiseSuppressionEngine) -> Int {
 private func makeSuppressor(_ engine: NoiseSuppressionEngine) throws -> NoiseSuppressor {
     let kernel: (any DenoiseKernel)? = switch engine {
     case .dpdfnet: DPDFNetKernel(model: model)
+    case .fastenhancer: FastEnhancerKernel(model: fastEnhancerModel)
     case .rnnoise: RNNoiseKernel.make()
     }
     let unwrapped = try #require(kernel)

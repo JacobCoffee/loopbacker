@@ -1,9 +1,9 @@
 import Accelerate
-import CryptoKit
 import Foundation
 
 /// CEVA's DPDFNet2 48 kHz model (Apache-2.0), bundled as `DPDFNet2_48k.mlmodelc` and
-/// reproducible with `scripts/convert-dpdfnet.py`.
+/// reproducible with `scripts/convert-dpdfnet.py`. Loads through the shared BNNS Graph loader
+/// in `CompiledGraph.swift` (also used by `FastEnhancerKernel`).
 ///
 /// The model runs through BNNS Graph, which executes a compiled graph with caller-provided
 /// workspace and buffers: no allocation, no locks, no thread hops. So it runs inline on the
@@ -132,10 +132,10 @@ final class DPDFNetKernel: DenoiseKernel, @unchecked Sendable {
         imagOut = floats(n)
         overlap = floats(n)
 
-        arguments[graph.specPosition].data_ptr = UnsafeMutableRawPointer(specIn)
-        arguments[graph.specPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
-        arguments[graph.specOutPosition].data_ptr = UnsafeMutableRawPointer(specOut)
-        arguments[graph.specOutPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
+        arguments[graph.inputPosition].data_ptr = UnsafeMutableRawPointer(specIn)
+        arguments[graph.inputPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
+        arguments[graph.outputPosition].data_ptr = UnsafeMutableRawPointer(specOut)
+        arguments[graph.outputPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
         arguments[graph.stateInPosition].data_ptr_size = graph.stateSize * MemoryLayout<Float>.size
         arguments[graph.stateOutPosition].data_ptr_size = graph.stateSize * MemoryLayout<Float>.size
 
@@ -240,7 +240,9 @@ final class NoiseSuppressionModel: Sendable {
     /// time per model and OS build, ~30 ms from the cache after that. Never call it on the
     /// audio thread or the routing queue.
     static func load(from url: URL) -> NoiseSuppressionModel? {
-        CompiledGraph.load(model: url).map(NoiseSuppressionModel.init)
+        CompiledGraph.load(model: url, cacheName: "DPDFNet2_48k", inputArgument: "spec",
+                            stateInArgument: "state_in", outputArgument: "spec_e",
+                            stateOutArgument: "state_out").map(NoiseSuppressionModel.init)
     }
 
     /// The model shipped in the app bundle. Same cost as `load(from:)`.
@@ -250,144 +252,5 @@ final class NoiseSuppressionModel: Sendable {
             return nil
         }
         return load(from: url)
-    }
-}
-
-/// A model compiled for BNNS Graph. Compiling takes ~1.5 s, so the result is cached in Caches,
-/// keyed by the model's contents and the OS build. The graph lives in wired memory until
-/// `release`: a file mapping could be evicted and then page-fault from disk on the IO thread.
-private struct CompiledGraph: @unchecked Sendable {
-    let graph: bnns_graph_t
-    /// True when `graph.data` is our own mapping (read from the cache); false when BNNS
-    /// allocated it while compiling, which must be `free`d.
-    let isMapped: Bool
-    let stateSize: Int
-    /// Initial recurrent state: the model's norm-state prefix, then zeros.
-    let stateInit: [Float]
-    let argumentCount: Int
-    let specPosition: Int
-    let stateInPosition: Int
-    let specOutPosition: Int
-    let stateOutPosition: Int
-
-    static func load(model: URL) -> CompiledGraph? {
-        guard let data = try? Data(contentsOf: model.appending(path: "metadata.json")),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              let meta = json.first?["userDefinedMetadata"] as? [String: String],
-              let stateSize = meta["state_size"].flatMap(Int.init),
-              let prefix = meta["state_init"]?.split(separator: ",").compactMap({ Float($0) }),
-              prefix.count <= stateSize else {
-            nsLogger.error("Noise suppression model metadata lacks state_size/state_init")
-            return nil
-        }
-        let stateInit = prefix + [Float](repeating: 0, count: stateSize - prefix.count)
-
-        let cacheFile = cacheURL(for: model)
-        if let cacheFile, let graph = readWired(cacheFile) {
-            if let compiled = CompiledGraph(graph: graph, isMapped: true, stateSize: stateSize, stateInit: stateInit) {
-                return compiled
-            }
-            munmap(graph.data, graph.size)
-            try? FileManager.default.removeItem(at: cacheFile)
-        }
-
-        let start = Date()
-        let options = BNNSGraphCompileOptionsMakeDefault()
-        defer { BNNSGraphCompileOptionsDestroy(options) }
-        // It runs inside the IO callback: no worker threads.
-        BNNSGraphCompileOptionsSetTargetSingleThread(options, true)
-        let graph = model.withUnsafeFileSystemRepresentation { BNNSGraphCompileFromFile($0!, nil, options) }
-        guard let data = graph.data else {
-            nsLogger.error("BNNSGraphCompileFromFile failed for the noise suppression model")
-            return nil
-        }
-        nsLogger.info("Compiled noise suppression graph in \(Int(Date().timeIntervalSince(start) * 1000)) ms")
-        mlock(data, graph.size)
-        if let cacheFile {
-            // .atomic writes a temporary file and renames it, so a crash never leaves a torn graph.
-            try? Data(bytesNoCopy: data, count: graph.size, deallocator: .none).write(to: cacheFile, options: .atomic)
-        }
-        guard let compiled = CompiledGraph(graph: graph, isMapped: false, stateSize: stateSize, stateInit: stateInit) else {
-            munlock(data, graph.size)
-            free(data)
-            return nil
-        }
-        return compiled
-    }
-
-    private init?(graph: bnns_graph_t, isMapped: Bool, stateSize: Int, stateInit: [Float]) {
-        func position(_ name: String) -> Int? {
-            let p = BNNSGraphGetArgumentPosition(graph, nil, name)
-            return p >= 0 ? p : nil
-        }
-        guard let spec = position("spec"), let stateIn = position("state_in"),
-              let specOut = position("spec_e"), let stateOut = position("state_out") else {
-            nsLogger.error("Noise suppression graph lacks the expected arguments")
-            return nil
-        }
-        self.graph = graph
-        self.isMapped = isMapped
-        self.stateSize = stateSize
-        self.stateInit = stateInit
-        argumentCount = BNNSGraphGetInputCount(graph, nil) + BNNSGraphGetOutputCount(graph, nil)
-        specPosition = spec
-        stateInPosition = stateIn
-        specOutPosition = specOut
-        stateOutPosition = stateOut
-    }
-
-    /// Frees the graph memory. Only once nothing can execute it.
-    func release() {
-        if isMapped {
-            munmap(graph.data, graph.size)
-        } else {
-            munlock(graph.data, graph.size)
-            free(graph.data)
-        }
-    }
-
-    /// `Caches/<bundle id>/DPDFNet2_48k-<model hash>-<OS build>.bnnsgraph`; older entries are removed.
-    private static func cacheURL(for model: URL) -> URL? {
-        var hasher = SHA256()
-        for file in ["model.mil", "weights/weight.bin", "metadata.json"] {
-            guard let data = try? Data(contentsOf: model.appending(path: file), options: .mappedIfSafe) else { return nil }
-            hasher.update(data: data)
-        }
-        let modelHash = hasher.finalize().prefix(8).map { String(format: "%02x", $0) }.joined()
-        let os = ProcessInfo.processInfo.operatingSystemVersionString.filter { $0.isLetter || $0.isNumber || $0 == "." }
-        let name = "DPDFNet2_48k-\(modelHash)-\(os).bnnsgraph"
-
-        let fm = FileManager.default
-        guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
-        let dir = caches.appending(path: Bundle.main.bundleIdentifier ?? "com.jacobcoffee.loopbacker")
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        for stale in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        where stale.hasPrefix("DPDFNet2_48k-") && stale != name {
-            try? fm.removeItem(at: dir.appending(path: stale))
-        }
-        return dir.appending(path: name)
-    }
-
-    /// Reads a cached compiled graph into wired anonymous memory.
-    private static func readWired(_ url: URL) -> bnns_graph_t? {
-        let fd = url.withUnsafeFileSystemRepresentation { open($0!, O_RDONLY) }
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_size > 0 else { return nil }
-        let size = Int(info.st_size)
-        guard let data = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
-              data != MAP_FAILED else { return nil }
-        var done = 0
-        while done < size {
-            let n = read(fd, data + done, size - done)
-            guard n > 0 else {
-                munmap(data, size)
-                return nil
-            }
-            done += n
-        }
-        mlock(data, size)
-        return bnns_graph_t(data: data, size: size)
     }
 }

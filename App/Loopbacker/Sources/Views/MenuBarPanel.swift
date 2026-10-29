@@ -10,6 +10,7 @@ struct MenuBarPanel: View {
     @EnvironmentObject var appCaptureService: AppCaptureService
 
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var loginItem = LoginItem.shared
 
     private var engineStatus: EngineStatus {
         EngineStatus(driverInstaller: driverInstaller, audioDeviceManager: audioDeviceManager, routingState: routingState)
@@ -32,6 +33,7 @@ struct MenuBarPanel: View {
         }
         .padding(Metrics.panelPadding)
         .frame(width: 300)
+        .onAppear { loginItem.refresh() }
     }
 
     // MARK: - Header
@@ -206,17 +208,39 @@ struct MenuBarPanel: View {
     // MARK: - Footer
 
     private var footer: some View {
-        HStack {
-            Text("\(routingState.outputDestinations.count) output route\(routingState.outputDestinations.count == 1 ? "" : "s")")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("Quit", role: .destructive) {
-                AppDelegate.forceQuit()
-            }
-            .buttonStyle(.borderless)
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Open at Login", isOn: Binding(
+                get: { loginItem.isEnabled },
+                set: { loginItem.setEnabled($0) }
+            ))
+            .toggleStyle(.checkbox)
             .font(.callout)
-            .help("Quit Loopbacker and stop all routing")
+            .help("Start Loopbacker in the menu bar when you log in, so routing is live without opening it")
+
+            if loginItem.needsApproval {
+                Button("Allow in Login Items…") { loginItem.openSystemSettings() }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .help("macOS needs your OK in System Settings › General › Login Items")
+            } else if let error = loginItem.error {
+                Text("Couldn't change Open at Login: \(error)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("\(routingState.outputDestinations.count) output route\(routingState.outputDestinations.count == 1 ? "" : "s")")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Quit", role: .destructive) {
+                    AppDelegate.forceQuit()
+                }
+                .buttonStyle(.borderless)
+                .font(.callout)
+                .help("Quit Loopbacker and stop all routing")
+            }
         }
     }
 }

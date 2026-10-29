@@ -461,7 +461,7 @@ every level has decayed to zero and that has been shown, ticks do nothing until 
 
 ## Noise Suppression
 
-`NoiseSuppressor` runs one of two engines (`DenoiseKernel`s) on the CPU, inline in the capture
+`NoiseSuppressor` runs one of three engines (`DenoiseKernel`s) on the CPU, inline in the capture
 callback. Only routes fed by a physical input use it (mic → virtual mic, mic → monitor); app
 captures and output routes don't.
 
@@ -473,6 +473,19 @@ captures and output routes don't.
   `mlock`ed mapping; the compiled graph is read into wired memory too, since a file mapping
   could page-fault from disk mid-callback. Kernel delay: 2400 samples (4 hops of model
   lookahead plus a hop for the second half of the analysis window).
+- **FastEnhancer** (`FastEnhancerKernel`): aask1357's FastEnhancer-S 48 kHz model (MIT) through
+  the same BNNS Graph setup as DPDFNet (they share `CompiledGraph`, generalised over the
+  model's bundle name and its four argument names). 212K parameters -- tiny next to DPDFNet --
+  so it measures ~0.2 ms per 10.67 ms hop (~2% of a core). A 1024-sample/512-hop Hann-window
+  STFT, one model execution per hop with a ping-pong recurrent state (the per-frequency-bin
+  GRUs' hidden states, flattened), then ISTFT with FastEnhancer's own COLA synthesis window
+  (not a symmetric analysis/synthesis window like DPDFNet's). FastEnhancer is zero-lookahead:
+  every layer but the GRUs is purely per-frame (strided convs and self-attention across
+  frequency bins, never across time), so unlike DPDFNet it has no model-inherent lookahead.
+  Kernel delay: 512 samples (one hop), measured by passing an impulse through the exact
+  analysis/synthesis framing with an identity mask -- matching FastEnhancer's reported
+  zero-lookahead, ~10.7 ms algorithmic latency. Zero heap allocations on the execute path,
+  checked the same way as DPDFNet (an interposed `malloc`, 500 hops).
 - **RNNoise** (`RNNoiseKernel`): Xiph's RNNoise v0.2 (BSD-3-Clause), vendored as the `CRNNoise`
   C target with its default model compiled in. ~0.2 ms per hop. `rnnoise_init(_, NULL)` resets
   state without allocating. Kernel delay: 960 samples (analysis over two frames, plus
@@ -480,10 +493,12 @@ captures and output routes don't.
   read-only data (mlock refuses those pages) and are read every hop.
 
 The engine-independent part is `NoiseSuppressor`: it downmixes channels 1–2 to mono, feeds
-the kernel 480-sample hops, and blends the dry signal (delayed by the kernel's delay) back in
-at the user's max-reduction level. Its buffers are `mlock`ed as well.
+the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 512 for FastEnhancer -- any hop
+size works, `NoiseSuppressor` doesn't assume one), and blends the dry signal (delayed by the
+kernel's delay) back in at the user's max-reduction level. Its buffers are `mlock`ed as well.
 
-Compiling DPDFNet takes ~1.5 s, so the compiled graph (`NoiseSuppressionModel`) is cached in
+Compiling DPDFNet or FastEnhancer takes roughly a second, so the compiled graph
+(`CompiledGraph`, shared by `NoiseSuppressionModel` and `FastEnhancerModel`) is cached in
 `~/Library/Caches/<bundle id>/`, keyed by a hash of the model and the OS build; loading from
 the cache takes ~30 ms. Either way it loads on a background queue: routes start immediately,
 and the router attaches suppressors when the model is ready, which then fade in as usual.
@@ -493,12 +508,16 @@ The audio thread reaches the suppressor through an unretained atomic pointer
 suppressor when suppression is on, the engine matches, and the source hasn't opted out
 (`AudioSource.noiseSuppression`). Otherwise it fades the suppressor to dry (10 ms), clears the
 slot after 100 ms, and drops its reference 0.5 s later, once no callback can still be inside
-it. Switching engines goes old wet → dry → new wet with no click. The router holds the DPDFNet
-model weakly, so the model (~13 MB) is freed with the last kernel that uses it.
+it. Switching engines goes old wet → dry → new wet with no click. The router holds each
+model-backed engine's compiled model weakly, behind a small generic `NoiseModelLoadState`, so
+the model (DPDFNet ~13 MB, FastEnhancer <1 MB) is freed with the last kernel that uses it.
 
 `NoiseEngineBenchmark` times 200 hops of each engine once per launch, when the Effects section
-first shows the picker. It recommends DPDFNet while that takes at most 20% of a core (one
-512-frame callback can run two hops alongside the mix and effects), and RNNoise otherwise.
+first shows the picker. It recommends the best-cleanup engine that stays under its CPU budget,
+in order DPDFNet, then FastEnhancer, then RNNoise as the fallback of last resort: DPDFNet and
+FastEnhancer both qualify while they take at most 20% of a core (one 512-frame callback can run
+roughly two hops alongside the mix and effects); RNNoise has no budget to clear, since it's
+already a fraction of a core by design.
 
 The virtual mic route and the monitor route of the same mic share one suppressor. They mix
 identically, and the HAL calls both input callbacks back to back on the device's IO thread
@@ -506,10 +525,10 @@ with the same sample time, so the first computes the block and the second copies
 flag leaves a block dry if two threads ever collided).
 
 Latency is constant regardless of buffer size: the kernel's delay plus up to a hop waiting for
-the current hop to fill. That's 60 ms (2879 samples) for DPDFNet and 30 ms (1439) for RNNoise.
-Switching on passes the dry signal until real output arrives, then crossfades over 10 ms;
-switching off crossfades back. Suppression only runs at 48 kHz; a monitor route on a device at
-another rate logs and stays dry.
+the current hop to fill. That's 60 ms (2879 samples) for DPDFNet, 21 ms (1023) for
+FastEnhancer, and 30 ms (1439) for RNNoise. Switching on passes the dry signal until real
+output arrives, then crossfades over 10 ms; switching off crossfades back. Suppression only
+runs at 48 kHz; a monitor route on a device at another rate logs and stays dry.
 
 `scripts/convert-dpdfnet.py` rebuilds `App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc` from
 pinned upstream code and weights. It replaces the DPRNN blocks' bidirectional `nn.GRU`s with
@@ -522,6 +541,45 @@ is unchanged. The script checks the result against the unmodified upstream PyTor
 ~500 stateful frames (~61 dB SNR, set by the fp16 weights; ~127 dB with fp32 weights). fp16
 compute and the Neural Engine were tried: fp16 compute breaks the output (~9 dB SNR), and the
 Neural Engine gives nothing for an fp32 model.
+
+`scripts/convert-fastenhancer.py` rebuilds `App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc`
+from pinned upstream code (commit `85d98a6`) and the `fastenhancer_s` checkpoint (release
+`ckpt-v1.0.0-48khz`, epoch 500). FastEnhancer-S's `ONNXModel.forward` already takes one STFT
+frame plus the per-block GRU caches and returns the enhanced frame plus the next caches -- the
+same shape as DPDFNet's traced graph -- so the conversion is a plain `torch.jit.trace` plus
+`coremltools.convert` with no custom op lowering: a single-layer unidirectional `nn.GRU` and
+`scaled_dot_product_attention` both convert natively (unlike DPDFNet's bidirectional,
+chunked GRU). Weights stay fp32 (212K parameters is under 1 MB either way, so there's no size
+reason to compress). Parity against the unmodified upstream PyTorch model over 484 frames
+(STFT frames of a real signal plus random spectra): 127.2 dB SNR, worst frame 1.26e-5 relative
+error. Three checkpoints share this hop size (10.67 ms) at increasing size/quality -- t (29K
+params), b (104K), s (212K) -- with authors' own VoiceBank+DEMAND-48k validation PESQ/STOI of
+2.73/0.937, 2.92/0.944 and 2.98/0.947 respectively; s is shipped since BNNS Graph runs it in a
+small fraction of the ~1 ms/hop budget regardless of size, so quality decided it.
+
+### Quality
+
+`scripts/eval-denoisers/` measures noisy input and all three engines on the VoiceBank+DEMAND
+48 kHz test set (824 real noisy/clean speech pairs, Edinburgh DataShare), through the literal
+app kernels: `denoise-cli` is `swiftc`-compiled directly from the committed
+`DenoiseKernel`/`NoiseSuppressor` sources (not a reimplementation), fed in 512-sample blocks the
+way a capture callback would. `eval.py` delay-compensates each engine's output by its kernel
+delay, then reports PESQ (wide-band, 16 kHz), ESTOI, SI-SDR and DNSMOS P.835 (official ONNX
+model) at -60 dB max reduction:
+
+| Engine | PESQ (wb) | ESTOI | SI-SDR (dB) | DNSMOS SIG | DNSMOS BAK | DNSMOS OVRL |
+|---|---|---|---|---|---|---|
+| Noisy input | 1.97 | 0.79 | 8.4 | 3.34 | 3.13 | 2.70 |
+| DPDFNet | 3.04 | 0.86 | 18.8 | 3.40 | 4.02 | 3.13 |
+| FastEnhancer | 2.99 | 0.86 | 18.2 | 3.35 | 4.02 | 3.07 |
+| RNNoise | 2.47 | 0.84 | 13.2 | 3.38 | 4.02 | 3.09 |
+
+DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with DPDFNet
+slightly ahead of FastEnhancer on every metric -- consistent with the authors' own
+VoiceBank+DEMAND numbers for FastEnhancer-S against stronger non-causal baselines. FastEnhancer
+gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's
+recommended over DPDFNet whenever DPDFNet's CPU runs too close to the audio deadline. Re-run
+with `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
 
 ## UI Cost
 
@@ -562,7 +620,11 @@ on a given machine, independent of the app's own UI.
   `DYLD_INSERT_LIBRARIES`) confirming the execute path allocates nothing on the heap. `--coreml`
   additionally reports parity (SNR) against running the same frames through Core ML. On an M4
   Max: ~1.4 s single-thread compile, 0.55 ms/hop hot, paced median/p99/max ~0.7/1.9/2.3 ms, 0
-  allocations.
+  allocations. `FastEnhancer_S_48k.mlmodelc` isn't wired into `model-bench.sh` (it's
+  DPDFNet-shaped only), but the same technique applied ad hoc gives ~0.2 ms/hop hot (BNNS
+  execute alone ~0.2 ms; full kernel including the STFT/ISTFT vDSP work ~0.2 ms, run-to-run
+  noise dominates the difference) and 0 allocations over 500 hops, both with and without the
+  STFT/ISTFT around it.
 - **`tone.swift`** plays a quiet 440 Hz tone with level swinging -40..-20 dBFS at 1.5 Hz to a
   named output device via `AudioQueue`, so meters and any level-dependent processing keep
   moving during a measurement without needing real program audio.

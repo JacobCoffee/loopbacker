@@ -15,6 +15,9 @@ struct NoiseEngineProfile {
         case .dpdfnet:
             NoiseEngineProfile(engine: engine, name: "DPDFNet", latencyMs: 60, cleanup: "Strongest",
                                tradeoff: "Removes fans, keyboards, traffic and chatter. The delay is noticeable when monitoring yourself.")
+        case .fastenhancer:
+            NoiseEngineProfile(engine: engine, name: "FastEnhancer", latencyMs: 21, cleanup: "Strong",
+                               tradeoff: "Removes fans, hum and most chatter, close to DPDFNet's cleanup, at less than half DPDFNet's latency and a fraction of its CPU.")
         case .rnnoise:
             NoiseEngineProfile(engine: engine, name: "RNNoise", latencyMs: 30, cleanup: "Light",
                                tradeoff: "Removes steady hiss and hum. Clicks and keyboard taps get through.")
@@ -33,10 +36,14 @@ final class NoiseEngineBenchmark: ObservableObject {
     @Published private(set) var coreLoad: [NoiseSuppressionEngine: Double] = [:]
     @Published private(set) var isMeasuring = false
 
-    /// DPDFNet is recommended while it stays under this share of a core. Each 512-frame IO
-    /// callback can run two hops, and the IO thread also carries the mix and effects, so this
-    /// keeps the worst callback well inside its deadline.
-    static let dpdfnetLoadLimit = 0.2
+    /// DPDFNet and FastEnhancer are recommended while they stay under this share of a core.
+    /// Each 512-frame IO callback can run two hops, and the IO thread also carries the mix and
+    /// effects, so this keeps the worst callback well inside its deadline. RNNoise has no limit:
+    /// it's the fallback of last resort, already a fraction of a core by design.
+    static let loadLimit: [NoiseSuppressionEngine: Double] = [.dpdfnet: 0.2, .fastenhancer: 0.2]
+    /// Best cleanup first; `recommended` picks the first of these that measures under its
+    /// `loadLimit`, falling back to RNNoise.
+    static let qualityOrder: [NoiseSuppressionEngine] = [.dpdfnet, .fastenhancer, .rnnoise]
 
     /// The Mac's chip, e.g. "Apple M4 Max".
     let chipName: String = {
@@ -49,10 +56,15 @@ final class NoiseEngineBenchmark: ObservableObject {
 
     private var started = false
 
-    /// DPDFNet on Apple silicon unless it measures too heavy here; RNNoise then.
+    /// The best-cleanup engine that stays under its CPU budget on this Mac, falling back to
+    /// RNNoise. Unmeasured engines are assumed to qualify, so the UI doesn't flip recommendations
+    /// while `measureIfNeeded` is still running.
     var recommended: NoiseSuppressionEngine {
-        guard let load = coreLoad[.dpdfnet] else { return .dpdfnet }
-        return load <= Self.dpdfnetLoadLimit ? .dpdfnet : .rnnoise
+        for engine in Self.qualityOrder.dropLast() {
+            if let load = coreLoad[engine], load > Self.loadLimit[engine] ?? .infinity { continue }
+            return engine
+        }
+        return Self.qualityOrder.last!
     }
 
     func measureIfNeeded() {
@@ -71,12 +83,13 @@ final class NoiseEngineBenchmark: ObservableObject {
         }
     }
 
-    /// Times 200 hops of noise after a 20-hop warm-up. The DPDFNet model is loaded just for
-    /// this and freed after.
+    /// Times 200 hops of noise after a 20-hop warm-up. Model-backed engines load their model
+    /// just for this and free it after.
     nonisolated private static func measure(_ engine: NoiseSuppressionEngine) -> Double? {
         let kernel: (any DenoiseKernel)?
         switch engine {
         case .dpdfnet: kernel = NoiseSuppressionModel.loadBundled().flatMap { DPDFNetKernel(model: $0) }
+        case .fastenhancer: kernel = FastEnhancerModel.loadBundled().flatMap { FastEnhancerKernel(model: $0) }
         case .rnnoise: kernel = RNNoiseKernel.make()
         }
         guard let kernel else { return nil }

@@ -135,6 +135,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppearanceMode.applyStored()
         DefaultDeviceRestorer.shared.saveDefaults()
+        // Started at login: stay in the menu bar. Routing doesn't need the window (RoutingSync).
+        if LoginItem.isLaunchingAtLogin() {
+            DispatchQueue.main.async {
+                for window in NSApp.windows where window.identifier?.rawValue.hasPrefix(WindowID.main) == true {
+                    window.close()
+                }
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

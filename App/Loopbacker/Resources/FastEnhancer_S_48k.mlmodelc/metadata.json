@@ -1,0 +1,118 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "shortDescription" : "Causal 48 kHz FastEnhancer-S speech enhancement, one 10.67 ms hop per call",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 1 × 513 × 1 × 2)",
+        "shortDescription" : "",
+        "shape" : "[1, 513, 1, 2]",
+        "name" : "spec_e",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 6912)",
+        "shortDescription" : "",
+        "shape" : "[6912]",
+        "name" : "state_out",
+        "type" : "MultiArray"
+      }
+    ],
+    "storagePrecision" : "Float32",
+    "modelParameters" : [
+
+    ],
+    "author" : "aask1357 FastEnhancer (MIT); Core ML conversion by scripts\/convert-fastenhancer.py",
+    "specificationVersion" : 9,
+    "license" : "MIT",
+    "mlProgramOperationTypeHistogram" : {
+      "Ios18.expandDims" : 3,
+      "Ios18.mul" : 15,
+      "Ios18.convTranspose" : 1,
+      "Stack" : 1,
+      "Ios18.sigmoid" : 6,
+      "Ios18.scaledDotProductAttention" : 3,
+      "Ios18.greaterEqual" : 3,
+      "Select" : 6,
+      "Ios18.gather" : 6,
+      "Ios18.add" : 29,
+      "Ios18.reshape" : 27,
+      "Pad" : 2,
+      "Ios18.scatter" : 3,
+      "WhileLoop" : 3,
+      "Ios18.linear" : 29,
+      "Ios18.conv" : 13,
+      "Ios18.clip" : 1,
+      "Ios18.concat" : 8,
+      "Ios18.silu" : 11,
+      "Ios18.transpose" : 11,
+      "Ios18.pow" : 2,
+      "Ios18.less" : 3,
+      "Ios18.tanh" : 3,
+      "Ios18.sub" : 4,
+      "Ios18.sliceByIndex" : 20,
+      "Ios18.squeeze" : 6,
+      "Ios16.reduceL2Norm" : 2
+    },
+    "computePrecision" : "Mixed (Float32, Int32)",
+    "stateSchema" : [
+
+    ],
+    "isUpdatable" : "0",
+    "availability" : {
+      "macOS" : "15.0",
+      "tvOS" : "18.0",
+      "visionOS" : "2.0",
+      "watchOS" : "11.0",
+      "iOS" : "18.0",
+      "macCatalyst" : "18.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 1 × 513 × 1 × 2)",
+        "shortDescription" : "",
+        "shape" : "[1, 513, 1, 2]",
+        "name" : "spec",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 6912)",
+        "shortDescription" : "",
+        "shape" : "[6912]",
+        "name" : "state_in",
+        "type" : "MultiArray"
+      }
+    ],
+    "userDefinedMetadata" : {
+      "state_size" : "6912",
+      "n_fft" : "1024",
+      "com.github.apple.coremltools.version" : "9.0",
+      "sample_rate" : "48000",
+      "com.github.apple.coremltools.conversion_date" : "2026-10-29",
+      "window_length" : "1024",
+      "state_init" : "",
+      "variant" : "s",
+      "com.github.apple.coremltools.source_dialect" : "TorchScript",
+      "com.github.apple.coremltools.source" : "torch==2.7.0",
+      "source_commit" : "85d98a689a85b956dec384f258b075859ca50263",
+      "hop_length" : "512"
+    },
+    "generatedClassName" : "FastEnhancer_S_48k",
+    "method" : "predict"
+  }
+]
