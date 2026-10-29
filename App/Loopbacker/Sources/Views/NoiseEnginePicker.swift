@@ -1,13 +1,16 @@
 import SwiftUI
 
-/// Chooses the noise suppression engine. One row per engine, with what it costs (latency, and
-/// CPU measured on this Mac) and what it cleans up, plus a recommendation for this Mac.
+/// Chooses the noise suppression engine. Collapsed, it's one line naming the engine and its
+/// cost; expanded, one row per engine with latency, CPU measured on this Mac, and what it
+/// cleans up, plus a recommendation for this Mac. Picking an engine collapses it again.
 struct NoiseEnginePicker: View {
     @Binding var selection: NoiseSuppressionEngine
     /// Suppression is on: the selected row lights up.
     var isActive: Bool
 
     @ObservedObject private var benchmark = NoiseEngineBenchmark.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isComparing = false
 
     /// Rows are buttons, so the numeric columns use fixed widths rather than a `Grid`.
     private enum Column {
@@ -17,6 +20,48 @@ struct NoiseEnginePicker: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            summary
+
+            if isComparing {
+                comparison
+                    .transition(.opacity)
+            }
+        }
+        .onAppear { benchmark.measureIfNeeded() }
+    }
+
+    private var summary: some View {
+        let profile = NoiseEngineProfile.of(selection)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("Engine")
+                .foregroundStyle(.secondary)
+            Text(profile.name)
+                .fontWeight(.semibold)
+            if benchmark.recommended == selection {
+                StatusTag(title: "Recommended", symbol: "checkmark.seal.fill")
+            }
+            let cpu = benchmark.coreLoad[selection] == nil ? "" : " · \(cpuText(selection)) CPU"
+            Text("\(profile.latencyMs) ms\(cpu) · \(profile.cleanup) cleanup")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { isComparing.toggle() }
+            } label: {
+                Label(isComparing ? "Hide Engines" : "Compare Engines",
+                      systemImage: isComparing ? "chevron.up" : "chevron.down")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.borderless)
+            .help(isComparing ? "Hide the engine comparison" : "Compare engines and switch")
+        }
+        .font(.callout)
+        .padding(.horizontal, 10)
+    }
+
+    private var comparison: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 12) {
                 Text("Engine")
@@ -28,6 +73,7 @@ struct NoiseEnginePicker: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 10)
+            .padding(.top, 8)
 
             ForEach(NoiseSuppressionEngine.allCases) { engine in
                 row(NoiseEngineProfile.of(engine))
@@ -40,7 +86,6 @@ struct NoiseEnginePicker: View {
                 .padding(.horizontal, 10)
                 .padding(.top, 2)
         }
-        .onAppear { benchmark.measureIfNeeded() }
     }
 
     private func row(_ profile: NoiseEngineProfile) -> some View {
@@ -49,6 +94,7 @@ struct NoiseEnginePicker: View {
         let measured = benchmark.coreLoad[profile.engine] != nil
         return Button {
             selection = profile.engine
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { isComparing = false }
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {

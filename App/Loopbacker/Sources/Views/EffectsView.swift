@@ -121,7 +121,6 @@ struct EffectsView: View {
     private var noiseSuppressionCard: some View {
         let settings = routingState.noiseSuppression
         let on = settings.isEnabled
-        let profile = NoiseEngineProfile.of(settings.engine)
         return VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
             HStack(spacing: 10) {
                 Image(systemName: "waveform.badge.minus")
@@ -132,7 +131,7 @@ struct EffectsView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Noise Suppression")
                         .font(.headline)
-                    Text("Removes background noise from mic inputs on-device, before the effects chain (even when it's bypassed). \(profile.name) adds \(profile.latencyMs) ms of latency.")
+                    Text("Removes background noise from mic inputs on-device, before the effects chain (even when it's bypassed).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
