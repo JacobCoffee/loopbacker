@@ -34,6 +34,7 @@ struct ContentView: View {
             // Apply saved effects preset to the audio router
             audioRouter.currentEffectsPreset = routingState.effectsPreset
             audioRouter.updateEffectsPreset(routingState.effectsPreset)
+            audioRouter.updateNoiseSuppression(routingState.noiseSuppression)
             // Start routing for saved state after the audio system settles.
             // After a driver reinstall, coreaudiod can take 2-3s to fully
             // re-initialize. Starting too early blocks and hangs the app.
@@ -64,6 +65,9 @@ struct ContentView: View {
         .onChange(of: routingState.effectsPreset) { _, newPreset in
             audioRouter.currentEffectsPreset = newPreset
             audioRouter.updateEffectsPreset(newPreset)
+        }
+        .onChange(of: routingState.noiseSuppression) { _, settings in
+            audioRouter.updateNoiseSuppression(settings)
         }
         .onChange(of: routingState.micChannelCount) { _, count in
             setDeviceChannels(count, deviceUID: VirtualDeviceChannels.micUID)

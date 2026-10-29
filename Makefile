@@ -37,6 +37,9 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp App/Loopbacker/Resources/Info.plist $(APP_CONTENTS)/Info.plist
 	cp App/Loopbacker/Resources/AppIcon.icns $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/logo.png $(APP_CONTENTS)/Resources/
+	rm -rf $(APP_CONTENTS)/Resources/DPDFNet2_48k.mlmodelc
+	cp -R App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt $(APP_CONTENTS)/Resources/
 	xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile $(APP_CONTENTS)/Resources \
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null

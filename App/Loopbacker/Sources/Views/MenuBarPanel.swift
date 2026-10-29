@@ -22,6 +22,9 @@ struct MenuBarPanel: View {
             sourcesList
             Divider()
                 .padding(.vertical, 12)
+            noiseSuppressionRow
+            Divider()
+                .padding(.vertical, 12)
             actions
             Divider()
                 .padding(.vertical, 12)
@@ -108,6 +111,40 @@ struct MenuBarPanel: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(source.name), \(source.isMuted ? "muted" : source.isEnabled ? "on" : "off")")
+    }
+
+    // MARK: - Noise suppression
+
+    private var noiseSuppressionRow: some View {
+        let on = routingState.noiseSuppression.isEnabled
+        return HStack(spacing: 10) {
+            Image(systemName: "waveform.badge.minus")
+                .font(.body)
+                .foregroundStyle(on ? AnyShapeStyle(.loopbacker) : AnyShapeStyle(.secondary))
+                .frame(width: 20)
+
+            Text("Noise Suppression")
+                .font(.callout)
+
+            Spacer(minLength: 8)
+
+            Toggle(on ? "Turn off noise suppression" : "Turn on noise suppression", isOn: Binding(
+                get: { on },
+                set: { newValue in
+                    routingState.noiseSuppression.isEnabled = newValue
+                    routingState.save()
+                    // The main window may be closed, so push to the engine directly.
+                    audioRouter.updateNoiseSuppression(routingState.noiseSuppression)
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .tint(.loopbacker)
+            .help("Remove background noise from mic inputs")
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Noise Suppression, \(on ? "on" : "off")")
     }
 
     // MARK: - Actions

@@ -17,6 +17,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     /// Current effects preset — applied to new routes and propagated to existing ones
     var currentEffectsPreset = EffectsPreset()
+    /// Noise suppression settings; read and written only on `queue`.
+    private var noiseSuppression = NoiseSuppressionSettings()
 
     // MARK: - Internal state
 
@@ -42,8 +44,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// the compiler's checking.
     ///
     /// Signal path per block: capture `inputChannels` into `renderBuffer` → source meter →
-    /// mix matrix into `mixBuffer` (`outputChannels` wide) → effects (channels 1–2) →
-    /// output meter → ring → playback.
+    /// mix matrix into `mixBuffer` (`outputChannels` wide) → noise suppression (voice routes,
+    /// channels 1–2) → effects (channels 1–2) → output meter → ring → playback.
     fileprivate final class RouteContext: @unchecked Sendable {
         var inputUnit: AudioComponentInstance?
         var outputUnit: AudioComponentInstance?
@@ -73,6 +75,14 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         // Audio effects chain (broadcast voice processing)
         var effectsChain: AudioEffectsChain?
 
+        /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these get
+        /// noise suppression: app captures carry music/game audio, and output routes replay the
+        /// already-processed virtual device.
+        let isVoiceInput: Bool
+        /// Created on `queue` the first time suppression is enabled, then kept until the route
+        /// is gone, so the audio thread never races its release. Stopped in `deinit`.
+        var noiseSuppressor: NoiseSuppressor?
+
         // Meter levels -- C buffers written on the RT thread, read and decayed on main.
         // Source levels are per captured channel; output levels are per playback channel.
         let meterLevelsPtr: UnsafeMutablePointer<Float>
@@ -85,7 +95,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
-             sampleRate: Float64) {
+             sampleRate: Float64, isVoiceInput: Bool = false) {
             self.captureDeviceUID = captureDeviceUID
             self.captureDeviceID = captureDeviceID
             self.playbackDeviceID = playbackDeviceID
@@ -93,6 +103,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.inputChannels = inputChannels
             self.outputChannels = outputChannels
             self.sampleRate = sampleRate
+            self.isVoiceInput = isVoiceInput
 
             meterLevelsPtr = .allocate(capacity: Int(inputChannels))
             meterLevelsPtr.initialize(repeating: 0.0, count: Int(inputChannels))
@@ -116,6 +127,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         deinit {
+            noiseSuppressor?.stop()
             renderBuffer.deallocate()
             mixBuffer.deallocate()
             meterLevelsPtr.deallocate()
@@ -148,6 +160,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         func processCapturedBlock(frames: UInt32) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
+            noiseSuppressor?.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
             effectsChain?.process(mixBuffer, frames: frames, channels: outputChannels)
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
@@ -328,8 +341,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             guard inputChannels > 0 else { return }
             let ctx = RouteContext(captureDeviceUID: sourceDeviceUID, captureDeviceID: captureID,
                                   playbackDeviceID: outputID, playbackDeviceUID: outputDeviceUID,
-                                  inputChannels: inputChannels, outputChannels: 2, sampleRate: rate)
+                                  inputChannels: inputChannels, outputChannels: 2, sampleRate: rate,
+                                  isVoiceInput: true)
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+            self.applyNoiseSuppression(to: ctx)
             // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
             if let pending = self.pendingMixMatrices[sourceDeviceUID] {
                 self.applyMixToContext(ctx, routes: pending)
@@ -591,6 +606,29 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - Noise suppression
+
+    /// Apply noise suppression settings to every voice-input route, and to routes started later.
+    func updateNoiseSuppression(_ settings: NoiseSuppressionSettings) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.noiseSuppression = settings
+            for ctx in self.activeRoutes.values { self.applyNoiseSuppression(to: ctx) }
+            for ctx in self.activeOutputRoutes.values { self.applyNoiseSuppression(to: ctx) }
+        }
+    }
+
+    /// Must run on `queue`. Loads the model (~150 ms) the first time a route is switched on.
+    private func applyNoiseSuppression(to ctx: RouteContext) {
+        guard ctx.isVoiceInput else { return }
+        let settings = noiseSuppression
+        if settings.isEnabled && ctx.noiseSuppressor == nil {
+            ctx.noiseSuppressor = NoiseSuppressor.make(sampleRate: ctx.sampleRate)
+        }
+        ctx.noiseSuppressor?.setMaxReduction(dB: settings.maxReductionDB)
+        ctx.noiseSuppressor?.setEnabled(settings.isEnabled)
+    }
+
     // MARK: - Meter timer
 
     private func startMeterTimer() {
@@ -675,9 +713,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             playbackDeviceUID: "LoopbackerDevice_UID",
             inputChannels: inputChannels,
             outputChannels: micChannels,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            isVoiceInput: true
         )
         ctx.effectsChain?.updatePreset(currentEffectsPreset)
+        applyNoiseSuppression(to: ctx)
 
         // Create input AUHAL (captures from source device)
         guard setupInputUnit(ctx) else {

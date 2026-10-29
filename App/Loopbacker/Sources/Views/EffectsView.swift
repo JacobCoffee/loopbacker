@@ -59,6 +59,8 @@ struct EffectsView: View {
     var body: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+                noiseSuppressionCard
+
                 if !preset.isEnabled {
                     disabledPrompt
                 }
@@ -107,6 +109,63 @@ struct EffectsView: View {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     routingState.effectsPreset.isEnabled = newValue
                 }
+                routingState.save()
+            }
+        )
+    }
+
+    // MARK: - Noise suppression
+
+    /// Sits above the chain and outside its bypass dimming: suppression runs whenever it's on,
+    /// whether or not the effects chain is enabled.
+    private var noiseSuppressionCard: some View {
+        let on = routingState.noiseSuppression.isEnabled
+        return VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            HStack(spacing: 10) {
+                Image(systemName: "waveform.badge.minus")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(on ? Color.loopbacker : Color.secondary)
+                    .frame(width: 28, height: 28)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Noise Suppression")
+                        .font(.headline)
+                    Text("Removes background noise from mic inputs with an on-device neural model. Runs before the effects chain, even when it's bypassed. Adds about 80 ms of latency.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                Toggle(isOn: noiseSuppressionBinding(\.isEnabled)) {
+                    Text(on ? "Active" : "Off")
+                        .font(.caption.weight(.semibold))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(.loopbacker)
+                .help(on ? "Turn off noise suppression" : "Turn on noise suppression")
+            }
+
+            if on {
+                ParameterSliderRow(label: "Max Reduction",
+                                   description: "How far noise is pulled down. Ease off to keep some room tone.",
+                                   value: noiseSuppressionBinding(\.maxReductionDB),
+                                   range: NoiseSuppressionSettings.reductionRange, unit: "dB")
+                    .transition(.opacity)
+            }
+        }
+        .padding(Metrics.panelPadding)
+        .glassPanel(cornerRadius: Metrics.panelRadius, tint: on ? Color.loopbacker.opacity(0.08) : nil)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: on)
+    }
+
+    private func noiseSuppressionBinding<T>(_ keyPath: WritableKeyPath<NoiseSuppressionSettings, T>) -> Binding<T> {
+        Binding(
+            get: { routingState.noiseSuppression[keyPath: keyPath] },
+            set: {
+                routingState.noiseSuppression[keyPath: keyPath] = $0
                 routingState.save()
             }
         )

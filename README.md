@@ -43,6 +43,14 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 - Output routing: send one channel pair of a multichannel device to your speakers while apps record the other channels
 - Scenes system for saving/loading routing configs
 
+**Noise Suppression**
+
+- On-device neural noise removal for mic inputs, using [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz model through Core ML
+- Runs before the effects chain, independent of its bypass and presets; toggle it from the Effects section or the menu bar
+- Max Reduction control (-60 to -6 dB) to keep some room tone instead of dead silence
+- Adds about 80 ms of latency at a 512-frame buffer (40 ms of it is the model's lookahead)
+- Applies to mic → virtual mic and monitor routes, not app captures
+
 **Effects Chain** (9 real-time DSP effects, all processed on the audio thread)
 
 - Noise Gate -- soft expander with configurable threshold
@@ -95,7 +103,7 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 Mic / App Output                        Discord / OBS / Zoom
        |                                       ^
        | capture                               | reads as mic input
-       v                                       |
+   [ Noise Suppression ]  (mic inputs)         |
    [ Effects Chain ]                           |
    Gate > EQ > Comp > DeEss >                 |
    Chorus > Pitch > Reverb > Delay > Limiter  |
@@ -107,7 +115,7 @@ Mic / App Output                        Discord / OBS / Zoom
                   Loopbacker Virtual Device
 ```
 
-A CoreAudio HAL plugin provides the virtual device. The SwiftUI app handles routing, effects processing, and driver installation. All DSP runs on the real-time audio thread with no allocations or locks.
+A CoreAudio HAL plugin provides the virtual device. The SwiftUI app handles routing, effects processing, and driver installation. The effects chain runs on the real-time audio thread with no allocations or locks. Noise suppression runs its Core ML model on a separate worker thread; the audio thread only exchanges samples with it through lock-free rings.
 
 ## Install
 
@@ -154,9 +162,9 @@ loopbacker/
 ├── App/             SwiftUI companion app (Swift 6 language mode, macOS 26)
 │   └── Sources/
 │       ├── Models/      AudioSource, AudioRoute, EffectsPreset, SoundboardItem
-│       ├── Services/    AudioRouter, AudioEffectsChain, SoundboardPlayer
+│       ├── Services/    AudioRouter, AudioEffectsChain, NoiseSuppressor, SoundboardPlayer
 │       └── Views/       ContentView, EffectsView, SoundboardView, ...
-├── scripts/         Install/uninstall helpers
+├── scripts/         Install/uninstall helpers, DPDFNet → Core ML conversion
 └── docs/            Architecture docs
 ```
 
@@ -169,3 +177,5 @@ loopbacker/
 ## License
 
 [FSL-1.1-MIT](LICENSE) -- free to use for any non-competing purpose, converts to MIT after 2 years.
+
+The bundled noise suppression model (`DPDFNet2_48k.mlmodelc`) is converted from [CEVA's DPDFNet](https://github.com/ceva-ip/DPDFNet) and licensed under [Apache-2.0](App/Loopbacker/Resources/DPDFNet-LICENSE.txt). Rebuild it with `scripts/convert-dpdfnet.py` (needs [uv](https://docs.astral.sh/uv/)).

@@ -446,7 +446,8 @@ source, capped at 64) and `outputChannels` (the playback device). One block flow
 
 ```
 capture (inputChannels) → source meter → mix matrix (outputChannels × inputChannels)
-  → effects on channels 1–2 → output meter → drift-compensated ring → playback
+  → noise suppression on channels 1–2 (voice routes) → effects on channels 1–2
+  → output meter → drift-compensated ring → playback
 ```
 
 Output routing captures every channel of the virtual device and mixes the monitor pair
@@ -455,6 +456,28 @@ example) stay on the device for other apps to record without reaching the speake
 
 Meter levels go to an `@Observable` `MeterLevels` store rather than the routing model,
 so 30 Hz meter updates re-render only the meter views.
+
+## Noise Suppression
+
+`NoiseSuppressor` runs CEVA's DPDFNet2 48 kHz model (Apache-2.0) through Core ML on the
+CPU. Only routes fed by a physical input get one (mic → virtual mic, mic → monitor); app
+captures and output routes don't. It is created on the router queue the first time it is
+enabled for a route and kept for the route's lifetime.
+
+Core ML allocates and locks, so inference runs on a dedicated worker thread. The audio
+callback downmixes channels 1–2 to mono, pushes it into a lock-free SPSC ring, wakes the
+worker, and pulls enhanced mono from a second ring back into channels 1–2. The worker does
+the 20 ms Vorbis-window STFT (10 ms hop), one model call per hop with a ping-pong recurrent
+state written into preallocated Core ML outputs, ISTFT/overlap-add, and blends the dry signal
+(delayed by the model's 4-hop lookahead) back in at the user's max-reduction level.
+
+Latency is ~40 ms of model lookahead plus the analysis window and about one IO buffer of
+cushion: ~80 ms end to end at a 512-frame buffer. While the cushion fills, after an underrun,
+and when switching off, the callback crossfades to the dry signal over 10 ms. The model only
+runs at 48 kHz; a monitor route on a device at another rate logs and stays dry.
+
+`scripts/convert-dpdfnet.py` rebuilds `App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc` from
+pinned upstream code and weights and checks Core ML against PyTorch over 300 stateful frames.
 
 ## Risks and Mitigations
 
