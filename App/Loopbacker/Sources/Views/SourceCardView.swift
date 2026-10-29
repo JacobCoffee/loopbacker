@@ -18,6 +18,11 @@ struct SourceCardView: View {
         return !audioDeviceManager.systemDevices.contains { $0.uid == source.deviceUID }
     }
 
+    /// Noise suppression is on globally and this device source hasn't opted out.
+    private var isDenoised: Bool {
+        !source.isAppCapture && source.noiseSuppression && routingState.noiseSuppression.isEnabled
+    }
+
     private var isNotRunning: Bool {
         source.isAppCapture && !appCaptureService.isAppRunning(bundleID: source.appBundleID)
     }
@@ -77,6 +82,10 @@ struct SourceCardView: View {
                         StatusTag(title: "Unavailable", tint: .signalWarm, symbol: "exclamationmark.triangle.fill")
                             .help("No audio device with this source's ID is connected. Reconnect it, or remove and re-add the source.")
                     }
+                    if isDenoised {
+                        StatusTag(title: "Denoised", tint: .loopbacker, symbol: "waveform.badge.minus")
+                            .help("Noise suppression (\(NoiseEngineProfile.of(routingState.noiseSuppression.engine).name)) cleans this mic before the effects chain")
+                    }
                 }
 
                 Text(source.isAppCapture ? "App Audio" : "\(source.channels.count) channel\(source.channels.count == 1 ? "" : "s")")
@@ -105,13 +114,14 @@ struct SourceCardView: View {
         DisclosureGroup(isExpanded: $showOptions) {
             optionsSection
         } label: {
+            // Help on the label only: on the group it would override the controls' own help.
             Text("Options")
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
+                .help(showOptions ? "Hide source options (monitor, noise suppression, mute, solo)" : "Show source options (monitor, noise suppression, mute, solo)")
         }
         .padding(.horizontal, Metrics.panelPadding)
         .padding(.vertical, 8)
-        .help(showOptions ? "Hide source options (mute, solo, pass-through)" : "Show source options (mute, solo, pass-through)")
     }
 
     private var optionsSection: some View {
@@ -124,6 +134,25 @@ struct SourceCardView: View {
                     monitorPicker
                 }
                 .help("Hear this source through a physical output (speakers/headphones)")
+
+                Toggle(isOn: Binding(
+                    get: { source.noiseSuppression },
+                    set: { source.noiseSuppression = $0; routingState.save() }
+                )) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Noise Suppression")
+                            .font(.callout)
+                        if !routingState.noiseSuppression.isEnabled {
+                            Text("Off for all mics. Turn it on in Effects.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .tint(.loopbacker)
+                .help(source.noiseSuppression ? "Don't denoise this mic" : "Denoise this mic when noise suppression is on")
             }
 
             HStack(spacing: 8) {

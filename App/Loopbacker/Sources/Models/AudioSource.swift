@@ -38,6 +38,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
     var sourceType: SourceType
     /// Bundle identifier for app capture sources (empty for device sources)
     var appBundleID: String
+    /// Noise suppression for this device's voice routes (virtual mic and monitor), when it's
+    /// switched on globally. App captures are never denoised.
+    var noiseSuppression: Bool
 
     init(
         id: UUID = UUID(),
@@ -51,7 +54,8 @@ struct AudioSource: Identifiable, Equatable, Codable {
         monitorOutputUID: String = "",
         monitorOutputName: String = "",
         sourceType: SourceType = .device,
-        appBundleID: String = ""
+        appBundleID: String = "",
+        noiseSuppression: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -65,13 +69,14 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.monitorOutputName = monitorOutputName
         self.sourceType = sourceType
         self.appBundleID = appBundleID
+        self.noiseSuppression = noiseSuppression
     }
 
     var isAppCapture: Bool { sourceType == .appCapture }
 
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
-        case monitorOutputUID, monitorOutputName, sourceType, appBundleID
+        case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression
     }
 
     init(from decoder: Decoder) throws {
@@ -88,6 +93,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         monitorOutputName = (try? container.decode(String.self, forKey: .monitorOutputName)) ?? ""
         sourceType = (try? container.decode(SourceType.self, forKey: .sourceType)) ?? .device
         appBundleID = (try? container.decode(String.self, forKey: .appBundleID)) ?? ""
+        noiseSuppression = (try? container.decode(Bool.self, forKey: .noiseSuppression)) ?? true
     }
 
     /// Create an AudioSource from a captured app

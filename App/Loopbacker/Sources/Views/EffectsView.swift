@@ -119,7 +119,9 @@ struct EffectsView: View {
     /// Sits above the chain and outside its bypass dimming: suppression runs whenever it's on,
     /// whether or not the effects chain is enabled.
     private var noiseSuppressionCard: some View {
-        let on = routingState.noiseSuppression.isEnabled
+        let settings = routingState.noiseSuppression
+        let on = settings.isEnabled
+        let profile = NoiseEngineProfile.of(settings.engine)
         return VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
             HStack(spacing: 10) {
                 Image(systemName: "waveform.badge.minus")
@@ -130,7 +132,7 @@ struct EffectsView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Noise Suppression")
                         .font(.headline)
-                    Text("Removes background noise from mic inputs with an on-device neural model. Runs before the effects chain, even when it's bypassed. Adds 60 ms of latency.")
+                    Text("Removes background noise from mic inputs on-device, before the effects chain (even when it's bypassed). \(profile.name) adds \(profile.latencyMs) ms of latency.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -147,6 +149,8 @@ struct EffectsView: View {
                 .tint(.loopbacker)
                 .help(on ? "Turn off noise suppression" : "Turn on noise suppression")
             }
+
+            NoiseEnginePicker(selection: noiseSuppressionBinding(\.engine), isActive: on)
 
             if on {
                 ParameterSliderRow(label: "Max Reduction",

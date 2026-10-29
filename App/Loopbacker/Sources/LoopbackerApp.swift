@@ -3,13 +3,36 @@ import SwiftUI
 @main
 struct LoopbackerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var routingState = RoutingState.load()
-    @StateObject private var audioDeviceManager = AudioDeviceManager()
-    @StateObject private var driverInstaller = DriverInstaller()
-    @StateObject private var audioRouter = AudioRouter()
-    @StateObject private var soundboardState = SoundboardState.load()
-    @StateObject private var soundboardPlayer = SoundboardPlayer()
-    @StateObject private var appCaptureService = AppCaptureService()
+    @StateObject private var routingState: RoutingState
+    @StateObject private var audioDeviceManager: AudioDeviceManager
+    @StateObject private var driverInstaller: DriverInstaller
+    @StateObject private var audioRouter: AudioRouter
+    @StateObject private var soundboardState: SoundboardState
+    @StateObject private var soundboardPlayer: SoundboardPlayer
+    @StateObject private var appCaptureService: AppCaptureService
+    // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
+    // routes start and menu-bar edits reach the engine even if the main window never opens.
+    @StateObject private var routingSync: RoutingSync
+
+    init() {
+        let routingState = RoutingState.load()
+        let audioDeviceManager = AudioDeviceManager()
+        let audioRouter = AudioRouter()
+        let appCaptureService = AppCaptureService()
+        _routingState = StateObject(wrappedValue: routingState)
+        _audioDeviceManager = StateObject(wrappedValue: audioDeviceManager)
+        _driverInstaller = StateObject(wrappedValue: DriverInstaller())
+        _audioRouter = StateObject(wrappedValue: audioRouter)
+        _soundboardState = StateObject(wrappedValue: SoundboardState.load())
+        _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
+        _appCaptureService = StateObject(wrappedValue: appCaptureService)
+        _routingSync = StateObject(wrappedValue: RoutingSync(
+            routingState: routingState,
+            audioDeviceManager: audioDeviceManager,
+            audioRouter: audioRouter,
+            appCaptureService: appCaptureService
+        ))
+    }
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,

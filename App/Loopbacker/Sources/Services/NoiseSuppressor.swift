@@ -1,28 +1,21 @@
-import Accelerate
-import CryptoKit
 import Foundation
 import Synchronization
 import os.log
 
-private let nsLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "NoiseSuppressor")
+let nsLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "NoiseSuppressor")
 
-/// Neural noise suppression for a mic's voice pair, using CEVA's DPDFNet2 48 kHz model
-/// (Apache-2.0), bundled as `DPDFNet2_48k.mlmodelc` and reproducible with
-/// `scripts/convert-dpdfnet.py`.
-///
-/// The model runs through BNNS Graph, which executes a compiled graph with caller-provided
-/// workspace and buffers: no allocation, no locks, no thread hops. So it runs inline on the
-/// capture device's IO thread, ~0.75 ms per 10 ms hop on an M4 Max.
+/// Noise suppression for a mic's voice pair, running a `DenoiseKernel` (DPDFNet or RNNoise)
+/// inline on the capture device's IO thread.
 ///
 /// One instance serves every voice route capturing the same device (mic → virtual mic and
 /// mic → monitor). Those routes' input callbacks run back to back on the device's IO thread
 /// with the same HAL sample time and the same channel mix, so the first route to see a block
 /// computes it and the others copy the result.
 ///
-/// Latency: 60 ms, constant. The model's output lags its input by four hops (40 ms), and a hop
-/// can only be emitted once the second half of its 20 ms analysis window has arrived (up to
-/// 20 ms). Switching on passes the dry signal until real output arrives, then crossfades over
-/// 10 ms; switching off crossfades back. Neither clicks.
+/// Latency is constant: the kernel's `delay` plus `hop - 1` samples waiting for a hop to fill
+/// (DPDFNet 2879 samples ≈ 60 ms, RNNoise 1439 ≈ 30 ms). Switching on passes the dry signal
+/// until real output arrives, then crossfades over 10 ms; switching off crossfades back.
+/// Neither clicks.
 ///
 /// Thread contract:
 /// - `process` runs on the capture devices' IO threads, one call at a time (a busy flag
@@ -31,24 +24,22 @@ private let nsLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category:
 final class NoiseSuppressor: @unchecked Sendable {
     static let sampleRate: Float64 = 48_000
 
-    private static let windowLength = 960
-    private static let hop = 480
-    private static let bins = windowLength / 2 + 1
-    /// The model's output lags its input by four hops (two conv + two deep-filter lookahead frames).
-    private static let modelDelay = 4 * hop
-    /// Output queued ahead at session start so a hop is always ready: a hop is emitted only
-    /// after two have arrived, so output trails input by at most `2 * hop - 1` samples.
-    private static let lead = 2 * hop - 1
-    /// Output samples before the enhanced signal is real (zeros and model warm-up before that).
-    private static let primeSamples = lead + modelDelay
-    /// Dry history: must reach back `modelDelay` behind the newest analysis window.
-    private static let historySize = 4096
-    /// Enhanced-sample FIFO; holds at most `lead + hop`.
-    private static let fifoSize = 2048
     /// Largest block cached for routes sharing this instance; larger blocks aren't shared.
     private static let maxBlock = 4096
     /// Wet/dry crossfade step per sample (10 ms at 48 kHz).
     private static let fadeStep: Float = 1.0 / 480.0
+
+    let engine: NoiseSuppressionEngine
+    private let kernel: any DenoiseKernel
+    private let hop: Int
+    private let delay: Int
+    /// Output queued ahead at session start so a hop is always ready: a hop is emitted only
+    /// once it has fully arrived, so output trails input by at most `hop - 1` samples.
+    private let lead: Int
+    /// Output samples before the enhanced signal is real.
+    private let primeSamples: Int
+    private let historyMask: Int
+    private let fifoMask: Int
 
     // MARK: Shared state
 
@@ -57,35 +48,15 @@ final class NoiseSuppressor: @unchecked Sendable {
     private let dryMixBits = Atomic<UInt32>(Float(0.001).bitPattern)
     private let busy = Atomic<Bool>(false)
 
-    // MARK: Model
-
-    private let graph: CompiledGraph
-    private let context: bnns_graph_context_t
-    /// One wired (mlock'd) anonymous mapping holds the workspace and every buffer the IO thread
-    /// touches, so memory pressure can't page or compress them out from under the callback.
-    private let arena: UnsafeMutableRawPointer
-    private let arenaSize: Int
-    private let workspace: UnsafeMutableRawPointer
-    private let workspaceSize: Int
-    private let arguments: UnsafeMutablePointer<bnns_graph_argument_t>
-    private let specIn: UnsafeMutablePointer<Float>
-    private let specOut: UnsafeMutablePointer<Float>
-    /// Ping-pong: even hops read `stateA` and write `stateB`, odd hops the reverse. Plain
-    /// pointers rather than an array, so the IO thread touches no reference-counted storage.
-    private let stateA: UnsafeMutablePointer<Float>
-    private let stateB: UnsafeMutablePointer<Float>
-    private let initialState: UnsafeMutablePointer<Float>
-    private var pingPong = 0
-
     // MARK: Stream state (IO thread)
 
     private var inSession = false
     private var failed = false
     private var wetGain: Float = 0
-    /// Output samples produced this session, including the `lead`.
-    private var sessionOut = 0
-    /// Input hops consumed this session.
-    private var hopsIn = 0
+    /// Input (and output) samples this session.
+    private var sessionSamples = 0
+    /// Kernel calls this session.
+    private var hops = 0
     private var hopFill = 0
     private var fifoRead = 0
     private var fifoWrite = 0
@@ -94,66 +65,45 @@ final class NoiseSuppressor: @unchecked Sendable {
     private var cachedFrames = 0
     private var cachedActive = false
 
-    private let forwardDFT: vDSP_DFT_Setup
-    private let inverseDFT: vDSP_DFT_Setup
-    private let window: UnsafeMutablePointer<Float>
-    private let analysis: UnsafeMutablePointer<Float>
-    private let realIn: UnsafeMutablePointer<Float>
-    private let imagIn: UnsafeMutablePointer<Float>
-    private let realOut: UnsafeMutablePointer<Float>
-    private let imagOut: UnsafeMutablePointer<Float>
-    private let overlap: UnsafeMutablePointer<Float>
+    /// One wired (mlock'd) anonymous mapping holds every buffer the IO thread touches, so
+    /// memory pressure can't page or compress them out from under the callback.
+    private let arena: UnsafeMutableRawPointer
+    private let arenaSize: Int
+    private let hopIn: UnsafeMutablePointer<Float>
+    private let hopOut: UnsafeMutablePointer<Float>
+    /// Dry input by session sample index, reaching back `hop + delay`.
     private let history: UnsafeMutablePointer<Float>
+    /// Blended output samples, `lead` ahead of the reader.
     private let fifo: UnsafeMutablePointer<Float>
     private let cachedBlock: UnsafeMutablePointer<Float>
 
     /// A suppressor for a route at `sampleRate`, or nil (logged) when it can't be suppressed.
-    /// Cheap once `model` is loaded: one context, buffers, and a warm-up hop.
-    static func make(sampleRate: Float64, model: NoiseSuppressionModel) -> NoiseSuppressor? {
+    static func make(sampleRate: Float64, engine: NoiseSuppressionEngine, kernel: any DenoiseKernel) -> NoiseSuppressor? {
         guard sampleRate == Self.sampleRate else {
             nsLogger.error("Noise suppression needs 48 kHz; route runs at \(sampleRate) Hz")
             return nil
         }
-        return NoiseSuppressor(graph: model.graph)
+        return NoiseSuppressor(engine: engine, kernel: kernel)
     }
 
-    private init?(graph: CompiledGraph) {
-        let context = BNNSGraphContextMake(graph.graph)
-        guard context.data != nil else {
-            nsLogger.error("BNNSGraphContextMake failed")
-            return nil
-        }
-        BNNSGraphContextSetArgumentType(context, BNNSGraphArgumentTypePointer)
-        let size = BNNSGraphContextGetWorkspaceSize(context, nil)
-        // size_t failure sentinels (SIZE_T_MAX) arrive in Swift as -1.
-        guard size >= 0,
-              let forward = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(Self.windowLength), .FORWARD),
-              let inverse = vDSP_DFT_zop_CreateSetup(forward, vDSP_Length(Self.windowLength), .INVERSE) else {
-            BNNSGraphContextDestroy(context)
-            nsLogger.error("Noise suppression setup failed")
-            return nil
-        }
-        self.graph = graph
-        self.context = context
-        forwardDFT = forward
-        inverseDFT = inverse
-        workspaceSize = size
+    private init?(engine: NoiseSuppressionEngine, kernel: any DenoiseKernel) {
+        func powerOfTwo(atLeast n: Int) -> Int { 1 << (Int.bitWidth - (n - 1).leadingZeroBitCount) }
+        self.engine = engine
+        self.kernel = kernel
+        hop = kernel.hop
+        delay = kernel.delay
+        lead = hop - 1
+        primeSamples = lead + delay
+        let historySize = powerOfTwo(atLeast: hop + delay)
+        let fifoSize = powerOfTwo(atLeast: lead + hop)
+        historyMask = historySize - 1
+        fifoMask = fifoSize - 1
 
-        // Carve the arena: the workspace first (BNNS requires it page-aligned), then the
-        // arguments and float buffers on cache-line boundaries.
-        let n = Self.windowLength
-        let page = Int(getpagesize())
         func rounded(_ bytes: Int, to alignment: Int) -> Int { (bytes + alignment - 1) / alignment * alignment }
-        let floatCounts = [2 * Self.bins, 2 * Self.bins, graph.stateSize, graph.stateSize, graph.stateSize,
-                           n, n, n, n, n, n, n, Self.historySize, Self.fifoSize, Self.maxBlock]
-        let argumentBytes = rounded(graph.argumentCount * MemoryLayout<bnns_graph_argument_t>.stride, to: 64)
-        let total = rounded(rounded(max(size, 1), to: page) + argumentBytes
-            + floatCounts.reduce(0) { $0 + rounded($1 * MemoryLayout<Float>.size, to: 64) }, to: page)
+        let counts = [hop, hop, historySize, fifoSize, Self.maxBlock]
+        let total = rounded(counts.reduce(0) { $0 + rounded($1 * MemoryLayout<Float>.size, to: 64) }, to: Int(getpagesize()))
         guard let mapping = mmap(nil, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
               mapping != MAP_FAILED else {
-            BNNSGraphContextDestroy(context)
-            vDSP_DFT_DestroySetup(forward)
-            vDSP_DFT_DestroySetup(inverse)
             nsLogger.error("Noise suppression buffers could not be mapped")
             return nil
         }
@@ -162,65 +112,23 @@ final class NoiseSuppressor: @unchecked Sendable {
         }
         arena = mapping
         arenaSize = total
-        workspace = mapping
-        var offset = rounded(max(size, 1), to: page)
-        let args = (mapping + offset).bindMemory(to: bnns_graph_argument_t.self, capacity: graph.argumentCount)
-        args.initialize(repeating: bnns_graph_argument_t(), count: graph.argumentCount)
-        arguments = args
-        offset += argumentBytes
         // Anonymous mappings start zeroed.
+        var offset = 0
         func floats(_ count: Int) -> UnsafeMutablePointer<Float> {
             let p = (mapping + offset).bindMemory(to: Float.self, capacity: count)
             offset += rounded(count * MemoryLayout<Float>.size, to: 64)
             return p
         }
-        specIn = floats(2 * Self.bins)
-        specOut = floats(2 * Self.bins)
-        stateA = floats(graph.stateSize)
-        stateB = floats(graph.stateSize)
-        let initial = floats(graph.stateSize)
-        graph.stateInit.withUnsafeBufferPointer { initial.update(from: $0.baseAddress!, count: $0.count) }
-        initialState = initial
-        window = floats(n)
-        analysis = floats(n)
-        realIn = floats(n)
-        imagIn = floats(n)
-        realOut = floats(n)
-        imagOut = floats(n)
-        overlap = floats(n)
-        history = floats(Self.historySize)
-        fifo = floats(Self.fifoSize)
+        hopIn = floats(hop)
+        hopOut = floats(hop)
+        history = floats(historySize)
+        fifo = floats(fifoSize)
         cachedBlock = floats(Self.maxBlock)
-
-        arguments[graph.specPosition].data_ptr = UnsafeMutableRawPointer(specIn)
-        arguments[graph.specPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
-        arguments[graph.specOutPosition].data_ptr = UnsafeMutableRawPointer(specOut)
-        arguments[graph.specOutPosition].data_ptr_size = 2 * Self.bins * MemoryLayout<Float>.size
-        arguments[graph.stateInPosition].data_ptr_size = graph.stateSize * MemoryLayout<Float>.size
-        arguments[graph.stateOutPosition].data_ptr_size = graph.stateSize * MemoryLayout<Float>.size
-
-        // Vorbis window: power-complementary at 50% overlap, as DPDFNet was trained with.
-        for i in 0..<n {
-            let s = sin(0.5 * Double.pi * (Double(i) + 0.5) / Double(n / 2))
-            window[i] = Float(sin(0.5 * Double.pi * s * s))
-        }
-
-        // Warm-up hop here, off the IO thread: the first execution touches context memory
-        // BNNS allocates lazily.
-        stateA.update(from: initialState, count: graph.stateSize)
-        arguments[graph.stateInPosition].data_ptr = UnsafeMutableRawPointer(stateA)
-        arguments[graph.stateOutPosition].data_ptr = UnsafeMutableRawPointer(stateB)
-        if BNNSGraphContextExecute(context, nil, graph.argumentCount, arguments, size,
-                                   workspace.assumingMemoryBound(to: CChar.self)) != 0 {
-            nsLogger.error("Noise suppression warm-up execution failed")
-        }
     }
 
     deinit {
-        BNNSGraphContextDestroy(context)
-        vDSP_DFT_DestroySetup(forwardDFT)
-        vDSP_DFT_DestroySetup(inverseDFT)
         munmap(arena, arenaSize)
+        nsLogger.info("Noise suppression (\(self.engine.rawValue, privacy: .public)) freed")
     }
 
     func setEnabled(_ on: Bool) {
@@ -274,8 +182,8 @@ final class NoiseSuppressor: @unchecked Sendable {
         }
     }
 
-    /// Runs one chunk through the model into `cachedBlock`. Returns false (and leaves the
-    /// chunk alone) while fully dry outside a session, so the stereo image survives.
+    /// Runs one chunk into `cachedBlock`. Returns false (and leaves the chunk alone) while
+    /// fully dry outside a session, so the stereo image survives.
     private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames n: Int, stride: Int, channels: Int) -> Bool {
         let want = enabled.load(ordering: .relaxed)
         if !inSession {
@@ -286,23 +194,22 @@ final class NoiseSuppressor: @unchecked Sendable {
             return false
         }
 
-        let h = Self.hop, mask = Self.fifoSize - 1
-        let tail = analysis.advanced(by: Self.windowLength - h)
         var g = wetGain
         for i in 0..<n {
             let base = i * stride
             let dry = channels == 1 ? buf[base] : 0.5 * (buf[base] + buf[base + 1])
-            tail[hopFill] = dry
+            hopIn[hopFill] = dry
+            history[sessionSamples & historyMask] = dry
             hopFill += 1
-            if hopFill == h {
+            sessionSamples += 1
+            if hopFill == hop {
                 if !failed { failed = !processHop() }
                 hopFill = 0
             }
-            let wet = fifo[fifoRead & mask]
+            let wet = fifo[fifoRead & fifoMask]
             fifoRead += 1
-            sessionOut += 1
 
-            let target: Float = want && !failed && sessionOut > Self.primeSamples ? 1 : 0
+            let target: Float = want && !failed && sessionSamples > primeSamples ? 1 : 0
             g = target > g ? min(target, g + Self.fadeStep) : max(target, g - Self.fadeStep)
             cachedBlock[i] = g * wet + (1 - g) * dry
         }
@@ -315,265 +222,30 @@ final class NoiseSuppressor: @unchecked Sendable {
         inSession = true
         failed = false
         wetGain = 0
-        sessionOut = 0
-        hopsIn = 0
+        sessionSamples = 0
+        hops = 0
         hopFill = 0
-        pingPong = 0
-        let n = Self.windowLength
-        analysis.update(repeating: 0, count: n)
-        overlap.update(repeating: 0, count: n)
-        history.update(repeating: 0, count: Self.historySize)
-        fifo.update(repeating: 0, count: Self.lead)
+        history.update(repeating: 0, count: historyMask + 1)
+        fifo.update(repeating: 0, count: lead)
         fifoRead = 0
-        fifoWrite = Self.lead
-        stateA.update(from: initialState, count: graph.stateSize)
+        fifoWrite = lead
+        kernel.reset()
     }
 
-    /// Consumes the hop sitting at the end of `analysis` and, once the window is full, emits one
-    /// enhanced hop into the FIFO. Returns false if inference failed.
+    /// Runs the kernel on the hop in `hopIn` and queues its output, with the matching dry
+    /// sample blended back in to cap the reduction. Returns false if the kernel failed.
     private func processHop() -> Bool {
-        let n = Self.windowLength, h = Self.hop
-        let base = hopsIn * h
-        for i in 0..<h {
-            history[(base + i) & (Self.historySize - 1)] = analysis[n - h + i]
-        }
-        hopsIn += 1
-        defer { analysis.update(from: analysis.advanced(by: h), count: n - h) }
-        guard hopsIn >= 2 else { return true }
-
-        // Analysis STFT frame (unnormalised, like numpy.fft.rfft).
-        vDSP_vmul(analysis, 1, window, 1, realIn, 1, vDSP_Length(n))
-        imagIn.update(repeating: 0, count: n)
-        vDSP_DFT_Execute(forwardDFT, realIn, imagIn, realOut, imagOut)
-        for k in 0..<Self.bins {
-            specIn[2 * k] = realOut[k]
-            specIn[2 * k + 1] = imagOut[k]
-        }
-
-        arguments[graph.stateInPosition].data_ptr = UnsafeMutableRawPointer(pingPong == 0 ? stateA : stateB)
-        arguments[graph.stateOutPosition].data_ptr = UnsafeMutableRawPointer(pingPong == 0 ? stateB : stateA)
-        let status = BNNSGraphContextExecute(context, nil, graph.argumentCount, arguments, workspaceSize,
-                                             workspace.assumingMemoryBound(to: CChar.self))
-        guard status == 0 else { return false }
-        pingPong = 1 - pingPong
-
-        // Rebuild the Hermitian spectrum and inverse-transform.
-        for k in 0..<Self.bins {
-            realIn[k] = specOut[2 * k]
-            imagIn[k] = specOut[2 * k + 1]
-        }
-        for k in Self.bins..<n {
-            realIn[k] = realIn[n - k]
-            imagIn[k] = -imagIn[n - k]
-        }
-        vDSP_DFT_Execute(inverseDFT, realIn, imagIn, realOut, imagOut)
-
-        // Synthesis window + overlap-add; the first hop is complete.
-        var scale = 1 / Float(n)
-        vDSP_vsmul(realOut, 1, &scale, realOut, 1, vDSP_Length(n))
-        vDSP_vma(realOut, 1, window, 1, overlap, 1, overlap, 1, vDSP_Length(n))
-
-        // Output sample j holds input sample j - modelDelay; blend that dry sample back in to
-        // cap the reduction. Frame k = hopsIn - 2 starts at input sample k * hop.
+        guard kernel.process(hopIn, hopOut) else { return false }
         let dryMix = Float(bitPattern: dryMixBits.load(ordering: .relaxed))
         let wetMix = 1 - dryMix
-        let outStart = (hopsIn - 2) * h - Self.modelDelay
-        let mask = Self.fifoSize - 1
-        for i in 0..<h {
+        let outStart = hops * hop - delay
+        for i in 0..<hop {
             let j = outStart + i
-            let dry = j >= 0 ? history[j & (Self.historySize - 1)] : 0
-            fifo[fifoWrite & mask] = wetMix * overlap[i] + dryMix * dry
+            let dry = j >= 0 ? history[j & historyMask] : 0
+            fifo[fifoWrite & fifoMask] = wetMix * hopOut[i] + dryMix * dry
             fifoWrite += 1
         }
-        overlap.update(from: overlap.advanced(by: h), count: n - h)
-        overlap.advanced(by: n - h).update(repeating: 0, count: h)
+        hops += 1
         return true
-    }
-}
-
-/// The DPDFNet model compiled for BNNS Graph. One instance serves every suppressor made from it
-/// (each gets its own context).
-final class NoiseSuppressionModel: Sendable {
-    fileprivate let graph: CompiledGraph
-
-    private init(graph: CompiledGraph) {
-        self.graph = graph
-    }
-
-    /// Loads the compiled model at `url` (an `.mlmodelc`). Slow: ~1.5 s to compile the first
-    /// time per model and OS build, ~30 ms from the cache after that. Never call it on the
-    /// audio thread or the routing queue.
-    static func load(from url: URL) -> NoiseSuppressionModel? {
-        CompiledGraph.load(model: url).map(NoiseSuppressionModel.init)
-    }
-
-    private enum BundledState {
-        case idle
-        case loading([@Sendable (Bool) -> Void])
-        case done(NoiseSuppressionModel?)
-    }
-
-    private static let bundledState = Mutex<BundledState>(.idle)
-
-    /// The model shipped in the app bundle, or nil until `loadBundled` has finished.
-    static var bundled: NoiseSuppressionModel? {
-        bundledState.withLock { state in
-            if case .done(let model) = state { return model }
-            return nil
-        }
-    }
-
-    /// Loads the bundled model on a background queue (once; later calls join or reuse it) and
-    /// then calls `done` with whether it loaded.
-    static func loadBundled(then done: @escaping @Sendable (Bool) -> Void) {
-        let start: Bool = bundledState.withLock { state in
-            switch state {
-            case .idle:
-                state = .loading([done])
-                return true
-            case .loading(let waiting):
-                state = .loading(waiting + [done])
-                return false
-            case .done(let model):
-                let loaded = model != nil
-                DispatchQueue.global(qos: .userInitiated).async { done(loaded) }
-                return false
-            }
-        }
-        guard start else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            var model: NoiseSuppressionModel?
-            if let url = Bundle.main.url(forResource: "DPDFNet2_48k", withExtension: "mlmodelc") {
-                model = load(from: url)
-            } else {
-                nsLogger.error("DPDFNet2_48k.mlmodelc missing from the app bundle")
-            }
-            let waiting: [@Sendable (Bool) -> Void] = bundledState.withLock { state in
-                defer { state = .done(model) }
-                if case .loading(let waiting) = state { return waiting }
-                return []
-            }
-            for callback in waiting { callback(model != nil) }
-        }
-    }
-}
-
-/// A model compiled for BNNS Graph. Compiling takes ~1.5 s, so the result is cached in Caches,
-/// keyed by the model's contents and the OS build. The graph lives in wired memory for the life
-/// of the process: a file mapping could be evicted and then page-fault from disk on the IO thread.
-private struct CompiledGraph: @unchecked Sendable {
-    let graph: bnns_graph_t
-    let stateSize: Int
-    /// Initial recurrent state: the model's norm-state prefix, then zeros.
-    let stateInit: [Float]
-    let argumentCount: Int
-    let specPosition: Int
-    let stateInPosition: Int
-    let specOutPosition: Int
-    let stateOutPosition: Int
-
-    static func load(model: URL) -> CompiledGraph? {
-        guard let data = try? Data(contentsOf: model.appending(path: "metadata.json")),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              let meta = json.first?["userDefinedMetadata"] as? [String: String],
-              let stateSize = meta["state_size"].flatMap(Int.init),
-              let prefix = meta["state_init"]?.split(separator: ",").compactMap({ Float($0) }),
-              prefix.count <= stateSize else {
-            nsLogger.error("Noise suppression model metadata lacks state_size/state_init")
-            return nil
-        }
-        let stateInit = prefix + [Float](repeating: 0, count: stateSize - prefix.count)
-
-        let cacheFile = cacheURL(for: model)
-        if let cacheFile, let graph = readWired(cacheFile) {
-            if let compiled = CompiledGraph(graph: graph, stateSize: stateSize, stateInit: stateInit) {
-                return compiled
-            }
-            munmap(graph.data, graph.size)
-            try? FileManager.default.removeItem(at: cacheFile)
-        }
-
-        let start = Date()
-        let options = BNNSGraphCompileOptionsMakeDefault()
-        defer { BNNSGraphCompileOptionsDestroy(options) }
-        // It runs inside the IO callback: no worker threads.
-        BNNSGraphCompileOptionsSetTargetSingleThread(options, true)
-        let graph = model.withUnsafeFileSystemRepresentation { BNNSGraphCompileFromFile($0!, nil, options) }
-        guard let data = graph.data else {
-            nsLogger.error("BNNSGraphCompileFromFile failed for the noise suppression model")
-            return nil
-        }
-        nsLogger.info("Compiled noise suppression graph in \(Int(Date().timeIntervalSince(start) * 1000)) ms")
-        mlock(data, graph.size)
-        if let cacheFile {
-            // .atomic writes a temporary file and renames it, so a crash never leaves a torn graph.
-            try? Data(bytesNoCopy: data, count: graph.size, deallocator: .none).write(to: cacheFile, options: .atomic)
-        }
-        return CompiledGraph(graph: graph, stateSize: stateSize, stateInit: stateInit)
-    }
-
-    private init?(graph: bnns_graph_t, stateSize: Int, stateInit: [Float]) {
-        func position(_ name: String) -> Int? {
-            let p = BNNSGraphGetArgumentPosition(graph, nil, name)
-            return p >= 0 ? p : nil
-        }
-        guard let spec = position("spec"), let stateIn = position("state_in"),
-              let specOut = position("spec_e"), let stateOut = position("state_out") else {
-            nsLogger.error("Noise suppression graph lacks the expected arguments")
-            return nil
-        }
-        self.graph = graph
-        self.stateSize = stateSize
-        self.stateInit = stateInit
-        argumentCount = BNNSGraphGetInputCount(graph, nil) + BNNSGraphGetOutputCount(graph, nil)
-        specPosition = spec
-        stateInPosition = stateIn
-        specOutPosition = specOut
-        stateOutPosition = stateOut
-    }
-
-    /// `Caches/<bundle id>/DPDFNet2_48k-<model hash>-<OS build>.bnnsgraph`; older entries are removed.
-    private static func cacheURL(for model: URL) -> URL? {
-        var hasher = SHA256()
-        for file in ["model.mil", "weights/weight.bin", "metadata.json"] {
-            guard let data = try? Data(contentsOf: model.appending(path: file), options: .mappedIfSafe) else { return nil }
-            hasher.update(data: data)
-        }
-        let modelHash = hasher.finalize().prefix(8).map { String(format: "%02x", $0) }.joined()
-        let os = ProcessInfo.processInfo.operatingSystemVersionString.filter { $0.isLetter || $0.isNumber || $0 == "." }
-        let name = "DPDFNet2_48k-\(modelHash)-\(os).bnnsgraph"
-
-        let fm = FileManager.default
-        guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
-        let dir = caches.appending(path: Bundle.main.bundleIdentifier ?? "com.jacobcoffee.loopbacker")
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        for stale in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        where stale.hasPrefix("DPDFNet2_48k-") && stale != name {
-            try? fm.removeItem(at: dir.appending(path: stale))
-        }
-        return dir.appending(path: name)
-    }
-
-    /// Reads a cached compiled graph into wired anonymous memory, kept for the process lifetime.
-    private static func readWired(_ url: URL) -> bnns_graph_t? {
-        let fd = url.withUnsafeFileSystemRepresentation { open($0!, O_RDONLY) }
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_size > 0 else { return nil }
-        let size = Int(info.st_size)
-        guard let data = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
-              data != MAP_FAILED else { return nil }
-        var done = 0
-        while done < size {
-            let n = read(fd, data + done, size - done)
-            guard n > 0 else {
-                munmap(data, size)
-                return nil
-            }
-            done += n
-        }
-        mlock(data, size)
-        return bnns_graph_t(data: data, size: size)
     }
 }

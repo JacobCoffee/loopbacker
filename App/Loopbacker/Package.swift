@@ -11,8 +11,13 @@ let package = Package(
         .executable(name: "Loopbacker", targets: ["Loopbacker"])
     ],
     targets: [
+        .target(
+            name: "CRNNoise",
+            path: "CRNNoise"
+        ),
         .executableTarget(
             name: "Loopbacker",
+            dependencies: ["CRNNoise"],
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),

@@ -116,15 +116,37 @@ struct MenuBarPanel: View {
     // MARK: - Noise suppression
 
     private var noiseSuppressionRow: some View {
-        let on = routingState.noiseSuppression.isEnabled
+        let settings = routingState.noiseSuppression
+        let on = settings.isEnabled
         return HStack(spacing: 10) {
             Image(systemName: "waveform.badge.minus")
                 .font(.body)
                 .foregroundStyle(on ? AnyShapeStyle(.loopbacker) : AnyShapeStyle(.secondary))
                 .frame(width: 20)
+                .accessibilityHidden(true)
 
-            Text("Noise Suppression")
-                .font(.callout)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Noise Suppression")
+                    .font(.callout)
+                Picker("Engine", selection: Binding(
+                    get: { settings.engine },
+                    set: { engine in
+                        routingState.noiseSuppression.engine = engine
+                        routingState.save()
+                    }
+                )) {
+                    ForEach(NoiseSuppressionEngine.allCases) { engine in
+                        let profile = NoiseEngineProfile.of(engine)
+                        Text("\(profile.name) · \(profile.latencyMs) ms").tag(engine)
+                    }
+                }
+                .pickerStyle(.menu)
+                .menuStyle(.borderlessButton)
+                .labelsHidden()
+                .controlSize(.mini)
+                .fixedSize()
+                .help("Noise suppression engine: DPDFNet cleans up more, RNNoise adds less delay")
+            }
 
             Spacer(minLength: 8)
 
@@ -133,8 +155,6 @@ struct MenuBarPanel: View {
                 set: { newValue in
                     routingState.noiseSuppression.isEnabled = newValue
                     routingState.save()
-                    // The main window may be closed, so push to the engine directly.
-                    audioRouter.updateNoiseSuppression(routingState.noiseSuppression)
                 }
             ))
             .labelsHidden()
@@ -143,8 +163,7 @@ struct MenuBarPanel: View {
             .tint(.loopbacker)
             .help("Remove background noise from mic inputs")
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Noise Suppression, \(on ? "on" : "off")")
+        .accessibilityElement(children: .contain)
     }
 
     // MARK: - Actions

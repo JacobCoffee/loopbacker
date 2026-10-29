@@ -461,35 +461,55 @@ every level has decayed to zero and that has been shown, ticks do nothing until 
 
 ## Noise Suppression
 
-`NoiseSuppressor` runs CEVA's DPDFNet2 48 kHz model (Apache-2.0) on the CPU through BNNS
-Graph. Only routes fed by a physical input use it (mic → virtual mic, mic → monitor); app
-captures and output routes don't. It is created on the router queue the first time it is
-enabled and kept for the route's lifetime.
+`NoiseSuppressor` runs one of two engines (`DenoiseKernel`s) on the CPU, inline in the capture
+callback. Only routes fed by a physical input use it (mic → virtual mic, mic → monitor); app
+captures and output routes don't.
 
-BNNS Graph executes a compiled graph with caller-provided workspace and buffers, with no
-allocation, locks or thread hops, so inference runs inline in the capture callback: ~0.75 ms
-per 10 ms hop on an M4 Max (p99 ~1.3 ms per 512-frame callback). The callback downmixes
-channels 1–2 to mono, runs the 20 ms Vorbis-window STFT (10 ms hop), one model execution per
-hop with a ping-pong recurrent state, ISTFT/overlap-add, and blends the dry signal (delayed by
-the model's 4-hop lookahead) back in at the user's max-reduction level. The workspace and
-every buffer the callback touches live in one `mlock`ed mapping; the compiled graph is read
-into wired memory too, since a file mapping could page-fault from disk mid-callback.
+- **DPDFNet** (`DPDFNetKernel`): CEVA's DPDFNet2 48 kHz model (Apache-2.0) through BNNS Graph,
+  which executes a compiled graph with caller-provided workspace and buffers, with no
+  allocation, locks or thread hops: ~0.6 ms per 10 ms hop on an M4 Max (p99 ~1.3 ms per
+  512-frame callback). A 20 ms Vorbis-window STFT (10 ms hop), one model execution per hop with
+  a ping-pong recurrent state, then ISTFT/overlap-add. The workspace and buffers live in one
+  `mlock`ed mapping; the compiled graph is read into wired memory too, since a file mapping
+  could page-fault from disk mid-callback. Kernel delay: 2400 samples (4 hops of model
+  lookahead plus a hop for the second half of the analysis window).
+- **RNNoise** (`RNNoiseKernel`): Xiph's RNNoise v0.2 (BSD-3-Clause), vendored as the `CRNNoise`
+  C target with its default model compiled in. ~0.2 ms per hop. `rnnoise_init(_, NULL)` resets
+  state without allocating. Kernel delay: 960 samples (analysis over two frames, plus
+  overlap-add). Its state and scratch buffers are `mlock`ed; the weights stay in the binary's
+  read-only data (mlock refuses those pages) and are read every hop.
 
-Compiling the model takes ~1.5 s, so the compiled graph (`NoiseSuppressionModel`) is cached in
+The engine-independent part is `NoiseSuppressor`: it downmixes channels 1–2 to mono, feeds
+the kernel 480-sample hops, and blends the dry signal (delayed by the kernel's delay) back in
+at the user's max-reduction level. Its buffers are `mlock`ed as well.
+
+Compiling DPDFNet takes ~1.5 s, so the compiled graph (`NoiseSuppressionModel`) is cached in
 `~/Library/Caches/<bundle id>/`, keyed by a hash of the model and the OS build; loading from
 the cache takes ~30 ms. Either way it loads on a background queue: routes start immediately,
 and the router attaches suppressors when the model is ready, which then fade in as usual.
+
+The audio thread reaches the suppressor through an unretained atomic pointer
+(`RouteContext.noiseSlot`), so the router queue can swap it at any time. The router attaches a
+suppressor when suppression is on, the engine matches, and the source hasn't opted out
+(`AudioSource.noiseSuppression`). Otherwise it fades the suppressor to dry (10 ms), clears the
+slot after 100 ms, and drops its reference 0.5 s later, once no callback can still be inside
+it. Switching engines goes old wet → dry → new wet with no click. The router holds the DPDFNet
+model weakly, so the model (~13 MB) is freed with the last kernel that uses it.
+
+`NoiseEngineBenchmark` times 200 hops of each engine once per launch, when the Effects section
+first shows the picker. It recommends DPDFNet while that takes at most 20% of a core (one
+512-frame callback can run two hops alongside the mix and effects), and RNNoise otherwise.
 
 The virtual mic route and the monitor route of the same mic share one suppressor. They mix
 identically, and the HAL calls both input callbacks back to back on the device's IO thread
 with the same sample time, so the first computes the block and the second copies it (a busy
 flag leaves a block dry if two threads ever collided).
 
-Latency is a constant 60 ms (2879 samples) regardless of buffer size: 40 ms of model lookahead
-plus up to 20 ms waiting for the second half of a hop's analysis window. Switching on passes
-the dry signal until real output arrives, then crossfades over 10 ms; switching off crossfades
-back. The model only runs at 48 kHz; a monitor route on a device at another rate logs and stays
-dry.
+Latency is constant regardless of buffer size: the kernel's delay plus up to a hop waiting for
+the current hop to fill. That's 60 ms (2879 samples) for DPDFNet and 30 ms (1439) for RNNoise.
+Switching on passes the dry signal until real output arrives, then crossfades over 10 ms;
+switching off crossfades back. Suppression only runs at 48 kHz; a monitor route on a device at
+another rate logs and stays dry.
 
 `scripts/convert-dpdfnet.py` rebuilds `App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc` from
 pinned upstream code and weights. It replaces the DPRNN blocks' bidirectional `nn.GRU`s with

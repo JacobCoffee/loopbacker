@@ -3,6 +3,7 @@ import AppKit
 import CoreAudio
 import AudioToolbox
 import Combine
+import Synchronization
 import os.log
 
 private let logger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "AudioRouter")
@@ -17,8 +18,14 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     /// Current effects preset — applied to new routes and propagated to existing ones
     var currentEffectsPreset = EffectsPreset()
-    /// Noise suppression settings; read and written only on `queue`.
+    /// Noise suppression settings and opted-out capture devices; read and written only on `queue`.
     private var noiseSuppression = NoiseSuppressionSettings()
+    private var noiseExcludedDevices: Set<String> = []
+    /// The DPDFNet model while any kernel uses it. Kernels hold it strongly, so it's freed with
+    /// the last one (engine switched, suppression off, opted out, or route stopped). Queue only.
+    private weak var dpdfnetModel: NoiseSuppressionModel?
+    private var dpdfnetLoading = false
+    private var dpdfnetLoadFailed = false
 
     // MARK: - Internal state
 
@@ -82,10 +89,15 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// noise suppression: app captures carry music/game audio, and output routes replay the
         /// already-processed virtual device.
         let isVoiceInput: Bool
-        /// Created on `queue` the first time suppression is enabled, then kept until the route
-        /// is gone, so the audio thread never races its release. Shared with the other voice
-        /// route on the same capture device (virtual mic + monitor), which runs the same mix.
-        var noiseSuppressor: NoiseSuppressor?
+        /// The suppressor the audio thread runs, published unretained so `queue` can swap it
+        /// without racing a release on the audio thread. `noiseOwner` holds the strong reference.
+        /// Shared with the other voice route on the same capture device (virtual mic + monitor),
+        /// which runs the same mix.
+        let noiseSlot = Atomic<Unmanaged<NoiseSuppressor>?>(nil)
+        /// Queue only.
+        private(set) var noiseOwner: NoiseSuppressor?
+        /// Queue only: fading out ahead of `detachNoiseSuppressor`.
+        var noiseDetaching = false
 
         // Meter levels -- C buffers written on the RT thread, read and decayed on main.
         // Source levels are per captured channel; output levels are per playback channel.
@@ -138,6 +150,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             mixMatrix.deallocate()
         }
 
+        /// Queue only.
+        func attachNoiseSuppressor(_ suppressor: NoiseSuppressor) {
+            noiseOwner = suppressor
+            noiseSlot.store(.passUnretained(suppressor), ordering: .releasing)
+        }
+
+        /// Queue only. Unpublishes the suppressor and hands back the strong reference: an audio
+        /// callback may still be inside it, so the caller must keep it alive a while longer.
+        func detachNoiseSuppressor() -> NoiseSuppressor? {
+            noiseSlot.store(nil, ordering: .releasing)
+            defer { noiseOwner = nil }
+            return noiseOwner
+        }
+
         /// Grow the block buffers. Only call before the route's callbacks are running.
         func reserveBlockFrames(_ frames: UInt32) {
             guard frames > blockFrames else { return }
@@ -164,7 +190,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
-            noiseSuppressor?.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
+            if let suppressor = noiseSlot.load(ordering: .acquiring) {
+                suppressor._withUnsafeGuaranteedRef {
+                    $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
+                }
+            }
             effectsChain?.process(mixBuffer, frames: frames, channels: outputChannels)
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
@@ -613,44 +643,108 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Noise suppression
 
     /// Apply noise suppression settings to every voice-input route, and to routes started later.
-    func updateNoiseSuppression(_ settings: NoiseSuppressionSettings) {
+    /// - Parameter excludedDeviceUIDs: capture devices whose source opted out.
+    func updateNoiseSuppression(_ settings: NoiseSuppressionSettings, excludedDeviceUIDs: Set<String>) {
         queue.async { [weak self] in
             guard let self else { return }
             self.noiseSuppression = settings
+            self.noiseExcludedDevices = excludedDeviceUIDs
             self.applyNoiseSuppressionToAllRoutes()
         }
     }
 
     /// Must run on `queue`.
-    private func applyNoiseSuppressionToAllRoutes() {
-        for ctx in activeRoutes.values { applyNoiseSuppression(to: ctx) }
-        for ctx in activeOutputRoutes.values { applyNoiseSuppression(to: ctx) }
+    private var voiceContexts: [RouteContext] {
+        (Array(activeRoutes.values) + Array(activeOutputRoutes.values)).filter(\.isVoiceInput)
     }
 
-    /// Must run on `queue`. Voice routes on the same capture device share one suppressor. The
-    /// model loads in the background the first time (~1.5 s compile after an app or OS update,
-    /// ~30 ms from cache), so routes start right away and suppression fades in once it's ready.
+    /// Must run on `queue`.
+    private func applyNoiseSuppressionToAllRoutes() {
+        for ctx in voiceContexts { applyNoiseSuppression(to: ctx) }
+    }
+
+    /// Must run on `queue`. Gives `ctx` a suppressor running the selected engine, or takes it
+    /// away. Voice routes on the same capture device share one suppressor. Suppressors nobody
+    /// wants (off, opted out, or the other engine) fade out and are freed, and with them the
+    /// DPDFNet model once nothing uses it.
     private func applyNoiseSuppression(to ctx: RouteContext) {
-        guard ctx.isVoiceInput else { return }
+        guard ctx.isVoiceInput, !ctx.noiseDetaching else { return }
         let settings = noiseSuppression
-        if settings.isEnabled && ctx.noiseSuppressor == nil {
-            let sibling = (Array(activeRoutes.values) + Array(activeOutputRoutes.values)).first {
-                $0 !== ctx && $0.isVoiceInput && $0.captureDeviceUID == ctx.captureDeviceUID
-                    && $0.sampleRate == ctx.sampleRate && $0.noiseSuppressor != nil
-            }
-            if let shared = sibling?.noiseSuppressor {
-                ctx.noiseSuppressor = shared
-            } else if let model = NoiseSuppressionModel.bundled {
-                ctx.noiseSuppressor = NoiseSuppressor.make(sampleRate: ctx.sampleRate, model: model)
+        let wanted = settings.isEnabled && !noiseExcludedDevices.contains(ctx.captureDeviceUID)
+
+        if let current = ctx.noiseOwner {
+            if wanted && current.engine == settings.engine {
+                current.setMaxReduction(dB: settings.maxReductionDB)
+                current.setEnabled(true)
             } else {
-                NoiseSuppressionModel.loadBundled { [weak self] loaded in
-                    guard loaded, let self else { return }
-                    self.queue.async { self.applyNoiseSuppressionToAllRoutes() }
+                fadeOutNoiseSuppressor(of: ctx)
+            }
+            return
+        }
+        guard wanted else { return }
+
+        let sibling = voiceContexts.first {
+            $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID && $0.sampleRate == ctx.sampleRate
+                && !$0.noiseDetaching && $0.noiseOwner?.engine == settings.engine
+        }
+        if let shared = sibling?.noiseOwner {
+            ctx.attachNoiseSuppressor(shared)
+            return
+        }
+        guard let kernel = makeNoiseKernel(settings.engine),
+              let suppressor = NoiseSuppressor.make(sampleRate: ctx.sampleRate, engine: settings.engine, kernel: kernel)
+        else { return }
+        suppressor.setMaxReduction(dB: settings.maxReductionDB)
+        suppressor.setEnabled(true)
+        ctx.attachNoiseSuppressor(suppressor)
+        logger.info("Noise suppression (\(settings.engine.rawValue, privacy: .public)) started on \(ctx.captureDeviceUID)")
+    }
+
+    /// Must run on `queue`. Crossfades `ctx`'s suppressor to dry (10 ms), then detaches it and
+    /// re-applies the settings, which may attach the other engine. Waiting out the fade keeps
+    /// an engine switch click-free: old wet → dry → new wet.
+    private func fadeOutNoiseSuppressor(of ctx: RouteContext) {
+        guard let current = ctx.noiseOwner else { return }
+        ctx.noiseDetaching = true
+        let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.noiseOwner === current && !$0.noiseDetaching }
+        if !sharedWithKeeper { current.setEnabled(false) }
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            let old = ctx.detachNoiseSuppressor()
+            ctx.noiseDetaching = false
+            // An audio callback that loaded the slot just before it was cleared may still be
+            // running `old`; one IO cycle is a few ms, so half a second is ample.
+            self?.queue.asyncAfter(deadline: .now() + 0.5) { withExtendedLifetime(old) {} }
+            guard let self, self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.applyNoiseSuppression(to: ctx)
+        }
+    }
+
+    /// Must run on `queue`. Nil while the DPDFNet model is still loading: the load runs in the
+    /// background (~1.5 s compile after an app or OS update, ~30 ms from cache) and re-applies
+    /// the settings when done, so routes start right away and suppression fades in later.
+    private func makeNoiseKernel(_ engine: NoiseSuppressionEngine) -> (any DenoiseKernel)? {
+        switch engine {
+        case .rnnoise:
+            return RNNoiseKernel.make()
+        case .dpdfnet:
+            if let model = dpdfnetModel { return DPDFNetKernel(model: model) }
+            guard !dpdfnetLoading, !dpdfnetLoadFailed else { return nil }
+            dpdfnetLoading = true
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let model = NoiseSuppressionModel.loadBundled()
+                guard let self else { return }
+                self.queue.async {
+                    self.dpdfnetLoading = false
+                    guard let model else {
+                        self.dpdfnetLoadFailed = true
+                        return
+                    }
+                    self.dpdfnetModel = model
+                    self.applyNoiseSuppressionToAllRoutes()
                 }
             }
+            return nil
         }
-        ctx.noiseSuppressor?.setMaxReduction(dB: settings.maxReductionDB)
-        ctx.noiseSuppressor?.setEnabled(settings.isEnabled)
     }
 
     // MARK: - Meter timer
