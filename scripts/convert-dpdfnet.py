@@ -22,6 +22,16 @@ The model consumes one 20 ms STFT frame (481 bins, real/imag) plus a flat recurr
 returns the enhanced frame plus the next state. STFT/ISTFT and overlap-add live in Swift
 (NoiseSuppressor.swift). The initial state is stored in the model's metadata so the app needs
 no side files.
+
+Weights are converted in fp32, then compressed to fp16 storage via a `constexpr_cast` MIL pass
+(see `compress_weights_fp16`): each weight becomes an fp16 `const` plus a `constexpr_cast` back
+to fp32, so every op still computes in fp32 (unlike `compute_precision=FLOAT16`, which also runs
+the arithmetic in fp16 and collapsed this model's output to ~9 dB SNR). `constexpr_cast` is a
+"weight compression" op that MIL's constant-folding passes are specifically written to leave
+alone, unlike a plain `cast`, which gets folded straight back into an fp32 `const` and undoes the
+compression. Measured on this model: ~63.5 dB SNR vs the uncompressed fp32 model over 500+
+stateful frames, compiled size 12.7 MB -> 7.4 MB, and no measurable BNNS Graph hop-time or
+compile-time regression (weights are decompressed to fp32 once at BNNS compile time).
 """
 
 from __future__ import annotations
@@ -54,6 +64,56 @@ def checkout_upstream(workdir: Path) -> Path:
     subprocess.run(["git", "clone", "--quiet", DPDFNET_REPO, str(src)], check=True)
     subprocess.run(["git", "-C", str(src), "checkout", "--quiet", DPDFNET_COMMIT], check=True)
     return src
+
+
+def compress_weights_fp16(mlmodel: "ct.models.MLModel") -> "ct.models.MLModel":
+    """Rewrite every fp32 weight ``const`` as an fp16 ``const`` plus a ``constexpr_cast`` back to
+    fp32, halving most of the weight storage while every op still computes in fp32.
+
+    ``constexpr_cast`` (unlike a plain ``cast``) is a MIL "weight compression" op: the MIL var
+    machinery marks its output as non-foldable (``Var._is_nonreplaceable_var``), so the
+    const-folding passes that otherwise run twice more during mlprogram backend lowering leave it
+    alone instead of baking it back into a plain fp32 const.
+    """
+    from coremltools.converters.mil.mil import Builder as mb
+    from coremltools.converters.mil.mil import types
+    from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+    from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+    from coremltools.models import utils as model_utils
+
+    @register_pass(namespace="loopbacker", override=True)
+    class _compress_weights_fp16(AbstractGraphPass):
+        min_size = 4  # skip true scalars (eps, norm constants, etc.): not worth a cast op.
+        max_abs = 65504.0  # fp16 max; DPDFNet weights never approach this.
+
+        def apply(self, prog):
+            for f in prog.functions.values():
+                self._walk(f)
+
+        def _walk(self, block):
+            for op in list(block.operations):
+                for b in op.blocks:
+                    self._walk(b)
+                if op.op_type == "const":
+                    self._maybe_compress(block, op)
+
+        def _maybe_compress(self, block, op):
+            var = op.outputs[0]
+            if var.dtype != types.fp32:
+                return
+            val = var.val
+            if val is None or not isinstance(val, np.ndarray) or val.size < self.min_size:
+                return
+            if np.max(np.abs(val)) > self.max_abs:
+                return
+            with block:
+                fp16_const = mb.const(val=val.astype(np.float16), name=var.name + "_fp16", before_op=op)
+                upcast = mb.constexpr_cast(source_val=fp16_const, output_dtype="fp32",
+                                           name=var.name + "_fp16_to_fp32", before_op=op)
+            block.replace_uses_of_var_after_op(anchor_op=op, old_var=var, new_var=upcast, force_replace=True)
+            block.remove_ops([op])
+
+    return model_utils._apply_graph_pass(mlmodel, _compress_weights_fp16(), skip_model_load=False)
 
 
 def register_unsafe_chunk() -> None:
@@ -177,7 +237,7 @@ def parity_frames(bins: int) -> list[np.ndarray]:
     for start in range(0, len(audio) - win_len, hop):
         spec = np.fft.rfft(audio[start:start + win_len] * window)
         frames.append(np.stack([spec.real, spec.imag], -1).astype(np.float32)[None, None])
-    frames += [(rng.standard_normal((1, 1, bins, 2)) * 3).astype(np.float32) for _ in range(100)]
+    frames += [(rng.standard_normal((1, 1, bins, 2)) * 3).astype(np.float32) for _ in range(110)]
     return frames
 
 
@@ -233,29 +293,54 @@ def main() -> None:
         meta["state_init"] = ",".join(format(float(v), ".9g") for v in init_state[:norm_size].numpy())
         meta["source_commit"] = DPDFNET_COMMIT
         meta["weights_revision"] = HF_REVISION
+        fp16w = compress_weights_fp16(mlmodel)
+        fp16w.author = mlmodel.author
+        fp16w.license = mlmodel.license
+        fp16w.short_description = mlmodel.short_description
+        for key, value in meta.items():
+            fp16w.user_defined_metadata[key] = value
 
-        # Parity against the unmodified upstream model, carrying state frame to frame as the
-        # app does, so it also covers the GRU rewrite.
+        # Parity against the unmodified upstream model, carrying state frame to frame as the app
+        # does, so it also covers the GRU rewrite. Also tracks the fp16-weight model against both
+        # PyTorch and the fp32 Core ML model, to size the precision loss from weight compression.
         torch_state = init_state.clone()
-        coreml_state = init_state.numpy().copy()
+        fp32_state = init_state.numpy().copy()
+        fp16_state = init_state.numpy().copy()
         signal = error = worst = 0.0
+        fp16_vs_torch_sig = fp16_vs_torch_err = 0.0
+        fp16_vs_fp32_sig = fp16_vs_fp32_err = 0.0
         frames = parity_frames(bins)
         for spec in frames:
             with torch.no_grad():
                 ref, torch_state = reference(torch.from_numpy(spec), torch_state)
-            out = mlmodel.predict({"spec": spec, "state_in": coreml_state})
-            coreml_state = out["state_out"].astype(np.float32)
             ref = ref.numpy()
+
+            out = mlmodel.predict({"spec": spec, "state_in": fp32_state})
+            fp32_state = out["state_out"].astype(np.float32)
             signal += float((ref ** 2).sum())
             error += float(((ref - out["spec_e"]) ** 2).sum())
             worst = max(worst, float(np.abs(out["spec_e"] - ref).max()) / (float(np.abs(ref).max()) or 1.0))
+
+            out16 = fp16w.predict({"spec": spec, "state_in": fp16_state})
+            fp16_state = out16["state_out"].astype(np.float32)
+            fp16_vs_torch_sig += float((ref ** 2).sum())
+            fp16_vs_torch_err += float(((ref - out16["spec_e"]) ** 2).sum())
+            fp16_vs_fp32_sig += float((out["spec_e"] ** 2).sum())
+            fp16_vs_fp32_err += float(((out["spec_e"] - out16["spec_e"]) ** 2).sum())
         snr = 10 * math.log10(signal / error)
-        print(f"vs upstream PyTorch over {len(frames)} frames: SNR {snr:.1f} dB, worst frame {worst:.2e}")
+        print(f"fp32 vs upstream PyTorch over {len(frames)} frames: SNR {snr:.1f} dB, worst frame {worst:.2e}")
         if worst > 1e-3:
             raise SystemExit("Core ML output diverges from PyTorch")
 
+        snr_fp16_torch = 10 * math.log10(fp16_vs_torch_sig / fp16_vs_torch_err)
+        snr_fp16_fp32 = 10 * math.log10(fp16_vs_fp32_sig / fp16_vs_fp32_err)
+        print(f"fp16-weight vs upstream PyTorch: SNR {snr_fp16_torch:.1f} dB")
+        print(f"fp16-weight vs fp32 Core ML: SNR {snr_fp16_fp32:.1f} dB")
+        if snr_fp16_fp32 < 50.0:
+            raise SystemExit("fp16-weight compression diverges from the fp32 model (measured ~63.5 dB)")
+
         package = workdir / "DPDFNet2_48k.mlpackage"
-        mlmodel.save(str(package))
+        fp16w.save(str(package))
         compiled = workdir / "compiled"
         compiled.mkdir()
         subprocess.run(["xcrun", "coremlcompiler", "compile", str(package), str(compiled)], check=True,
