@@ -24,6 +24,9 @@ private let nsLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category:
 /// - The worker owns the model and STFT state, plus the ring ends opposite the audio thread.
 ///   The audio thread starts a session (an enabled stretch) only after the worker has cleared
 ///   everything and published `workerReady`; it ends one by clearing `workerReady`.
+/// - The worker runs with a real-time (time-constraint) policy. At normal priority a busy
+///   machine (e.g. a browser in a video call) stalled it for 30–100 ms, past the ~20 ms the
+///   rings allow, so the voice kept dropping back to the unprocessed mic.
 final class NoiseSuppressor: @unchecked Sendable {
     static let sampleRate: Float64 = 48_000
 
@@ -167,7 +170,6 @@ final class NoiseSuppressor: @unchecked Sendable {
 
         let worker = Thread { [self] in runWorker() }
         worker.name = "Loopbacker noise suppression"
-        worker.qualityOfService = .userInteractive
         worker.start()
         // First wake: the worker resets and publishes `workerReady`, opening the first session.
         wake.signal()
@@ -273,6 +275,7 @@ final class NoiseSuppressor: @unchecked Sendable {
     // MARK: - Worker thread
 
     private func runWorker() {
+        Self.makeCurrentThreadRealTime()
         while true {
             wake.wait()
             if stopRequested.load(ordering: .acquiring) { return }
@@ -372,6 +375,28 @@ final class NoiseSuppressor: @unchecked Sendable {
         // Full only if the audio thread stopped reading mid-session; drop the hop then.
         _ = output.write(hopOut, count: h)
         return true
+    }
+
+    /// Each wake processes a block's worth of hops (~1.5 ms per hop); the deadline is one hop.
+    private static func makeCurrentThreadRealTime() {
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        func ticks(ms: Double) -> UInt32 {
+            UInt32(ms * 1_000_000 * Double(timebase.denom) / Double(timebase.numer))
+        }
+        var policy = thread_time_constraint_policy_data_t(
+            period: ticks(ms: 10), computation: ticks(ms: 5), constraint: ticks(ms: 10), preemptible: 1)
+        let count = mach_msg_type_number_t(
+            MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &policy) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                  thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), $0, count)
+            }
+        }
+        if result != KERN_SUCCESS {
+            nsLogger.error("Could not make the noise suppression thread real-time: \(result)")
+        }
     }
 }
 
