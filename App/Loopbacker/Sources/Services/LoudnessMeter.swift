@@ -27,13 +27,6 @@ final class LoudnessMeter {
     private struct ChannelFilterState {
         var s1z1: Double = 0, s1z2: Double = 0
         var s2z1: Double = 0, s2z2: Double = 0
-        // True-peak oversampling: last two raw samples, for Catmull-Rom interpolation of the
-        // intersample points between them (an approximation of BS.1770 Annex 2's polyphase FIR
-        // oversampler — real-time safe and allocation-free, at the cost of some precision vs.
-        // the standard's exact filter; true peak isn't part of the LUFS agreement acceptance
-        // test, only a UI readout).
-        var peakPrev2: Double = 0, peakPrev1: Double = 0
-        var hasPeakHistory = false
     }
 
     private let stage1: Biquad
@@ -43,6 +36,42 @@ final class LoudnessMeter {
     /// on every channel.
     private let channelWeights: [Double]
     private var filterState: [ChannelFilterState]
+
+    // MARK: - True peak (ITU-R BS.1770-4/5 Annex 2): 4x oversampling via a 48-tap, 4-phase
+    // polyphase FIR -- the standard's published example filter, exact coefficients (not a
+    // generated approximation). Each phase is a 12-tap FIR against a 12-sample circular history
+    // per channel; every incoming sample produces 4 interpolated points 1/4 sample apart, and
+    // the true peak is the max |value| seen across all of them.
+
+    private static let truePeakTaps = 12
+    private static let truePeakCoefficients: [[Double]] = [
+        [
+            0.001708984375, 0.010986328125, -0.0196533203125, 0.033203125,
+            -0.0594482421875, 0.1373291015625, 0.97216796875, -0.102294921875,
+            0.047607421875, -0.026611328125, 0.014892578125, -0.00830078125,
+        ],
+        [
+            -0.0291748046875, 0.029296875, -0.0517578125, 0.089111328125, -0.16650390625,
+            0.465087890625, 0.77978515625, -0.2003173828125, 0.1015625, -0.0582275390625,
+            0.0330810546875, -0.0189208984375,
+        ],
+        [
+            -0.0189208984375, 0.0330810546875, -0.0582275390625, 0.1015625,
+            -0.2003173828125, 0.77978515625, 0.465087890625, -0.16650390625,
+            0.089111328125, -0.0517578125, 0.029296875, -0.0291748046875,
+        ],
+        [
+            -0.00830078125, 0.014892578125, -0.026611328125, 0.047607421875,
+            -0.102294921875, 0.97216796875, 0.1373291015625, -0.0594482421875,
+            0.033203125, -0.0196533203125, 0.010986328125, 0.001708984375,
+        ],
+    ]
+    /// `channelCount * truePeakTaps` circular history, laid out per channel: `history[ch *
+    /// truePeakTaps ..< (ch + 1) * truePeakTaps]`. Preallocated in `init`, mutated in place.
+    private var truePeakHistory: UnsafeMutablePointer<Double>
+    /// Per-channel write position within its 12-slot history (the index holding the most
+    /// recently pushed sample).
+    private var truePeakWriteIndex: UnsafeMutablePointer<Int>
 
     // MARK: - 100 ms step accumulation (400 ms gating blocks step every 100 ms, 75% overlap)
 
@@ -95,6 +124,10 @@ final class LoudnessMeter {
         self.channelWeights = Array(repeating: 1.0, count: channelCount)
         (stage1, stage2) = Self.kWeightingCoefficients(sampleRate: sampleRate)
         filterState = Array(repeating: ChannelFilterState(), count: channelCount)
+        truePeakHistory = .allocate(capacity: channelCount * Self.truePeakTaps)
+        truePeakHistory.initialize(repeating: 0, count: channelCount * Self.truePeakTaps)
+        truePeakWriteIndex = .allocate(capacity: channelCount)
+        truePeakWriteIndex.initialize(repeating: 0, count: channelCount)
         stepFrames = max(1, Int((sampleRate * 0.1).rounded()))
         stepSumSquares = Array(repeating: 0, count: channelCount)
 
@@ -124,6 +157,8 @@ final class LoudnessMeter {
         momentaryPtr.deallocate()
         shortTermPtr.deallocate()
         truePeakPtr.deallocate()
+        truePeakHistory.deallocate()
+        truePeakWriteIndex.deallocate()
     }
 
     /// Derives the two K-weighting biquad stages for a given sample rate from BS.1770-4 Annex 1's
@@ -188,7 +223,7 @@ final class LoudnessMeter {
                 let x = Double(buffer[frame * channels + ch])
                 let y = kWeight(x, &filterState[ch])
                 stepSumSquares[ch] += y * y
-                accumulateTruePeak(x, &filterState[ch])
+                accumulateTruePeak(x, channel: ch)
             }
             stepSampleCount += 1
             frame += 1
@@ -200,35 +235,32 @@ final class LoudnessMeter {
         }
     }
 
-    /// Catmull-Rom interpolation between the previous two raw samples and the new one, tracking
-    /// the peak across the 4x-oversampled intersample points.
+    /// Pushes one raw sample into the channel's 12-sample circular history, then runs all 4
+    /// polyphase FIR phases against it -- 4 points spaced 1/4 sample apart, interpolating the
+    /// continuous-time waveform between this sample and its neighbors per BS.1770-4/5 Annex 2.
+    /// Tracks the peak across all 4 phases (and so implicitly the original samples too: one
+    /// phase's dominant tap sits near unity gain, close to a pass-through).
     @inline(__always)
-    private func accumulateTruePeak(_ x: Double, _ state: inout ChannelFilterState) {
-        defer {
-            state.peakPrev2 = state.peakPrev1
-            state.peakPrev1 = x
-            state.hasPeakHistory = true
+    private func accumulateTruePeak(_ x: Double, channel: Int) {
+        let taps = Self.truePeakTaps
+        let base = channel * taps
+        let head = truePeakWriteIndex[channel]
+        truePeakHistory[base + head] = x
+
+        for phase in 0..<Self.truePeakCoefficients.count {
+            let coeffs = Self.truePeakCoefficients[phase]
+            var acc = 0.0
+            var lag = 0
+            while lag < taps {
+                let idx = base + (head - lag + taps) % taps
+                acc += coeffs[lag] * truePeakHistory[idx]
+                lag += 1
+            }
+            let a = abs(acc)
+            if a > stepPeak { stepPeak = a }
         }
-        var peak = abs(x)
-        guard state.hasPeakHistory else {
-            if peak > stepPeak { stepPeak = peak }
-            return
-        }
-        let p0 = state.peakPrev2, p1 = state.peakPrev1, p2 = x, p3 = x
-        for tap in 1..<4 {
-            let t = Double(tap) / 4.0
-            let t2 = t * t
-            let t3 = t2 * t
-            let interp = 0.5 * (
-                (2 * p1)
-                + (-p0 + p2) * t
-                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-            )
-            let a = abs(interp)
-            if a > peak { peak = a }
-        }
-        if peak > stepPeak { stepPeak = peak }
+
+        truePeakWriteIndex[channel] = (head + 1) % taps
     }
 
     private func finalizeStep() {

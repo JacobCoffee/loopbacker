@@ -59,13 +59,16 @@ final class SoundboardPlayer: ObservableObject {
         var globalVolume: Float = 1.0
         var done: Bool = false
         var meterLevel: Float = 0.0
+        /// True for the loopback (virtual mic) unit's state, false for the speaker unit's --
+        /// only the former contributes to `MicLoudnessBus`.
+        let feedsVirtualMic: Bool
 
         var activeFrameCount: UInt32 { endFrame > startFrame ? endFrame - startFrame : 0 }
 
         init(
             buffer: DecodedBuffer, startFrame: UInt32, endFrame: UInt32,
             fadeInFrames: UInt32, fadeOutFrames: UInt32, loop: Bool,
-            volume: Float, globalVolume: Float
+            volume: Float, globalVolume: Float, feedsVirtualMic: Bool
         ) {
             self.buffer = buffer
             self.startFrame = startFrame
@@ -75,6 +78,7 @@ final class SoundboardPlayer: ObservableObject {
             self.loop = loop
             self.volume = volume
             self.globalVolume = globalVolume
+            self.feedsVirtualMic = feedsVirtualMic
         }
     }
 
@@ -274,11 +278,11 @@ private actor SoundboardEngine {
         let totalVolume = item.volume * gainOffsetLinear
         let chokeGroup = (item.chokeGroup?.isEmpty == false) ? item.chokeGroup : nil
 
-        func makeState() -> RenderState {
+        func makeState(feedsVirtualMic: Bool) -> RenderState {
             RenderState(
                 buffer: decoded, startFrame: startFrame, endFrame: endFrame,
                 fadeInFrames: fadeInFrames, fadeOutFrames: fadeOutFrames, loop: loop,
-                volume: totalVolume, globalVolume: globalVolume
+                volume: totalVolume, globalVolume: globalVolume, feedsVirtualMic: feedsVirtualMic
             )
         }
 
@@ -287,7 +291,7 @@ private actor SoundboardEngine {
         // Speaker state + unit (so the user hears the sound), unless the pad targets the
         // virtual mic only.
         if item.outputTarget == .virtualMicAndSpeakers {
-            let spkState = makeState()
+            let spkState = makeState(feedsVirtualMic: false)
             if let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) {
                 ctx.speakerUnit = speakerUnit
                 ctx.speakerState = spkState
@@ -298,7 +302,7 @@ private actor SoundboardEngine {
 
         // Loopback state + unit (so Discord/Zoom hears it) — independent read position
         if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
-            let lbState = makeState()
+            let lbState = makeState(feedsVirtualMic: true)
             if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
                 ctx.loopbackUnit = lbUnit
                 ctx.loopbackState = lbState
@@ -588,6 +592,15 @@ private func soundboardRenderCallback(
         i += 1
     }
     state.meterLevel = peak
+
+    // Contribute to the virtual mic's shared loudness measurement, combined with every other
+    // feed writing to the same device this IO cycle (see `MicLoudnessBus`'s doc comment).
+    if state.feedsVirtualMic {
+        MicLoudnessBus.shared.contribute(
+            buffer: outBuf, frames: Int(inNumberFrames), channels: chCount,
+            sampleTime: inTimeStamp.pointee.mSampleTime
+        )
+    }
 
     return noErr
 }

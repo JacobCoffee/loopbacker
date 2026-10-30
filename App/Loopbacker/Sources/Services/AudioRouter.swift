@@ -127,17 +127,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// at worst produce one block with a half-applied matrix, which is inaudible.
         let mixMatrix: UnsafeMutablePointer<Float>
 
-        /// Loudness meter for what this route hands to its playback device, read directly off
-        /// the ring-read buffer in `outputRenderCallback` -- i.e. what the AUHAL output unit is
-        /// about to send, no new CoreAudio IO client. Only set for routes that feed a Loopbacker
-        /// virtual device (`measuresLoudness`); output routes to physical devices (monitoring)
-        /// don't need a loudness reading. Allocated in `init` (not the RT thread), real-time
-        /// safe to call from the callback.
-        let loudnessMeter: LoudnessMeter?
-
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
-             sampleRate: Float64, isVoiceInput: Bool = false, measuresLoudness: Bool = false) {
+             sampleRate: Float64, isVoiceInput: Bool = false) {
             self.captureDeviceUID = captureDeviceUID
             self.captureDeviceID = captureDeviceID
             self.playbackDeviceID = playbackDeviceID
@@ -146,9 +138,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.outputChannels = outputChannels
             self.sampleRate = sampleRate
             self.isVoiceInput = isVoiceInput
-            self.loudnessMeter = measuresLoudness
-                ? LoudnessMeter(sampleRate: sampleRate, channelCount: Int(outputChannels))
-                : nil
 
             meterLevelsPtr = .allocate(capacity: Int(inputChannels))
             meterLevelsPtr.initialize(repeating: 0.0, count: Int(inputChannels))
@@ -528,8 +517,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 playbackDeviceUID: "LoopbackerDevice_UID",
                 inputChannels: captureChannels,
                 outputChannels: micChannels,
-                sampleRate: sampleRate,
-                measuresLoudness: true
+                sampleRate: sampleRate
             )
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
 
@@ -817,45 +805,44 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// allocation); when it agrees with `wasSilentMeters` this tick skips draining, building the
     /// per-route dictionaries, and walking `NSApp.windows` entirely.
     private func updatePublishedMeters() {
-        guard !(wasSilentMeters && isEverythingSilent()) else { return }
+        // Only the legacy peak-meter work (source/output dB bars) can be skipped on a silent
+        // tick: `MicLoudnessBus` may still have fresh data from a feed `isEverythingSilent`
+        // doesn't know about (the soundboard's loopback unit isn't an AudioRouter route), so
+        // loudness is always read and published below, independent of this gate.
+        let skipPeakMeters = wasSilentMeters && isEverythingSilent()
 
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevels: [Int: Float] = [:]
         var sawNonZero = false
 
-        for (uid, ctx) in activeRoutes {
-            newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
-            // Output meter takes post-mix levels (max across sources).
-            for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
-                newOutputLevels[ch] = max(newOutputLevels[ch] ?? 0.0, level)
+        if !skipPeakMeters {
+            for (uid, ctx) in activeRoutes {
+                newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+                // Output meter takes post-mix levels (max across sources).
+                for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
+                    newOutputLevels[ch] = max(newOutputLevels[ch] ?? 0.0, level)
+                }
+            }
+
+            // Output routes report the virtual device channels they capture.
+            for (uid, ctx) in activeOutputRoutes {
+                newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
             }
         }
-
-        // Output routes report the virtual device channels they capture.
-        for (uid, ctx) in activeOutputRoutes {
-            newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
-        }
-
-        // Skip later silent ticks only once these zeros are on screen; a hidden window must still
-        // get them when it reappears, or it would keep showing the last levels it saw.
-        wasSilentMeters = false
 
         let sourceLevels = newSourceLevels
         let outputLevels = newOutputLevels
         let routesEmpty = activeRoutes.isEmpty
-        // Group loudness-measuring routes by their destination device, taking the loudest feed
-        // when more than one route targets the same virtual device at once (see
-        // `RouteContext.loudnessMeter`'s doc comment).
-        var newLoudness: [String: LoudnessReading] = [:]
-        for ctx in activeRoutes.values {
-            guard let meter = ctx.loudnessMeter else { continue }
-            var reading = newLoudness[ctx.playbackDeviceUID] ?? LoudnessReading()
-            reading.momentaryLUFS = max(reading.momentaryLUFS, meter.momentaryLUFS)
-            reading.shortTermLUFS = max(reading.shortTermLUFS, meter.shortTermLUFS)
-            reading.integratedLUFS = max(reading.integratedLUFS, meter.integratedLUFS())
-            reading.truePeakDBTP = max(reading.truePeakDBTP, meter.truePeakDBTP)
-            newLoudness[ctx.playbackDeviceUID] = reading
-        }
+        // The virtual mic's loudness is combined across every feed by `MicLoudnessBus` itself
+        // (summed per IO cycle on the shared device thread), so there's nothing to group here --
+        // just read its current state. Cheap (a handful of property reads plus a histogram scan
+        // over a few hundred fixed bins), so always done, not gated on route activity.
+        let micLoudness = LoudnessReading(
+            momentaryLUFS: MicLoudnessBus.shared.momentaryLUFS,
+            shortTermLUFS: MicLoudnessBus.shared.shortTermLUFS,
+            integratedLUFS: MicLoudnessBus.shared.integratedLUFS(),
+            truePeakDBTP: MicLoudnessBus.shared.truePeakDBTP
+        )
         MainActor.assumeIsolated {
             // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
             // publish re-renders the cables and meters of a window nobody sees. Publish only while
@@ -865,43 +852,42 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 $0.isVisible && $0.occlusionState.contains(.visible) && $0.className != "NSStatusBarWindow"
             }
             guard showing else { return }
-            wasSilentMeters = !sawNonZero
 
-            // Routing changes are rare (user-driven), so only pay for the `Set` and the removal
-            // scan when the route count actually moved; the common tick (nothing started or
-            // stopped) skips it.
-            if meters.sourceCount != sourceLevels.count {
-                meters.retainSources(Set(sourceLevels.keys))
+            if !skipPeakMeters {
+                // Skip later silent ticks only once these zeros are on screen; a hidden window
+                // must still get them when it reappears, or it would keep showing stale levels.
+                wasSilentMeters = !sawNonZero
+
+                // Routing changes are rare (user-driven), so only pay for the `Set` and the
+                // removal scan when the route count actually moved; the common tick (nothing
+                // started or stopped) skips it.
+                if meters.sourceCount != sourceLevels.count {
+                    meters.retainSources(Set(sourceLevels.keys))
+                }
+                for (key, channels) in sourceLevels {
+                    meters.updateSource(key, channels: channels)
+                }
+                // Every active route shares the same virtual output device, so its channel set
+                // never changes while any route is running — only clear it on the empty
+                // transition so a stale post-mix peak doesn't linger once nothing writes it.
+                if routesEmpty {
+                    meters.clearOutputs()
+                } else {
+                    meters.updateOutputs(outputLevels)
+                }
             }
-            for (key, channels) in sourceLevels {
-                meters.updateSource(key, channels: channels)
-            }
-            // Every active route shares the same virtual output device, so its channel set never
-            // changes while any route is running — only clear it on the empty transition so a
-            // stale post-mix peak doesn't linger once nothing writes it anymore.
-            if routesEmpty {
-                meters.clearOutputs()
-            } else {
-                meters.updateOutputs(outputLevels)
-            }
-            for deviceUID in loudness.readings.keys where newLoudness[deviceUID] == nil {
-                loudness.clear(deviceUID: deviceUID)
-            }
-            for (deviceUID, reading) in newLoudness {
-                loudness.update(deviceUID: deviceUID, reading)
-            }
+
+            loudness.update(deviceUID: VirtualDeviceChannels.micUID, micLoudness)
         }
     }
 
-    /// Resets integrated loudness (on demand, from the UI's reset button) for every route
-    /// currently feeding the given virtual device.
+    /// Resets integrated loudness (on demand, from the UI's reset button). `deviceUID` is kept
+    /// for API symmetry with the per-device UI (`LoudnessPanelView`) even though there is
+    /// currently only one measured device (the virtual mic) -- `MicLoudnessBus` IS that device's
+    /// reading, not a per-route one, so there's nothing to look up.
     func resetIntegratedLoudness(deviceUID: String) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            for ctx in self.activeRoutes.values where ctx.playbackDeviceUID == deviceUID {
-                ctx.loudnessMeter?.resetIntegrated()
-            }
-        }
+        guard deviceUID == VirtualDeviceChannels.micUID else { return }
+        MicLoudnessBus.shared.resetIntegrated()
     }
 
     /// Snapshot 1-based channel levels, decay the RT-written meter buffer in place, and note
@@ -977,8 +963,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             inputChannels: inputChannels,
             outputChannels: micChannels,
             sampleRate: sampleRate,
-            isVoiceInput: true,
-            measuresLoudness: true
+            isVoiceInput: true
         )
         ctx.effectsChain?.updatePreset(currentEffectsPreset)
         applyNoiseSuppression(to: ctx)
@@ -1727,10 +1712,14 @@ private func outputRenderCallback(
     // Read from the ring buffer into the output
     ctx.readFromRing(outputBuffer, frames: inNumberFrames)
 
-    // Measure loudness of exactly what's about to reach the playback device, for routes that
-    // feed a Loopbacker virtual device (see `RouteContext.loudnessMeter`'s doc comment for why
-    // this is per-route rather than a true cross-route sum).
-    ctx.loudnessMeter?.process(outputBuffer, frames: Int(inNumberFrames), channels: Int(ctx.outputChannels))
+    // Measure loudness of exactly what's about to reach the device, combined with every other
+    // feed writing to the same virtual mic this IO cycle (see `MicLoudnessBus`'s doc comment).
+    if ctx.playbackDeviceUID == VirtualDeviceChannels.micUID {
+        MicLoudnessBus.shared.contribute(
+            buffer: outputBuffer, frames: Int(inNumberFrames), channels: Int(ctx.outputChannels),
+            sampleTime: inTimeStamp.pointee.mSampleTime
+        )
+    }
 
     return noErr
 }

@@ -114,6 +114,34 @@ struct LoudnessMeterTests {
         #expect(abs(meter.integratedLUFS() - (-18.0)) < 0.5)
     }
 
+    @Test("True peak on a fs/4, 45° phase intersample-peak fixture matches ffmpeg's true peak within 0.2 dB")
+    func truePeakMatchesReferenceOnIntersamplePeakFixture() {
+        // ITU-R BS.1770-4/5 Annex 2's classic intersample-peak test: a sine at exactly 1/4 the
+        // sample rate, 45° out of phase with the sample grid, so every sampled value lands at
+        // ±0.707 (-3.01 dBFS) while the continuous waveform's true peak is 1.0 (0 dBFS) -- a
+        // peak-only meter misses it entirely; a true-peak meter must catch it.
+        //
+        // Cross-checked against `ffmpeg -af ebur128=peak=true` on this exact signal (200 ms of
+        // silence lead-in so the FIR's history is settled before the measured portion, same as
+        // this test reads `truePeakDBTP` after a full second of steady tone): this meter reads
+        // 0.045 dBTP vs. ffmpeg's 0.1 dBTP, 0.055 dB apart -- within the 0.2 dB bound.
+        let meter = LoudnessMeter(sampleRate: Fixture.sampleRate, channelCount: 2)
+        let frameCount = Int(Fixture.sampleRate)
+        var samples = [Float](repeating: 0, count: frameCount * 2)
+        for n in 0..<frameCount {
+            let s = Float(sin(Double.pi * Double(n) / 2 + Double.pi / 4))
+            samples[n * 2] = s
+            samples[n * 2 + 1] = s
+        }
+        // Sampled peak understates the true peak by ~3 dB -- confirms the fixture itself (and
+        // that this isn't just measuring the sample peak under another name).
+        let sampledPeakDB = 20 * log10(samples.map { abs($0) }.max()!)
+        #expect(abs(sampledPeakDB - (-3.01)) < 0.05)
+
+        Fixture.process(meter, samples, channels: 2)
+        #expect(abs(meter.truePeakDBTP - 0.1) < 0.2)
+    }
+
     @Test("True peak reads above 0 dBTP for a 0 dBFS tone sampled off-grid")
     func truePeakCatchesIntersampleOvers() {
         let meter = LoudnessMeter(sampleRate: Fixture.sampleRate, channelCount: 2)
