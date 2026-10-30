@@ -42,7 +42,7 @@ let package = Package(
                 .headerSearchPath("ysfx-sources"),
                 .headerSearchPath("stb"),
                 .define("WDL_FFT_REALSIZE", to: "8"),
-                .unsafeFlags(["-fsigned-char", "-fno-objc-arc", "-std=c++17"])
+                .unsafeFlags(["-fsigned-char", "-fno-objc-arc"])
             ],
             linkerSettings: [
                 .linkedFramework("Cocoa"),
@@ -108,8 +108,7 @@ let package = Package(
                 .define("WEBRTC_ENABLE_AVX2"),
                 .define("WEBRTC_LIBRARY_IMPL"),
                 .define("WEBRTC_APM_DEBUG_DUMP", to: "0"),
-                .define("NDEBUG"),
-                .unsafeFlags(["-std=c++17"])
+                .define("NDEBUG")
             ]
         ),
         .executableTarget(
