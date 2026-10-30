@@ -88,7 +88,9 @@ struct EffectsSimpleView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Slider(value: binding, in: 0...1) { Text(label) }
+                .labelsHidden()
                 .tint(.loopbacker)
+                .accessibilityLabel(label)
                 .accessibilityValue("\(Int(binding.wrappedValue * 100)) percent")
         }
         .padding(.vertical, 4)

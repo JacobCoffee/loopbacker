@@ -225,7 +225,7 @@ struct CompressorVisual: View {
                         ZStack(alignment: .trailing) {
                             RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5))
                             RoundedRectangle(cornerRadius: 4)
-                                .fill(Color.signalWarm)
+                                .fill(Color.secondary.opacity(0.7))
                                 .frame(width: max(2, CGFloat(min(1, gr / maxGR)) * geo.size.width))
                         }
                     }
@@ -378,7 +378,7 @@ struct LimiterVisual: View {
                         ZStack(alignment: .trailing) {
                             RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5))
                             RoundedRectangle(cornerRadius: 4)
-                                .fill(gr > maxGR * 0.6 ? Color.signalHot : Color.signalWarm)
+                                .fill(Color.secondary.opacity(0.7))
                                 .frame(width: max(2, CGFloat(min(1, gr / maxGR)) * geo.size.width))
                                 .animation(.linear(duration: 0.08), value: gr)
                         }

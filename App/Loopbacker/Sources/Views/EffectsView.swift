@@ -73,6 +73,14 @@ struct EffectsView: View {
         .navigationSubtitle(preset.isEnabled ? "\(activeCount) of \(nodes.count) active" : "Bypassed")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Picker("Mode", selection: $mode) {
+                    ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .accessibilityLabel("Mode")
+                .frame(maxWidth: 200)
+
                 Toggle(isOn: masterBinding) {
                     Label(preset.isEnabled ? "Effects On" : "Effects Off", systemImage: "power")
                 }
@@ -116,12 +124,6 @@ struct EffectsView: View {
     private var pageContent: some View {
         VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
             adviceBanner
-
-            Picker("Mode", selection: $mode) {
-                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 360)
 
             noiseSuppressionCard
 

@@ -132,6 +132,7 @@ struct SignalLineConnector: View {
     var active: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     private let length: CGFloat = 12
 
@@ -143,7 +144,19 @@ struct SignalLineConnector: View {
                 .shadow(color: active ? Color.loopbacker.opacity(0.6) : .clear, radius: 3)
 
             if active && !reduceMotion {
-                LoopingDot(color: .loopbacker, diameter: 4, loop: .fall)
+                // `LoopingDot` is an `NSViewRepresentable` driven by `CAAnimation` so the
+                // repeating fall animation never re-enters the SwiftUI view graph; that AppKit
+                // bridge doesn't render in a headless offscreen snapshot, so snapshot captures
+                // fall back to a plain static dot that still conveys "signal is flowing" without
+                // the animation.
+                if snapshotRendering {
+                    Circle()
+                        .fill(Color.loopbacker)
+                        .frame(width: 4, height: 4)
+                        .offset(y: length / 2 - 2)
+                } else {
+                    LoopingDot(color: .loopbacker, diameter: 4, loop: .fall)
+                }
             }
         }
         .frame(width: 22, height: length)
