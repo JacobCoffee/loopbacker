@@ -59,15 +59,20 @@ final class SourceLevelStore {
 /// Kept apart from `RoutingState` on purpose: only views that read a level re-render when
 /// meters move, instead of every view observing the routing graph. Storage is split per route
 /// (`SourceLevelStore`) and per channel (`ChannelLevelBox`) so one route's level change doesn't
-/// invalidate every other route's meters and cables: `sourceStores`/`outputBoxes` are themselves
+/// invalidate every other route's meters and cables: `sourceStores`/`outputStores` are themselves
 /// `@Observable`-tracked, but they're only written (and so only broadcast a change) when a route
 /// or channel first appears, never on the per-tick level update — that writes the leaf box's own
 /// `level`, which only the views reading that exact box observe.
+///
+/// Output levels are post-mix and per target device (the virtual mic and, when enabled, Stream
+/// Mix): each target gets its own `SourceLevelStore` keyed by its device UID, so the two
+/// targets' meters never bleed into each other even though their channel numbering overlaps
+/// (both start at channel 1).
 @MainActor
 @Observable
 final class MeterLevels {
     private var sourceStores: [String: SourceLevelStore] = [:]
-    private var outputBoxes: [Int: ChannelLevelBox] = [:]
+    private var outputStores: [String: SourceLevelStore] = [:]
 
     nonisolated init() {}
 
@@ -79,8 +84,9 @@ final class MeterLevels {
         sourceStores[key]?.peak ?? 0
     }
 
-    func output(channel: Int) -> Float {
-        outputBoxes[channel]?.level ?? 0
+    /// Post-mix level for `channel` (1-based) on the given target device.
+    func output(target: String, channel: Int) -> Float {
+        outputStores[target]?.level(channel: channel) ?? 0
     }
 
     /// Pushes one route's freshly drained channel levels. Lazily creates the route's store the
@@ -94,16 +100,15 @@ final class MeterLevels {
         store.update(channels)
     }
 
-    /// Sets the post-mix output levels (the router already took the max across routes).
-    func updateOutputs(_ channels: [Int: Float]) {
-        for (channel, level) in channels {
-            let box = outputBoxes[channel] ?? {
-                let box = ChannelLevelBox()
-                outputBoxes[channel] = box
-                return box
-            }()
-            box.set(level)
-        }
+    /// Sets a target device's post-mix output levels (the router already took the max across
+    /// every route feeding that target).
+    func updateOutputs(target: String, _ channels: [Int: Float]) {
+        let store = outputStores[target] ?? {
+            let store = SourceLevelStore()
+            outputStores[target] = store
+            return store
+        }()
+        store.update(channels)
     }
 
     /// Number of route stores currently held, so the router can skip the `Set` allocation in
@@ -118,10 +123,10 @@ final class MeterLevels {
         }
     }
 
-    /// Drops all output channel state. Called once when the last route stops, so a stale
-    /// post-mix peak doesn't linger forever on a channel nothing writes anymore.
-    func clearOutputs() {
-        guard !outputBoxes.isEmpty else { return }
-        outputBoxes.removeAll()
+    /// Drops output channel state for one target. Called once when its last route stops, so a
+    /// stale post-mix peak doesn't linger forever on a channel nothing writes anymore.
+    func clearOutputs(target: String) {
+        guard outputStores[target] != nil else { return }
+        outputStores.removeValue(forKey: target)
     }
 }

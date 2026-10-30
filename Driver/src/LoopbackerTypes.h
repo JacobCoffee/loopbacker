@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // Number of virtual devices this plugin exposes
-static const uint32_t kMaxDevices = 2;
+static const uint32_t kMaxDevices = 3;
 
 // Object IDs
 // Plugin itself is always kAudioObjectPlugInObject (1).
@@ -43,6 +43,12 @@ static const VirtualDeviceInfo kDeviceInfos[kMaxDevices] = {
     // FaceTime/Phone won't gate the user's real mic when this device exists.
     { "Loopbacker 2", "LoopbackerDevice_UID_2", 20, 21, 22, 23, 24,
       kTerminalTypeInputUndefined, kTerminalTypeOutputUndefined },
+    // Device 2: app-compatible (Microphone-class), same rationale as device 0.
+    // A second mic-class target ("Stream Mix") so routing can send a separate
+    // mix (e.g. a stream mix with music/alerts folded in) to streaming/
+    // recording apps without disturbing the device 0 route.
+    { "Loopbacker Stream", "LoopbackerDevice_UID_Stream", 30, 31, 32, 33, 34,
+      kAudioStreamTerminalTypeMicrophone, kAudioStreamTerminalTypeSpeaker },
 };
 
 // Device metadata

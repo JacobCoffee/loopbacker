@@ -165,7 +165,7 @@ private final class CableLayerView: NSView {
 
             for route in routes {
                 let sourceEnd = ConnectorEnd.source(sourceId: route.sourceId, channelId: route.sourceChannelId)
-                let outputEnd = ConnectorEnd.output(channelId: route.outputChannelId)
+                let outputEnd = ConnectorEnd.output(target: route.targetId, channelId: route.outputChannelId)
                 guard let sourceRect = positions[sourceEnd], let outputRect = positions[outputEnd] else { continue }
 
                 let start = CGPoint(x: sourceRect.midX, y: sourceRect.midY)

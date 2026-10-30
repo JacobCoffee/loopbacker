@@ -1,7 +1,7 @@
 # Loopbacker Architecture
 
-A minimal CoreAudio AudioServerPlugin (HAL plugin) that creates a virtual stereo
-loopback device on macOS. Audio written to the device's output is immediately
+A minimal CoreAudio AudioServerPlugin (HAL plugin) that creates virtual stereo
+loopback devices on macOS. Audio written to a device's output is immediately
 readable from its input -- enabling apps like Discord to capture audio from
 hardware interfaces like a MOTU M2.
 
@@ -9,24 +9,43 @@ hardware interfaces like a MOTU M2.
 
 CoreAudio's HAL plugin interface is a flat object graph where every entity has an
 `AudioObjectID`. The host queries properties on these objects by ID. Loopbacker
-exposes exactly five objects:
+exposes `kMaxDevices` (currently 3) virtual devices, each with the same shape:
 
 ```
 PlugIn (ID = kAudioObjectPlugInObject = 1)
   |
-  +-- Device (ID = 2)   "Loopbacker"
-        |
-        +-- Input Stream  (ID = 3)   2ch, captures looped-back audio
-        +-- Output Stream (ID = 4)   2ch, receives audio from apps
-        +-- Volume Control (ID = 5)  master output volume (optional, nice UX)
+  +-- Device 0 (ID = 10)    "Loopbacker"        (LoopbackerDevice_UID)
+  |     +-- Input Stream  (ID = 11)   Nch, captures looped-back audio
+  |     +-- Output Stream (ID = 12)   Nch, receives audio from apps
+  |     +-- Volume Control       (ID = 13)  output-scope volume
+  |     +-- Input Volume Control (ID = 14)  input-scope volume
+  |
+  +-- Device 1 (ID = 20)    "Loopbacker 2"      (LoopbackerDevice_UID_2)
+  |     +-- Input Stream  (ID = 21), Output Stream (ID = 22),
+  |         Volume Control (ID = 23), Input Volume Control (ID = 24)
+  |
+  +-- Device 2 (ID = 30)    "Loopbacker Stream"  (LoopbackerDevice_UID_Stream)
+        +-- Input Stream  (ID = 31), Output Stream (ID = 32),
+            Volume Control (ID = 33), Input Volume Control (ID = 34)
 ```
 
-The PlugIn object owns the Device. The Device owns two Streams and optionally a
-Volume Control. That is the entire object hierarchy.
+The PlugIn object owns every Device. Each Device owns two Streams and two Volume
+Controls (`Driver/src/LoopbackerTypes.h`: `VirtualDeviceInfo`, `kDeviceInfos`).
+`N` is the device's current `lbch` channel count (see "Per-Device Channel Count"
+below), independently configurable per device.
+
+Device 0 and Device 2 report `kAudioStreamTerminalTypeMicrophone`/`...Speaker`
+stream terminal types, so strict pickers (Slack, some CallKit clients, OBS) list
+them as real microphones. Device 1 reports generic USB Audio Class "undefined"
+terminal types so macOS Voice Processing IO (FaceTime, Phone, iPhone-relay)
+doesn't model it as a candidate mic and gate the user's actual mic. Device 2
+("Loopbacker Stream", the app's "Stream Mix" routing target) exists so a source
+can feed a second, independently-mixed virtual mic -- e.g. a stream mix with
+music/alerts folded in for OBS -- without disturbing Device 0's route.
 
 ## Data Flow
 
-The loopback mechanism is straightforward:
+The loopback mechanism is straightforward, repeated per device:
 
 ```
 App A (e.g. Music.app)           App B (e.g. Discord)
@@ -40,19 +59,23 @@ App A (e.g. Music.app)           App B (e.g. Discord)
 ```
 
 1. The host calls `DoIOOperation` with `kAudioServerPlugInIOOperationWriteMix` on
-   the output stream. The plugin writes the samples into the ring buffer.
+   a device's output stream. The plugin writes the samples into that device's
+   ring buffer.
 2. The host calls `DoIOOperation` with `kAudioServerPlugInIOOperationReadInput` on
-   the input stream. The plugin reads the same samples from the ring buffer.
-3. `GetZeroTimeStamp` drives the virtual clock. It advances sample time based on
-   `mach_absolute_time()` at the nominal sample rate.
+   the same device's input stream. The plugin reads the same samples back.
+3. `GetZeroTimeStamp` drives each device's virtual clock. It advances sample time
+   based on `mach_absolute_time()` at the nominal sample rate.
 
 There is no actual hardware. The plugin synthesizes timestamps from the wall clock.
+Each device's `DeviceState` (ring buffer, clock anchors, channel count) is
+independent, so one device's IO never blocks or interferes with another's.
 
 ## Ring Buffer Design
 
-- **Size**: 65536 frames (power of 2, ~1.36s at 48kHz). Large enough to absorb
-  jitter, small enough to stay in L2 cache.
-- **Format**: Interleaved Float32, 2 channels = 8 bytes/frame.
+- **Size**: `kRingBufferFrames` = 2048 frames (power of 2, ~42ms at 48kHz) per
+  device, sized at least 4x the default IO buffer to prevent underruns.
+- **Format**: Interleaved Float32, `BytesPerFrameForChannelCount(channelCount)`
+  bytes/frame -- the device's current `lbch` channel count, not a fixed 2.
 - **Indexing**: Atomic 64-bit write position. Read position derived from
   `GetZeroTimeStamp` sample time. Masking with `(size - 1)` for wrap-around.
 - **Thread safety**: Lock-free. The host guarantees that `DoIOOperation` calls
@@ -64,7 +87,7 @@ There is no actual hardware. The plugin synthesizes timestamps from the wall clo
 
 ## Virtual Clock
 
-Since there is no real hardware, we synthesize a clock:
+Since there is no real hardware, we synthesize a clock per device:
 
 ```
 GetZeroTimeStamp() {
@@ -79,20 +102,20 @@ GetZeroTimeStamp() {
 
 - `period` = `kAudioDevicePropertyZeroTimeStampPeriod` (we use the buffer size,
   minimum 10923 per Apple docs -- we will use 16384).
-- `anchor_host_time` is captured at `StartIO`.
+- `anchor_host_time` is captured at `StartIO`, per device.
 - `host_ticks_per_frame` = `mach_timebase_info` conversion at nominal sample rate.
 
 ## File Structure
 
 ```
-loopbacker/
+Driver/
 +-- CMakeLists.txt                  # Build system
 +-- Info.plist.in                   # Bundle plist template (CMake configures UUIDs)
 +-- src/
-|   +-- LoopbackerDriver.h          # Main driver struct + vtable
-|   +-- LoopbackerDriver.cpp        # All AudioServerPlugInDriverInterface methods
-|   +-- LoopbackerDevice.h          # Device/Stream/Control property handling
-|   +-- LoopbackerDevice.cpp        # Device property getters/setters
+|   +-- LoopbackerTypes.h           # kMaxDevices, kDeviceInfos, shared constants
+|   +-- LoopbackerDriver.h          # Driver struct (DeviceState[kMaxDevices]) + vtable
+|   +-- LoopbackerDriver.cpp        # All AudioServerPlugInDriverInterface methods,
+|   |                                # generic over device index (no per-device branches)
 |   +-- RingBuffer.h                # Lock-free ring buffer (header-only)
 |   +-- PluginEntry.cpp             # CFPlugIn factory function (extern "C" entry point)
 +-- scripts/
@@ -109,127 +132,129 @@ loopbacker/
 | File | Responsibility |
 |---|---|
 | `PluginEntry.cpp` | Exports `Loopbacker_Create` (the CFPlugIn factory). Allocates the driver struct, returns `IUnknown`. ~50 lines. |
-| `LoopbackerDriver.h/cpp` | The `AudioServerPlugInDriverInterface` vtable and IUnknown methods (`QueryInterface`, `AddRef`, `Release`), plus `Initialize`, `CreateDevice`, `DestroyDevice`, client management, and IO dispatch. This is the "router" -- it looks at the ObjectID and delegates to the device. |
-| `LoopbackerDevice.h/cpp` | All property handling for the Device, its two Streams, and the Volume Control. This is where `HasProperty`, `GetPropertyData`, `SetPropertyData`, `StartIO`, `StopIO`, `GetZeroTimeStamp`, and `DoIOOperation` live for object IDs 2-5. |
+| `LoopbackerTypes.h` | `kMaxDevices`, `kDeviceInfos` (name/UID/object-ID base/terminal types per device), channel-count/sample-rate/ring-buffer constants, and `'lbch'` custom property selector. Adding a device means adding one `VirtualDeviceInfo` entry and bumping `kMaxDevices`; nothing else in the driver assumes a device count. |
+| `LoopbackerDriver.h/cpp` | The `AudioServerPlugInDriverInterface` vtable and IUnknown methods (`QueryInterface`, `AddRef`, `Release`), `Initialize`, `CreateDevice`/`DestroyDevice` (both unsupported), client management, property handling (`HasProperty`/`GetPropertyData`/`SetPropertyData`/...), and IO dispatch (`StartIO`/`StopIO`/`GetZeroTimeStamp`/`DoIOOperation`) for every device, stream, and control, keyed generically by `FindDeviceByObjectID`. |
 | `RingBuffer.h` | ~60 lines. A trivial lock-free SPSC ring buffer. `write(const float*, frameCount)` and `read(float*, frameCount, atFrame)`. Header-only, no allocations after construction. |
 
 ### Why Not More Files
 
 A HAL plugin is inherently a single flat interface with ~20 function pointers.
-Splitting further (separate Stream class, separate Control class) adds
-indirection without benefit at this scale. BlackHole uses a single .cpp file for
-the same reason. We use two files (Driver + Device) purely to separate routing
-from property logic.
+Splitting further (a class per device, a class per stream) adds indirection
+without benefit at this scale: every device shares identical property/IO logic,
+dispatched by object ID through `FindDeviceByObjectID`, so there is nothing
+device-specific to factor out into its own file. BlackHole uses a single .cpp
+file for the same reason.
 
 ## AudioObjectID Assignment
 
-All IDs are compile-time constants:
+IDs are derived at compile time from `kMaxDevices` and each device's index,
+not individually hardcoded:
 
 ```cpp
-enum : AudioObjectID {
-    kPlugInObjectID     = kAudioObjectPlugInObject,  // 1 (Apple-defined)
-    kDeviceObjectID     = 2,
-    kInputStreamID      = 3,
-    kOutputStreamID     = 4,
-    kVolumeControlID    = 5,
-};
+// Plugin itself is always kAudioObjectPlugInObject (1).
+// Device N gets base ID (N+1)*10:
+//   deviceID = (N+1)*10, inputStreamID = +1, outputStreamID = +2,
+//   volumeControlID = +3, inputVolumeControlID = +4.
+// Today: Device 0 -> 10-14, Device 1 -> 20-24, Device 2 -> 30-34.
 ```
 
-No dynamic allocation of IDs. The host queries `kAudioObjectPropertyOwnedObjects`
-on each parent, and we return the children by their fixed IDs.
+`FindDeviceByObjectID` inverts this (`group = objectID / 10`, `offset = objectID
+% 10`) to find the owning `DeviceState` for any object ID in O(1), generic over
+`kMaxDevices` -- adding a device needs no change here. No dynamic allocation of
+IDs; the host queries `kAudioObjectPropertyOwnedObjects`/`kAudioPlugInPropertyDeviceList`
+on the PlugIn, and we return every device's fixed ID.
 
 ## Properties We Must Implement
 
+Every device implements the same property set (values below are per-device,
+substituting that device's own IDs/UID/name/channel count):
+
 ### PlugIn (ID 1)
 - `kAudioObjectPropertyClass` -> `kAudioPlugInClassID`
-- `kAudioObjectPropertyOwnedObjects` -> `[kDeviceObjectID]`
-- `kAudioPlugInPropertyDeviceList` -> `[kDeviceObjectID]`
+- `kAudioObjectPropertyOwnedObjects` -> every device's ID
+- `kAudioPlugInPropertyDeviceList` -> every device's ID
 - `kAudioPlugInPropertyResourceBundle` -> `""`
-- `kAudioObjectPropertyManufacturer` -> `"Loopbacker"`
+- `kAudioObjectPropertyManufacturer` -> `"JacobCoffee"`
 
-### Device (ID 2)
+### Device (e.g. ID 10, 20, 30)
 - `kAudioObjectPropertyClass` -> `kAudioDeviceClassID`
-- `kAudioObjectPropertyName` -> `"Loopbacker"`
-- `kAudioDevicePropertyDeviceUID` -> `"Loopbacker_UID"`
-- `kAudioDevicePropertyModelUID` -> `"Loopbacker_ModelUID"`
-- `kAudioObjectPropertyManufacturer` -> `"Loopbacker"`
-- `kAudioObjectPropertyOwnedObjects` -> `[kInputStreamID, kOutputStreamID, kVolumeControlID]`
-- `kAudioDevicePropertyStreams` (input scope) -> `[kInputStreamID]`
-- `kAudioDevicePropertyStreams` (output scope) -> `[kOutputStreamID]`
-- `kAudioDevicePropertyNominalSampleRate` -> `48000.0` (settable: 44100, 48000, 96000)
-- `kAudioDevicePropertyAvailableNominalSampleRates` -> `[44100, 48000, 96000]`
-- `kAudioDevicePropertyBufferFrameSize` -> `512` (settable, range 64-8192)
-- `kAudioDevicePropertyBufferFrameSizeRange` -> `{64, 8192}`
+- `kAudioObjectPropertyName` -> the device's name (`"Loopbacker"`, `"Loopbacker 2"`, `"Loopbacker Stream"`)
+- `kAudioDevicePropertyDeviceUID` -> the device's UID (e.g. `"LoopbackerDevice_UID_Stream"`)
+- `kAudioDevicePropertyModelUID` -> `"LoopbackerDevice_ModelUID"` (shared)
+- `kAudioObjectPropertyManufacturer` -> `"JacobCoffee"`
+- `kAudioObjectPropertyOwnedObjects` -> `[inputStreamID, outputStreamID, volumeControlID, inputVolumeControlID]`
+- `kAudioDevicePropertyStreams` (input scope) -> `[inputStreamID]`
+- `kAudioDevicePropertyStreams` (output scope) -> `[outputStreamID]`
+- `kAudioDevicePropertyNominalSampleRate` -> `48000.0` (locked; see `kSampleRates`)
+- `kAudioDevicePropertyBufferFrameSize` -> `kDefaultIOBufferFrames` (settable)
+- `kLoopbackerDevicePropertyChannelCount` (`'lbch'`) -> this device's current channel count (settable, even 2-16; see "Per-Device Channel Count")
 - `kAudioDevicePropertyLatency` -> `0`
 - `kAudioDevicePropertySafetyOffset` -> `0`
-- `kAudioDevicePropertyZeroTimeStampPeriod` -> `16384`
+- `kAudioDevicePropertyZeroTimeStampPeriod` -> `kRingBufferFrames`
 - `kAudioDevicePropertyClockIsStable` -> `1`
 - `kAudioDevicePropertyClockAlgorithm` -> `kAudioDeviceClockAlgorithmRaw`
-- `kAudioDevicePropertyIsRunning` -> `(0 or 1)`
+- `kAudioDevicePropertyIsRunning` -> `(0 or 1)`, per device
 - `kAudioDevicePropertyIsAlive` -> `1`
 - `kAudioDevicePropertyDeviceCanBeDefaultDevice` -> `1`
 - `kAudioDevicePropertyDeviceCanBeDefaultSystemDevice` -> `1`
-- `kAudioObjectPropertyControlList` -> `[kVolumeControlID]`
+- `kAudioObjectPropertyControlList` -> `[volumeControlID, inputVolumeControlID]`
 - `kAudioDevicePropertyTransportType` -> `kAudioDeviceTransportTypeVirtual`
-- `kAudioDevicePropertyRelatedDevices` -> `[kDeviceObjectID]`
+- `kAudioDevicePropertyRelatedDevices` -> this device's own ID only (devices are not related to each other)
 
-### Input Stream (ID 3)
+### Input Stream
 - `kAudioObjectPropertyClass` -> `kAudioStreamClassID`
 - `kAudioStreamPropertyDirection` -> `1` (input)
-- `kAudioStreamPropertyTerminalType` -> `kAudioStreamTerminalTypeMicrophone`
+- `kAudioStreamPropertyTerminalType` -> the device's `inputTerminalType` (microphone, or undefined for Device 1)
 - `kAudioStreamPropertyStartingChannel` -> `1`
-- `kAudioStreamPropertyPhysicalFormat` -> `{48000, 'lpcm', kFloat32, 2ch, interleaved}`
-- `kAudioStreamPropertyVirtualFormat` -> same
-- `kAudioStreamPropertyAvailablePhysicalFormats` -> all rate/format combos
+- `kAudioStreamPropertyPhysicalFormat`/`VirtualFormat` -> `{48000, 'lpcm', kFloat32, <channelCount>ch, interleaved}`
+- `kAudioStreamPropertyAvailablePhysicalFormats` -> every supported channel count at 48 kHz
 - `kAudioStreamPropertyLatency` -> `0`
 - `kAudioObjectPropertyOwnedObjects` -> `[]`
 
-### Output Stream (ID 4)
+### Output Stream
 - Same as Input Stream but `kAudioStreamPropertyDirection` -> `0` (output)
-- `kAudioStreamPropertyTerminalType` -> `kAudioStreamTerminalTypeSpeaker`
+- `kAudioStreamPropertyTerminalType` -> the device's `outputTerminalType`
 
-### Volume Control (ID 5)
+### Volume Control / Input Volume Control
 - `kAudioObjectPropertyClass` -> `kAudioVolumeControlClassID`
-- `kAudioObjectPropertyScope` -> `kAudioObjectPropertyScopeOutput`
+- `kAudioObjectPropertyScope` -> `kAudioObjectPropertyScopeOutput` / `kAudioObjectPropertyScopeInput`
 - `kAudioLevelControlPropertyScalarValue` -> `1.0` (settable)
 - `kAudioLevelControlPropertyDecibelValue` -> `0.0` (settable)
 - `kAudioLevelControlPropertyDecibelRange` -> `{-96.0, 0.0}`
 
-## Driver Struct (C layout for CFPlugIn COM compatibility)
+## Driver Struct
 
 ```cpp
+struct DeviceState {
+    const char* name; const char* uid;
+    AudioObjectID deviceID, inputStreamID, outputStreamID, volumeControlID, inputVolumeControlID;
+    Float64 sampleRate;
+    std::atomic<UInt32> ioIsRunning;
+    UInt64  ioCycleCount;
+    Float32 volume; bool mute;
+    UInt32  inputTerminalType, outputTerminalType;
+    std::unique_ptr<RingBuffer> ringBuffer;
+    std::vector<float> snapshotBuffer;        // broadcast-read snapshot for this IO cycle
+    std::atomic<bool>  needsSnapshot;
+    UInt64  anchorHostTime; Float64 hostTicksPerFrame;
+    std::atomic<UInt32> channelCount;          // current 'lbch' value, IO-thread safe
+    UInt32  pendingChannelCount;               // guarded by LoopbackerDriver::mMutex
+};
+
 struct LoopbackerDriver {
-    // COM vtable pointer -- MUST be first field
-    AudioServerPlugInDriverInterface** mInterface;
-
-    // Reference count (atomic)
+    AudioServerPlugInDriverInterface* mInterface;  // COM vtable pointer -- MUST be first field
     std::atomic<UInt32> mRefCount;
-
-    // Host interface (set during Initialize)
     AudioServerPlugInHostRef mHost;
-
-    // Device state
-    std::atomic<bool>    mIORunning;
-    std::atomic<UInt32>  mIOClientCount;
-    Float64              mSampleRate;      // current nominal
-    UInt32               mBufferFrameSize; // current buffer size
-    Float32              mVolume;          // 0.0 - 1.0
-
-    // Clock state
-    UInt64  mAnchorHostTime;  // mach_absolute_time at StartIO
-    UInt64  mAnchorSampleTime;
-    UInt64  mClockSeed;
-
-    // Ring buffer
-    RingBuffer mRingBuffer;
-
-    // Mutex for non-realtime property changes (sample rate, etc.)
-    pthread_mutex_t mMutex;
+    DeviceState mDevices[kMaxDevices];
+    std::mutex mMutex;                              // shared across all devices
+    static AudioServerPlugInDriverInterface sInterface;
 };
 ```
 
-The static vtable is defined once and the `mInterface` field points to its
-address. This is standard COM/CFPlugIn layout.
+The static vtable is defined once and `mInterface` points to its address --
+standard COM/CFPlugIn layout. `mDevices` is a fixed-size array sized by
+`kMaxDevices`; every device shares the same mutex for non-realtime property
+changes (channel count, etc.) since those are rare and never on the IO path.
 
 ## Build System (CMake)
 
@@ -243,7 +268,6 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
 add_library(Loopbacker MODULE
     src/PluginEntry.cpp
     src/LoopbackerDriver.cpp
-    src/LoopbackerDevice.cpp
 )
 
 set_target_properties(Loopbacker PROPERTIES
@@ -266,7 +290,8 @@ set_target_properties(Loopbacker PROPERTIES
 )
 ```
 
-This produces `Loopbacker.driver/` as a proper macOS bundle.
+This produces `Loopbacker.driver/` as a proper macOS bundle. Build with
+`cd Driver && cmake -B build && cmake --build build`.
 
 ## Info.plist
 
@@ -338,7 +363,8 @@ sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod
 ```
 
 The `launchctl kickstart -kp` restarts `coreaudiod`, which rescans the HAL
-directory and loads the new plugin. No reboot required.
+directory and loads the new plugin -- all `kMaxDevices` devices appear together.
+No reboot required.
 
 Uninstall is the reverse: delete the bundle, restart coreaudiod.
 
@@ -348,19 +374,24 @@ Uninstall is the reverse: delete the bundle, restart coreaudiod.
 
 The AudioServerPlugIn interface is C (COM-style vtable). We implement it with
 free functions that cast `inDriver` to our `LoopbackerDriver*` struct. Internals
-use C++ for `std::atomic`, but nothing heavier -- no STL containers, no
-exceptions, no RTTI.
+use C++ for `std::atomic`, but nothing heavier -- no STL containers on the IO
+path, no exceptions, no RTTI.
 
 **Rationale**: The IO path runs on a realtime thread. No allocations, no locks,
 no exceptions. C++ atomics are the only concession.
 
-### 2. Single device, no dynamic creation
+### 2. Fixed device set, no dynamic creation
 
 `CreateDevice` / `DestroyDevice` return `kAudioHardwareUnsupportedOperationError`.
-The device exists from plugin load to unload.
+The driver's `kMaxDevices` devices exist from plugin load to unload; adding one
+means adding a `VirtualDeviceInfo` entry and rebuilding/reinstalling the driver,
+not calling a runtime API.
 
-**Rationale**: Simplicity. BlackHole does the same. Multiple devices would be a
-separate binary (like BlackHole16ch vs BlackHole2ch).
+**Rationale**: Simplicity and predictability -- every object ID is a compile-time
+constant, so no part of the driver (or the app's `AudioRouter`) has to handle a
+device appearing or disappearing mid-session. BlackHole ships separate binaries
+per channel count for the same reason; we instead parameterize the device count
+at compile time via `kMaxDevices`/`kDeviceInfos`.
 
 ### 3. Interleaved Float32
 
@@ -381,7 +412,7 @@ desired later, it is a single multiply in the ReadInput path.
 ### 5. Zero latency / zero safety offset
 
 Both `kAudioDevicePropertyLatency` and `kAudioDevicePropertySafetyOffset` return
-0. Since there is no real hardware, there is no pipeline delay.
+0 on every device. Since there is no real hardware, there is no pipeline delay.
 
 **Rationale**: Minimizes the total roundtrip latency reported to apps.
 
@@ -419,7 +450,8 @@ Input and output streams on a device always share the same count.
   `host->WriteToStorage` with key `"channelCount.<deviceUID>"` and a
   `CFNumber` value. `Initialize` restores it per device via
   `host->CopyFromStorage`, falling back to the default (2) if the key is
-  absent or the stored value is invalid.
+  absent or the stored value is invalid. Keys are per-device-UID, so each of
+  the three devices persists its own width independently.
 - **IO path**: `DoIOOperation` reads `DeviceState::channelCount` with an
   atomic load (real-time safe — no allocation/lock/logging) to size its
   `memcpy`/volume-scaling loops; the value only changes while IO is stopped.
@@ -431,18 +463,38 @@ Input and output streams on a device always share the same count.
 
 The app sets `lbch` through `VirtualDeviceChannels` and owns the desired counts:
 
-- **Virtual mic** (`LoopbackerDevice_UID`): the Routing canvas's output channels
-  rounded up to a pair (`RoutingState.micChannelCount`). The ⊕/⊖ buttons add or
-  remove a pair.
+- **Virtual mic** (`VirtualDeviceChannels.micUID` = `LoopbackerDevice_UID`): the
+  Routing canvas's output channels rounded up to a pair (`RoutingState.micChannelCount`).
+  The ⊕/⊖ buttons add or remove a pair.
+- **Stream Mix** (`VirtualDeviceChannels.streamUID` = `LoopbackerDevice_UID_Stream`):
+  a second, independent set of channels (`RoutingState.streamOutputChannels`,
+  `streamMicChannelCount`), hidden behind `RoutingState.streamMixEnabled` (a
+  toggle in the routing canvas header) so existing users see no change until
+  they opt in. Sized and routed exactly like the virtual mic, just into a
+  different device and a disjoint set of `AudioRoute`s (`AudioRoute.targetId`).
 - **Output devices** (e.g. `LoopbackerDevice_UID_2`): `OutputDestination.channelCount`,
   plus `monitorChannel`, the first channel of the pair played to the physical output.
 
-`AudioRouter.setVirtualDeviceChannels` stops the routes that touch the device, sets
-the property, waits (≤2 s) for the HAL to report the new stream configuration, and
-restarts the same routes. Saved counts are pushed before any route starts at launch.
+`AudioRouter.setVirtualDeviceChannels` stops every route whose target is the
+resized device (identified by `RouteContext.playbackDeviceUID == deviceUID`,
+regardless of source), sets the property, waits (≤2 s) for the HAL to report the
+new stream configuration, and restarts those same routes. Saved counts for every
+device (virtual mic, Stream Mix, output destinations) are pushed before any
+route starts at launch.
+
+**Routing targets.** `AudioRoute` carries a `targetId: RouteTarget` (`.virtualMic`
+or `.streamMix`; routes saved before Stream Mix existed decode as `.virtualMic`).
+The router runs one `RouteContext` per (source device, target device) pair, each
+with its own mix matrix (`AudioRoute.sourceChannelId` -> `.outputChannelId` for
+that target only) and its own input/output AUHAL pair, keyed internally by both
+source and target so a source can feed the virtual mic, Stream Mix, both, or
+neither independently. This mirrors the existing mic-route/monitor-route split
+(two separate `RouteContext`s on the same capture device) rather than
+introducing a new sharing mechanism.
 
 Each `RouteContext` has independent widths: `inputChannels` (every channel of the
-source, capped at 64) and `outputChannels` (the playback device). One block flows:
+source, capped at 64) and `outputChannels` (the target device's current width,
+which can differ between the virtual mic and Stream Mix). One block flows:
 
 ```
 capture (inputChannels) → source meter → mix matrix (outputChannels × inputChannels)
@@ -452,20 +504,34 @@ capture (inputChannels) → source meter → mix matrix (outputChannels × input
   → output meter → drift-compensated ring → playback
 ```
 
+Noise suppression and the voice `FXChain` run **once per capture device**, not
+once per route: every voice route on the same capture device (virtual mic,
+Stream Mix, monitor) shares one `NoiseSuppressor` and one `FXChain` instance,
+published through an unretained atomic pointer the IO thread reads
+(`RouteContext.noiseSlot`/`fxSlot`). Both caches key a processed block by HAL
+sample time and are width-agnostic: the cached data is always a canonical
+stereo/mono pair, and both the cache-hit and cache-miss paths write/read it
+through the *calling* route's own `stride`/`outputChannels`, never anything
+cached from whichever route happened to compute the block first -- so the
+virtual mic (e.g. 2 channels) and Stream Mix (e.g. 4 channels) routes on the
+same mic correctly share one computation despite their different output widths.
+
 Output routing captures every channel of the virtual device and mixes the monitor pair
 to the physical output's first two channels, so other channels (a timecode track, for
 example) stay on the device for other apps to record without reaching the speakers.
 
 Meter levels go to an `@Observable` `MeterLevels` store rather than the routing model, split
 per route and per channel (`SourceLevelStore`, `ChannelLevelBox`) and quantized to 1/256, so a
-30 Hz meter tick re-renders only the meters and cables whose own level visibly moved. Once
-every level has decayed to zero and that has been shown, ticks do nothing until signal returns.
+30 Hz meter tick re-renders only the meters and cables whose own level visibly moved. Post-mix
+output levels are tracked per target device (`MeterLevels.updateOutputs(target:_:)`), so the
+virtual mic's and Stream Mix's meters never bleed into each other even though both number
+their channels from 1.
 
 ## Noise Suppression
 
 `NoiseSuppressor` runs one of three engines (`DenoiseKernel`s) on the CPU, inline in the capture
-callback. Only routes fed by a physical input use it (mic → virtual mic, mic → monitor); app
-captures and output routes don't.
+callback. Only routes fed by a physical input use it (mic → virtual mic, mic → Stream Mix,
+mic → monitor); app captures and output routes don't.
 
 - **DPDFNet** (`DPDFNetKernel`): CEVA's DPDFNet2 48 kHz model (Apache-2.0) through BNNS Graph,
   which executes a compiled graph with caller-provided workspace and buffers, with no
@@ -498,6 +564,11 @@ The engine-independent part is `NoiseSuppressor`: it downmixes channels 1–2 to
 the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 512 for FastEnhancer -- any hop
 size works, `NoiseSuppressor` doesn't assume one), and blends the dry signal (delayed by the
 kernel's delay) back in at the user's max-reduction level. Its buffers are `mlock`ed as well.
+`process(_:frames:stride:sampleTime:)` caches the processed mono/stereo pair keyed by
+`sampleTime`; a later caller with the same `sampleTime` and frame count gets the cached result
+written through its *own* `stride`, so routes of different output widths sharing one
+suppressor (e.g. the virtual mic at 2 channels and Stream Mix at 4) are handled correctly
+without any width-specific logic.
 
 Compiling DPDFNet or FastEnhancer takes roughly a second, so the compiled graph
 (`CompiledGraph`, shared by `NoiseSuppressionModel` and `FastEnhancerModel`) is cached in
@@ -520,10 +591,12 @@ first shows the picker. It recommends FastEnhancer while it takes at most 20% of
 otherwise. FastEnhancer is also the default engine for new setups. DPDFNet is never the
 recommendation: it cleans up slightly more, but its 60 ms of delay matters more on a live mic.
 
-The virtual mic route and the monitor route of the same mic share one suppressor. They mix
-identically, and the HAL calls both input callbacks back to back on the device's IO thread
-with the same sample time, so the first computes the block and the second copies it (a busy
-flag leaves a block dry if two threads ever collided).
+Every voice route on the same capture device shares one suppressor: the virtual mic route,
+the Stream Mix route, and the monitor route, when more than one exists. They mix identically
+(the mix matrix only differs in output *width*, not which source channels feed channels 1-2),
+and the HAL calls their input callbacks back to back on the device's IO thread with the same
+sample time, so the first one to run computes the block and the others copy it (a busy flag
+leaves a block dry if two threads ever collided).
 
 Latency is constant regardless of buffer size: the kernel's delay plus up to a hop waiting for
 the current hop to fill. That's 60 ms (2879 samples) for DPDFNet, 21 ms (1023) for
@@ -587,12 +660,15 @@ recommended engine and the default. Re-run with
 The voice chain is an ordered list of `FXNode` stages (`EffectsPreset.nodes`, each an
 `FXNodeConfig`): built-ins (gate, EQ, compressor, leveler, de-esser, chorus, pitch shift, reverb,
 delay, limiter) plus hosted third-party effects (Audio Unit, JSFX, Airwindows). `FXChain` runs
-that list for one capture device, shared by every voice route on the device (virtual mic +
-monitor) exactly like `NoiseSuppressor`: the routes' input callbacks run back to back on the
-device's IO thread with the same HAL sample time, so the first route to see a block computes it
-and the others copy the cached result. Each block is deinterleaved into planar scratch buffers
-(processed mono when the voice pair is bitwise identical, e.g. a mono mic fanned to L+R), run
-through the nodes, then reinterleaved; blocks larger than `FXBlock.maxFrames` (4096) are split.
+that list for one capture device, shared by every voice route on the device (virtual mic,
+Stream Mix, and monitor) exactly like `NoiseSuppressor`: the routes' input callbacks run back to
+back on the device's IO thread with the same HAL sample time, so the first route to see a block
+computes it and the others copy the cached result -- the cache (`FXChain.cachedInterleaved`) is
+a fixed-width stereo pair written and read through each caller's own `stride`, so it stays
+correct across routes of different output widths. Each block is deinterleaved into planar
+scratch buffers (processed mono when the voice pair is bitwise identical, e.g. a mono mic
+fanned to L+R), run through the nodes, then reinterleaved; blocks larger than `FXBlock.maxFrames`
+(4096) are split.
 
 `FXChain` also runs a `VoiceActivityDetector` on the block's mono mix and publishes the latest
 speech probability to `VoiceBus`, an app-wide atomic (max over every active chain, decaying when
@@ -654,7 +730,9 @@ SwiftUI work on the main thread is kept off the per-display-frame path:
   `MeterLevels` inside the `NSView`, quantized to 16 steps. The glow is a wide low-opacity stroke
   layer plus a native `shadowRadius`/`shadowOpacity` for softness, not a Gaussian blur filter,
   which previously forced the whole routing canvas to be re-rasterized on the main thread on
-  every step change (~6% of a core with all meters moving).
+  every step change (~6% of a core with all meters moving). `ConnectorEnd.output` carries the
+  target device, so the virtual mic and Stream Mix columns' channel 1 connectors (and their
+  cables) never collide despite sharing channel numbers.
 - **Looping animations** (`LiveDot`'s halo, `SignalLineConnector`'s travelling dot) are
   `CAAnimation`s on a `LoopingDot` layer. A repeating SwiftUI animation re-runs the view graph
   and window layout every display frame; Core Animation runs it in the render server.
@@ -700,22 +778,33 @@ on a given machine, independent of the app's own UI.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Clock drift vs. real hardware | Glitches when aggregating with MOTU M2 | Use `kAudioDeviceClockAlgorithmRaw` and keep timestamps precise. For aggregate device use, the host handles drift compensation. The app's own routes (input AUHAL on one device, output AUHAL on another) bridge clocks through `DriftCompensatedRing`, which resamples by up to ±0.1% to hold the ring at its target fill; a measured M2 runs ~45 ppm slow vs. the host clock, which drained the old plain ring into continuous crackle within minutes. |
-| Ring buffer overrun/underrun | Silence or stale audio | 65536-frame buffer provides >1s headroom. Log (to stderr/syslog) on wrap. |
-| coreaudiod crash on bad property response | System-wide audio failure | Extensive testing of every property the host queries. Return `kAudioHardwareUnknownPropertyError` for anything unexpected. |
+| Ring buffer overrun/underrun | Silence or stale audio | 2048-frame-per-device buffer provides >4x the default IO buffer size of headroom. Log (to stderr/syslog) on wrap. |
+| coreaudiod crash on bad property response | System-wide audio failure | Extensive testing of every property the host queries, on every device. Return `kAudioHardwareUnknownPropertyError` for anything unexpected. |
 | Code signing on macOS 13+ | Plugin may not load | Ad-hoc signing (`codesign -s -`) is sufficient for local use. Distribution requires a Developer ID. |
 | Apple Silicon / Intel | Must run on both | CMake `CMAKE_OSX_ARCHITECTURES "arm64;x86_64"` for universal binary. |
+| A new virtual device isn't VPIO-safe or mic-class by mistake | FaceTime/Phone gates the real mic, or OBS/Discord can't see it | Each `VirtualDeviceInfo` entry picks its own `inputTerminalType`/`outputTerminalType` explicitly (mic-class for Device 0 and 2, generic for Device 1); adding a device means choosing this deliberately, not inheriting a default. |
 
 ## Testing Strategy
 
-1. **Build and load**: Install, restart coreaudiod, verify device appears in
-   Audio MIDI Setup.
+1. **Build and load**: Install, restart coreaudiod, verify all `kMaxDevices`
+   devices appear in Audio MIDI Setup (Loopbacker, Loopbacker 2, Loopbacker
+   Stream).
 2. **Property audit**: Use `coreaudiod` log output and/or a test harness that
-   calls `AudioObjectGetPropertyData` for every property we claim to support.
-3. **Loopback test**: Play audio to Loopbacker output, record from Loopbacker
-   input, compare waveforms (should be bit-identical with no volume scaling).
-4. **Multi-rate**: Switch between 44.1/48/96kHz and verify no crashes.
+   calls `AudioObjectGetPropertyData` for every property we claim to support,
+   on every device.
+3. **Loopback test**: Play audio to a device's output, record from that same
+   device's input, compare waveforms (should be bit-identical with no volume
+   scaling). Repeat per device.
+4. **Channel count**: Switch each device's `lbch` through its supported range
+   and verify no crashes and the new width is reported and persisted.
 5. **Aggregate device**: Create an aggregate with MOTU M2 + Loopbacker, verify
    Discord can capture the aggregate input.
+6. **App-side manual test plan** (after installing the new driver, see the
+   PR/issue report for the exact steps): devices appear with the right names
+   and terminal types, OBS/streaming apps see "Loopbacker Stream" as a
+   selectable microphone, a source routes independently to Virtual Mic and
+   Stream Mix, and each target's channel count can be changed without
+   affecting the other.
 
 ## Future Considerations (Out of Scope for v0.1)
 

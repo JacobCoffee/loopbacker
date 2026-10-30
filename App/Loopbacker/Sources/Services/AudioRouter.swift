@@ -18,7 +18,17 @@ private final class NoiseModelLoadState<Model: AnyObject & Sendable>: @unchecked
     var loadFailed = false
 }
 
-/// Routes audio from real input devices to the Loopbacker virtual output device,
+/// Identifies one running input/app-capture route: a source (device UID, or `"app:<bundle>"`)
+/// feeding one target virtual mic (`RouteTarget.deviceUID`). A source can run two routes at
+/// once — one to the virtual mic, one to Stream Mix — sharing voice processing (FX chain,
+/// noise suppressor) by `captureDeviceUID` (see `attachFXChain`/`applyNoiseSuppression`), each
+/// with its own `RouteContext` and mix matrix per the routing-target contract.
+private struct RouteKey: Hashable {
+    let source: String
+    let target: String
+}
+
+/// Routes audio from real input devices to the Loopbacker virtual output device(s),
 /// providing real-time meter levels back to the UI.
 class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Published state
@@ -58,7 +68,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Internal state
 
-    private var activeRoutes: [String: RouteContext] = [:]
+    /// Keyed by (source, target) so one source can feed both the virtual mic and Stream Mix.
+    private var activeRoutes: [RouteKey: RouteContext] = [:]
     private var activeOutputRoutes: [String: RouteContext] = [:]
     /// Voice chains keyed by capture device UID, mirrored into `fxChainsSnapshot` for
     /// cross-thread reads (`FXEngine`). Queue only.
@@ -75,10 +86,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// for very wide interfaces).
     static let maxRouteChannels: UInt32 = 64
 
-    /// Per-source channel mix saved from the UI. Applied when the route is (re)started,
-    /// and pushed live to the running route via `mixMatrix` if it's already active.
-    /// Key = sourceDeviceUID (or "app:<bundle>" for app captures).
-    private var pendingMixMatrices: [String: [(srcCh: Int, dstCh: Int)]] = [:]
+    /// Per-source, per-target channel mix saved from the UI. Applied when the route is
+    /// (re)started, and pushed live to the running route via `mixMatrix` if it's already active.
+    private var pendingMixMatrices: [RouteKey: [(srcCh: Int, dstCh: Int)]] = [:]
 
     /// Holds the CoreAudio resources for a single source -> destination route.
     ///
@@ -118,9 +128,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         private(set) var mixBuffer: UnsafeMutablePointer<Float>
         private(set) var blockFrames: UInt32 = 1024
 
-        /// Voice-chain processor (mic → virtual mic / mic → monitor only), shared with the
-        /// other voice route on the same capture device via `fxSlot`, published unretained
-        /// exactly like `noiseSlot`. `fxOwner` holds the strong reference.
+        /// Voice-chain processor (mic → virtual mic / mic → Stream Mix / mic → monitor), shared
+        /// with every other voice route on the same capture device via `fxSlot`, published
+        /// unretained exactly like `noiseSlot`. `fxOwner` holds the strong reference.
         let fxSlot = Atomic<Unmanaged<FXChain>?>(nil)
         /// Queue only.
         private(set) var fxOwner: FXChain?
@@ -135,15 +145,15 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// noise suppression and the voice `FXChain`: app captures carry music/game audio, and
         /// output routes replay the already-processed virtual device.
         let isVoiceInput: Bool
-        /// App-capture routes (game/music/browser → virtual mic). Gets `appAudioProcessor`
+        /// App-capture routes (game/music/browser → a virtual mic). Gets `appAudioProcessor`
         /// instead of the voice chain.
         let isAppCapture: Bool
         /// Mic → monitor output (you hearing yourself). Queue only.
         var isMonitor = false
         /// The suppressor the audio thread runs, published unretained so `queue` can swap it
         /// without racing a release on the audio thread. `noiseOwner` holds the strong reference.
-        /// Shared with the other voice route on the same capture device (virtual mic + monitor),
-        /// which runs the same mix.
+        /// Shared with every other voice route on the same capture device (virtual mic, Stream
+        /// Mix, monitor), which all run the same dry mix.
         let noiseSlot = Atomic<Unmanaged<NoiseSuppressor>?>(nil)
         /// Queue only.
         private(set) var noiseOwner: NoiseSuppressor?
@@ -383,8 +393,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
         queue.async { [self] in
             let keys = Array(self.activeRoutes.keys)
-            for uid in keys {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             let outputKeys = Array(self.activeOutputRoutes.keys)
             for uid in outputKeys {
@@ -399,58 +409,61 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     func restartAllRoutes() {
         queue.async { [weak self] in
             guard let self else { return }
-            let uids = Array(self.activeRoutes.keys)
+            let pairs = self.activeRoutes.keys.map { (source: $0.source, target: $0.target) }
             let outputUIDs = Array(self.activeOutputRoutes.keys)
-            for uid in uids {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in self.activeRoutes.keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             for uid in outputUIDs {
                 self.stopOutputRoutingInternal(virtualDeviceUID: uid)
             }
             // Retry with bounded attempts instead of a fixed 0.5s delay.
             // The audio system may take a variable amount of time to settle after wake.
-            self.retryRoutingAfterWake(sourceUIDs: uids, attempt: 0, maxAttempts: 5)
+            self.retryRoutingAfterWake(pairs: pairs, attempt: 0, maxAttempts: 5)
         }
     }
 
     /// Retry starting routes after wake with bounded attempts at increasing intervals.
-    private func retryRoutingAfterWake(sourceUIDs: [String], attempt: Int, maxAttempts: Int) {
+    private func retryRoutingAfterWake(pairs: [(source: String, target: String)], attempt: Int, maxAttempts: Int) {
         // USB devices like MOTU M2 need more time to re-enumerate after wake
         let delay = Double(attempt + 1) * 0.5
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            var failedUIDs: [String] = []
-            for uid in sourceUIDs {
+            var failedPairs: [(source: String, target: String)] = []
+            for pair in pairs {
                 // Check if the device is available before trying to start
-                if self.findDeviceByUID(uid) != nil {
-                    self.startRouting(sourceDeviceUID: uid)
+                if self.findDeviceByUID(pair.source) != nil {
+                    self.startRouting(sourceDeviceUID: pair.source, targetDeviceUID: pair.target)
                 } else {
-                    failedUIDs.append(uid)
+                    failedPairs.append(pair)
                 }
             }
-            // Retry remaining UIDs if we haven't exhausted attempts
-            if !failedUIDs.isEmpty && attempt + 1 < maxAttempts {
-                logger.info("Wake retry \(attempt + 1)/\(maxAttempts): \(failedUIDs.count) device(s) not yet available")
-                self.retryRoutingAfterWake(sourceUIDs: failedUIDs, attempt: attempt + 1, maxAttempts: maxAttempts)
-            } else if !failedUIDs.isEmpty {
-                logger.warning("Wake retry exhausted: \(failedUIDs.count) device(s) still unavailable")
+            // Retry remaining pairs if we haven't exhausted attempts
+            if !failedPairs.isEmpty && attempt + 1 < maxAttempts {
+                logger.info("Wake retry \(attempt + 1)/\(maxAttempts): \(failedPairs.count) route(s) not yet available")
+                self.retryRoutingAfterWake(pairs: failedPairs, attempt: attempt + 1, maxAttempts: maxAttempts)
+            } else if !failedPairs.isEmpty {
+                logger.warning("Wake retry exhausted: \(failedPairs.count) route(s) still unavailable")
             }
         }
     }
 
     // MARK: - Public API (input routing)
 
-    /// Start routing audio from the given source device to the Loopbacker virtual device.
-    func startRouting(sourceDeviceUID: String) {
+    /// Start routing audio from the given source device to a Loopbacker virtual device.
+    /// `targetDeviceUID` defaults to the virtual mic; pass `VirtualDeviceChannels.streamUID`
+    /// for Stream Mix. The two targets run independent `RouteContext`s sharing voice
+    /// processing (see `attachFXChain`/`applyNoiseSuppression`).
+    func startRouting(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID) {
         queue.async { [weak self] in
-            self?.startRoutingInternal(sourceDeviceUID: sourceDeviceUID)
+            self?.startRoutingInternal(sourceDeviceUID: sourceDeviceUID, targetDeviceUID: targetDeviceUID)
         }
     }
 
-    /// Stop routing for a specific source device.
-    func stopRouting(sourceDeviceUID: String) {
+    /// Stop routing for a specific source device → target pair.
+    func stopRouting(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID) {
         queue.async { [weak self] in
-            self?.stopRoutingInternal(sourceDeviceUID: sourceDeviceUID)
+            self?.stopRoutingInternal(sourceKey: sourceDeviceUID, targetDeviceUID: targetDeviceUID)
         }
     }
 
@@ -459,8 +472,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             let keys = Array(self.activeRoutes.keys)
-            for uid in keys {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             let outputKeys = Array(self.activeOutputRoutes.keys)
             for uid in outputKeys {
@@ -504,8 +517,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.applyNoiseSuppression(to: ctx)
             self.applyEchoCancellation(to: ctx)
             self.refreshEchoCancellersSnapshot()
-            // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
-            if let pending = self.pendingMixMatrices[sourceDeviceUID] {
+            // Monitor hears the same channel mix as the virtual mic route (e.g. mono mic fanned
+            // to L+R); the virtual mic is the monitor's reference target.
+            if let pending = self.pendingMixMatrices[RouteKey(source: sourceDeviceUID, target: VirtualDeviceChannels.micUID)] {
                 self.applyMixToContext(ctx, routes: pending)
             }
             guard self.setupInputUnit(ctx) else { return }
@@ -525,10 +539,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Public API (virtual device channel count)
 
-    /// Resize a Loopbacker virtual device to `count` channels. Routes that play into or
-    /// capture from the device stop, the driver reconfigures it, and the same routes restart
-    /// at the new width. `completion` receives the count the device reports afterwards
-    /// (nil when its driver predates the channel-count property).
+    /// Resize a Loopbacker virtual device (the virtual mic, Stream Mix, or an output
+    /// destination) to `count` channels. Every route whose target is this device stops, the
+    /// driver reconfigures it, and the same routes restart at the new width. `completion`
+    /// receives the count the device reports afterwards (nil when its driver predates the
+    /// channel-count property).
     func setVirtualDeviceChannels(_ count: Int, deviceUID: String, appCaptureService: AppCaptureService,
                                   completion: @escaping @MainActor @Sendable (Int?) -> Void) {
         queue.async { [weak self] in
@@ -539,15 +554,15 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            let inputKeys = deviceUID == VirtualDeviceChannels.micUID ? Array(self.activeRoutes.keys) : []
+            let affectedKeys = self.activeRoutes.filter { $0.value.playbackDeviceUID == deviceUID }.map(\.key)
             let outputRoute = self.activeOutputRoutes[deviceUID].map {
                 (physicalUID: $0.playbackDeviceUID, monitorChannel: $0.monitorChannel)
             }
-            for key in inputKeys {
-                if key.hasPrefix("app:") {
-                    self.stopAppCaptureInternal(bundleID: String(key.dropFirst(4)))
+            for key in affectedKeys {
+                if key.source.hasPrefix("app:") {
+                    self.stopAppCaptureInternal(bundleID: String(key.source.dropFirst(4)), targetDeviceUID: key.target)
                 } else {
-                    self.stopRoutingInternal(sourceDeviceUID: key)
+                    self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
                 }
             }
             if outputRoute != nil {
@@ -560,12 +575,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 logger.error("Driver rejected \(count) channels for \(deviceUID)")
             }
 
-            for key in inputKeys {
-                if key.hasPrefix("app:") {
+            for key in affectedKeys {
+                if key.source.hasPrefix("app:") {
                     // SCStream keeps running; startCapture swaps it onto the new context.
-                    self.startAppCapture(bundleID: String(key.dropFirst(4)), appCaptureService: appCaptureService)
+                    self.startAppCapture(bundleID: String(key.source.dropFirst(4)), targetDeviceUID: key.target,
+                                        appCaptureService: appCaptureService)
                 } else {
-                    self.startRoutingInternal(sourceDeviceUID: key)
+                    self.startRoutingInternal(sourceDeviceUID: key.source, targetDeviceUID: key.target)
                 }
             }
             if let outputRoute {
@@ -593,16 +609,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Public API (app audio capture)
 
-    /// Start routing audio from a running application (via ScreenCaptureKit) to the Loopbacker virtual device.
-    func startAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
-        let key = "app:\(bundleID)"
+    /// Start routing audio from a running application (via ScreenCaptureKit) to a Loopbacker
+    /// virtual device. `targetDeviceUID` defaults to the virtual mic; pass
+    /// `VirtualDeviceChannels.streamUID` to also (or instead) feed Stream Mix.
+    func startAppCapture(bundleID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                         appCaptureService: AppCaptureService) {
+        let sourceKey = "app:\(bundleID)"
+        let routeKey = RouteKey(source: sourceKey, target: targetDeviceUID)
         queue.async { [weak self] in
             guard let self else { return }
-            guard self.activeRoutes[key] == nil else { return }
+            guard self.activeRoutes[routeKey] == nil else { return }
 
-            // Find the Loopbacker virtual device for output
-            guard let playbackDeviceID = self.findDeviceByUID("LoopbackerDevice_UID") else {
-                logger.error("Loopbacker virtual device not found for app capture")
+            // Find the target Loopbacker virtual device for output
+            guard let playbackDeviceID = self.findDeviceByUID(targetDeviceUID) else {
+                logger.error("Loopbacker virtual device not found for app capture: \(targetDeviceUID)")
                 return
             }
 
@@ -611,16 +631,16 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             let captureChannels: UInt32 = 2
             let micChannels = self.routableChannelCount(playbackDeviceID, scope: kAudioObjectPropertyScopeOutput)
             guard micChannels > 0 else {
-                logger.error("Loopbacker virtual device reports no output channels")
+                logger.error("Loopbacker virtual device reports no output channels: \(targetDeviceUID)")
                 return
             }
 
             // Create a RouteContext with no input AUHAL — SCStream replaces it
             let ctx = RouteContext(
-                captureDeviceUID: key,
+                captureDeviceUID: sourceKey,
                 captureDeviceID: 0,
                 playbackDeviceID: playbackDeviceID,
-                playbackDeviceUID: "LoopbackerDevice_UID",
+                playbackDeviceUID: targetDeviceUID,
                 inputChannels: captureChannels,
                 outputChannels: micChannels,
                 sampleRate: sampleRate,
@@ -657,8 +677,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                     return
                 }
             }
-            self.activeRoutes[key] = ctx
-            if let pending = self.pendingMixMatrices[key] {
+            self.activeRoutes[routeKey] = ctx
+            if let pending = self.pendingMixMatrices[routeKey] {
                 self.applyMixToContext(ctx, routes: pending)
             }
 
@@ -687,28 +707,29 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 } catch {
                     logger.error("Failed to start app capture for \(bundleID): \(error.localizedDescription)")
                     self.queue.async {
-                        self.stopAppCaptureInternal(bundleID: bundleID)
+                        self.stopAppCaptureInternal(bundleID: bundleID, targetDeviceUID: targetDeviceUID)
                     }
                 }
             }
 
-            logger.info("Started app capture routing for \(bundleID)")
+            logger.info("Started app capture routing for \(bundleID) -> \(targetDeviceUID)")
         }
     }
 
-    /// Stop app audio capture routing for a specific bundle.
-    func stopAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
+    /// Stop app audio capture routing for a specific bundle → target pair.
+    func stopAppCapture(bundleID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                        appCaptureService: AppCaptureService) {
         queue.async { [weak self] in
-            self?.stopAppCaptureInternal(bundleID: bundleID)
+            self?.stopAppCaptureInternal(bundleID: bundleID, targetDeviceUID: targetDeviceUID)
         }
         Task { @MainActor in
             await appCaptureService.stopCapture(bundleID: bundleID)
         }
     }
 
-    private func stopAppCaptureInternal(bundleID: String) {
-        let key = "app:\(bundleID)"
-        guard let ctx = activeRoutes.removeValue(forKey: key) else { return }
+    private func stopAppCaptureInternal(bundleID: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: "app:\(bundleID)", target: targetDeviceUID)
+        guard let ctx = activeRoutes.removeValue(forKey: routeKey) else { return }
 
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
@@ -718,23 +739,28 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         teardownUnit(&ctx.outputUnit)
         if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
-        logger.info("Stopped app capture routing for \(bundleID)")
+        logger.info("Stopped app capture routing for \(bundleID) -> \(targetDeviceUID)")
     }
 
     // MARK: - Channel routing
 
-    /// Push the per-source channel mix from the UI's route graph into the audio engine.
-    /// `routes` is a list of (sourceChannel, outputChannel) 1-indexed pairs for a single source.
-    /// An empty list falls back to identity passthrough (src1→out1, src2→out2).
-    /// Applied immediately if the route is active, and cached so it's re-applied on restart.
-    func setChannelMix(sourceDeviceUID: String, routes: [(srcCh: Int, dstCh: Int)]) {
+    /// Push the per-source, per-target channel mix from the UI's route graph into the audio
+    /// engine. `routes` is a list of (sourceChannel, outputChannel) 1-indexed pairs for a
+    /// single source → target pair. An empty list falls back to identity passthrough
+    /// (src1→out1, src2→out2). Applied immediately if the route is active, and cached so it's
+    /// re-applied on restart.
+    func setChannelMix(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                       routes: [(srcCh: Int, dstCh: Int)]) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.pendingMixMatrices[sourceDeviceUID] = routes
-            if let ctx = self.activeRoutes[sourceDeviceUID] {
+            let key = RouteKey(source: sourceDeviceUID, target: targetDeviceUID)
+            self.pendingMixMatrices[key] = routes
+            if let ctx = self.activeRoutes[key] {
                 self.applyMixToContext(ctx, routes: routes)
             }
-            if let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
+            // The monitor route always mirrors the virtual mic's mix (see `startMonitoring`).
+            if targetDeviceUID == VirtualDeviceChannels.micUID,
+               let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
                 self.applyMixToContext(monitor, routes: routes)
             }
         }
@@ -780,8 +806,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Voice FX chain
 
     /// Must run on `queue`. Attaches `ctx` to the voice chain for its capture device, sharing
-    /// the existing instance with any other voice route on the same device (virtual mic +
-    /// monitor), or creating one. No-op for non-voice routes.
+    /// the existing instance with any other voice route on the same device (virtual mic,
+    /// Stream Mix, monitor), or creating one. No-op for non-voice routes.
     private func attachFXChain(to ctx: RouteContext) {
         guard ctx.isVoiceInput else { return }
         if let sibling = voiceContexts.first(where: { $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID }),
@@ -838,7 +864,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// - Parameters:
     ///   - excludedDeviceUIDs: capture devices whose source opted out.
     ///   - dryMonitorDeviceUIDs: capture devices whose monitor route skips suppression (no
-    ///     added delay when hearing yourself); their virtual mic route is still suppressed.
+    ///     added delay when hearing yourself); their virtual mic and Stream Mix routes are
+    ///     still suppressed.
     func updateNoiseSuppression(_ settings: NoiseSuppressionSettings, excludedDeviceUIDs: Set<String>,
                                 dryMonitorDeviceUIDs: Set<String>) {
         queue.async { [weak self] in
@@ -1168,19 +1195,25 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// real audio returns. `isEverythingSilent` is a read-only pass over the raw buffers (no
     /// allocation); when it agrees with `wasSilentMeters` this tick skips draining, building the
     /// per-route dictionaries, and walking `NSApp.windows` entirely.
+    ///
+    /// Output levels are tracked per target device (virtual mic, Stream Mix): two routes
+    /// feeding different targets never bleed into each other's post-mix meters even though
+    /// their channel numbering overlaps (see `MeterLevels.updateOutputs(target:_:)`).
     private func updatePublishedMeters() {
         guard !(wasSilentMeters && isEverythingSilent()) else { return }
 
         var newSourceLevels: [String: [Int: Float]] = [:]
-        var newOutputLevels: [Int: Float] = [:]
+        var newOutputLevelsByTarget: [String: [Int: Float]] = [:]
         var sawNonZero = false
 
-        for (uid, ctx) in activeRoutes {
-            newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
-            // Output meter takes post-mix levels (max across sources).
+        for (key, ctx) in activeRoutes {
+            newSourceLevels[key.source] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+            // Output meter takes post-mix levels (max across every route feeding this target).
+            var targetLevels = newOutputLevelsByTarget[ctx.playbackDeviceUID] ?? [:]
             for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
-                newOutputLevels[ch] = max(newOutputLevels[ch] ?? 0.0, level)
+                targetLevels[ch] = max(targetLevels[ch] ?? 0.0, level)
             }
+            newOutputLevelsByTarget[ctx.playbackDeviceUID] = targetLevels
         }
 
         // Output routes report the virtual device channels they capture.
@@ -1193,8 +1226,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         wasSilentMeters = false
 
         let sourceLevels = newSourceLevels
-        let outputLevels = newOutputLevels
-        let routesEmpty = activeRoutes.isEmpty
+        let outputLevelsByTarget = newOutputLevelsByTarget
+        let activeTargets = Set(activeRoutes.values.map(\.playbackDeviceUID))
         MainActor.assumeIsolated {
             // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
             // publish re-renders the cables and meters of a window nobody sees. Publish only while
@@ -1215,13 +1248,14 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             for (key, channels) in sourceLevels {
                 meters.updateSource(key, channels: channels)
             }
-            // Every active route shares the same virtual output device, so its channel set never
-            // changes while any route is running — only clear it on the empty transition so a
-            // stale post-mix peak doesn't linger once nothing writes it anymore.
-            if routesEmpty {
-                meters.clearOutputs()
-            } else {
-                meters.updateOutputs(outputLevels)
+            // Every target's channel set never changes while any route still feeds it — clear
+            // only on that target's empty transition so a stale post-mix peak doesn't linger.
+            for target in [VirtualDeviceChannels.micUID, VirtualDeviceChannels.streamUID] {
+                if activeTargets.contains(target) {
+                    meters.updateOutputs(target: target, outputLevelsByTarget[target] ?? [:])
+                } else {
+                    meters.clearOutputs(target: target)
+                }
             }
         }
     }
@@ -1260,9 +1294,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Internal routing (input -> loopbacker)
 
-    private func startRoutingInternal(sourceDeviceUID: String) {
-        // Already routing this source
-        guard activeRoutes[sourceDeviceUID] == nil else { return }
+    private func startRoutingInternal(sourceDeviceUID: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: sourceDeviceUID, target: targetDeviceUID)
+        // Already routing this source -> target pair
+        guard activeRoutes[routeKey] == nil else { return }
 
         // Find the source device ID
         guard let captureDeviceID = findDeviceByUID(sourceDeviceUID) else {
@@ -1270,9 +1305,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return
         }
 
-        // Find the Loopbacker virtual device
-        guard let playbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") else {
-            logger.error("Loopbacker virtual device not found")
+        // Find the target Loopbacker virtual device
+        guard let playbackDeviceID = findDeviceByUID(targetDeviceUID) else {
+            logger.error("Loopbacker virtual device not found: \(targetDeviceUID)")
             return
         }
 
@@ -1284,18 +1319,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
         let micChannels = routableChannelCount(playbackDeviceID, scope: kAudioObjectPropertyScopeOutput)
         guard micChannels > 0 else {
-            logger.error("Loopbacker virtual device reports no output channels")
+            logger.error("Loopbacker virtual device reports no output channels: \(targetDeviceUID)")
             return
         }
 
-        // Get sample rate from the Loopbacker device
+        // Get sample rate from the target device
         let sampleRate = getDeviceSampleRate(playbackDeviceID)
 
         let ctx = RouteContext(
             captureDeviceUID: sourceDeviceUID,
             captureDeviceID: captureDeviceID,
             playbackDeviceID: playbackDeviceID,
-            playbackDeviceUID: "LoopbackerDevice_UID",
+            playbackDeviceUID: targetDeviceUID,
             inputChannels: inputChannels,
             outputChannels: micChannels,
             sampleRate: sampleRate,
@@ -1312,7 +1347,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return
         }
 
-        // Create output AUHAL (sends to Loopbacker device)
+        // Create output AUHAL (sends to the target Loopbacker device)
         guard setupOutputUnit(ctx) else {
             logger.error("Failed to set up output unit")
             teardownUnit(&ctx.inputUnit)
@@ -1341,16 +1376,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Restore any previously-configured channel mix for this source so it survives
-        // restarts (wake, sample rate change) without the UI having to reapply it.
-        if let pending = pendingMixMatrices[sourceDeviceUID] {
+        // Restore any previously-configured channel mix for this source -> target pair so it
+        // survives restarts (wake, sample rate change) without the UI having to reapply it.
+        if let pending = pendingMixMatrices[routeKey] {
             applyMixToContext(ctx, routes: pending)
         }
 
-        activeRoutes[sourceDeviceUID] = ctx
+        activeRoutes[routeKey] = ctx
 
-        // Listen for sample rate changes on the capture device only — auto-restart
-        // the route when the hardware rate changes (e.g., after sleep).
+        // Listen for sample rate changes on the capture device only — auto-restart every
+        // route on this device when the hardware rate changes (e.g., after sleep). Idempotent:
+        // a second route on the same device (e.g. Stream Mix alongside the virtual mic)
+        // re-installs the same mapping rather than displacing it.
         // NOTE: Do NOT listen on the playback (Loopbacker) device. Apps like Chrome/Meet
         // can force rate changes on the virtual device, which would cause a restart loop
         // (stop → 0.3s gap → restart → rate changes again) producing crackling and
@@ -1358,14 +1395,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         // Wake-related rate changes are already handled by restartAllRoutes().
         installSampleRateListener(deviceID: captureDeviceID, sourceDeviceUID: sourceDeviceUID)
 
-        logger.info(" Started routing: \(sourceDeviceUID)")
+        logger.info(" Started routing: \(sourceDeviceUID) -> \(targetDeviceUID)")
     }
 
-    private func stopRoutingInternal(sourceDeviceUID: String) {
-        guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
+    private func stopRoutingInternal(sourceKey: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: sourceKey, target: targetDeviceUID)
+        guard let ctx = activeRoutes.removeValue(forKey: routeKey) else { return }
 
-        // Remove sample rate listener for the capture device
-        removeSampleRateListener(deviceID: ctx.captureDeviceID)
+        // Remove the sample rate listener only once no other route still captures this
+        // device (e.g. the virtual mic route may still be running after Stream Mix stops).
+        if !activeRoutes.values.contains(where: { $0.captureDeviceID == ctx.captureDeviceID }) {
+            removeSampleRateListener(deviceID: ctx.captureDeviceID)
+        }
 
         // Stop callbacks first, then dispose, then release the retained references.
         // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
@@ -1389,7 +1430,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if hadInput { Unmanaged.passUnretained(ctx).release() }
         if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
-        logger.info(" Stopped routing: \(sourceDeviceUID)")
+        logger.info(" Stopped routing: \(sourceKey) -> \(targetDeviceUID)")
     }
 
     // MARK: - Internal output routing (virtual device -> physical output)
@@ -1903,8 +1944,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     private var sampleRateListeners: [AudioObjectID: String] = [:]  // deviceID -> sourceDeviceUID
 
     private func installSampleRateListener(deviceID: AudioObjectID, sourceDeviceUID: String) {
-        // Remove existing listener if any
-        removeSampleRateListener(deviceID: deviceID)
+        // Already installed for this device (e.g. a second target route on the same capture
+        // device, like Stream Mix alongside the virtual mic): nothing to do.
+        guard sampleRateListeners[deviceID] == nil else { return }
 
         sampleRateListeners[deviceID] = sourceDeviceUID
 
@@ -1934,16 +1976,27 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Called from the C listener callback when any monitored device changes sample rate.
     fileprivate func handleSampleRateChange(deviceID: AudioObjectID) {
         // Find which source UID this device corresponds to
-        guard let sourceUID = sampleRateListeners[deviceID] else { return }
+        guard sampleRateListeners[deviceID] != nil else { return }
         let newRate = getDeviceSampleRate(deviceID)
-        logger.info("Sample rate changed on device \(deviceID) to \(newRate)Hz — restarting route for \(sourceUID)")
+        logger.info("Sample rate changed on device \(deviceID) to \(newRate)Hz — restarting its routes")
 
         queue.async { [weak self] in
             guard let self else { return }
-            self.stopRoutingInternal(sourceDeviceUID: sourceUID)
+            // Restart every route (virtual mic, Stream Mix) that captures this device, not
+            // just the one whose UID happened to install the listener.
+            let pairs = self.activeRoutes.keys
+                .filter { self.activeRoutes[$0]?.captureDeviceID == deviceID }
+                .map { (source: $0.source, target: $0.target) }
+            guard !pairs.isEmpty else { return }
+            for pair in pairs {
+                self.stopRoutingInternal(sourceKey: pair.source, targetDeviceUID: pair.target)
+            }
             // Small delay to let the device settle at the new rate
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.startRouting(sourceDeviceUID: sourceUID)
+                guard let self else { return }
+                for pair in pairs {
+                    self.startRouting(sourceDeviceUID: pair.source, targetDeviceUID: pair.target)
+                }
             }
         }
     }

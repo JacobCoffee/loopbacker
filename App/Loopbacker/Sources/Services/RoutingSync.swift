@@ -113,6 +113,15 @@ final class RoutingSync: ObservableObject {
             }
             .store(in: &cancellables)
 
+        routingState.$streamOutputChannels
+            .map { VirtualDeviceChannels.deviceCount(forChannels: $0.count) }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] count in
+                self?.setDeviceChannels(count, deviceUID: VirtualDeviceChannels.streamUID)
+            }
+            .store(in: &cancellables)
+
         // Push noise suppression settings (global toggle/engine/reduction, or a source's opt-out,
         // monitor choice or device UID changing) to the engine. `removeDuplicates` skips no-op
         // re-emissions; `dropFirst` skips the value already pushed in `start()`.
@@ -186,7 +195,8 @@ final class RoutingSync: ObservableObject {
     private func rebindMissingDeviceSources(devices: [SystemAudioDevice]) {
         let changes = routingState.rebindMissingDeviceSources(to: devices)
         for change in changes {
-            audioRouter.stopRouting(sourceDeviceUID: change.old)
+            audioRouter.stopRouting(sourceDeviceUID: change.old, targetDeviceUID: VirtualDeviceChannels.micUID)
+            audioRouter.stopRouting(sourceDeviceUID: change.old, targetDeviceUID: VirtualDeviceChannels.streamUID)
             audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(change.old)")
             guard let source = routingState.sources.first(where: { $0.deviceUID == change.new }),
                   !source.monitorOutputUID.isEmpty, source.isEnabled, !source.isMuted else { continue }
@@ -194,41 +204,47 @@ final class RoutingSync: ObservableObject {
         }
     }
 
-    /// Starts/stops audio routing based on which sources are enabled, not muted, and have routes
+    /// Starts/stops audio routing based on which sources are enabled, not muted, and have
+    /// routes into a given target. Each source → target pair (virtual mic, Stream Mix) is
+    /// started/stopped independently: a source can feed one, the other, both, or neither.
     private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute]) {
-        let routedSourceIDs = Set(routes.map(\.sourceId))
-
         for source in sources {
-            let hasRoutes = routedSourceIDs.contains(source.id)
-            let shouldRoute = source.isEnabled && !source.isMuted && hasRoutes && !source.deviceUID.isEmpty
-
-            // Push the per-source channel mix matrix so the engine knows how to
-            // fan source channels into output channels (handles mono→stereo, cross-routing).
-            let sourceRoutes: [(srcCh: Int, dstCh: Int)] = routes
-                .filter { $0.sourceId == source.id }
-                .map { (srcCh: $0.sourceChannelId, dstCh: $0.outputChannelId) }
             let mixUID = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
-            if !mixUID.isEmpty {
-                audioRouter.setChannelMix(sourceDeviceUID: mixUID, routes: sourceRoutes)
-            }
+            let baseEligible = source.isEnabled && !source.isMuted && !source.deviceUID.isEmpty
 
-            if shouldRoute {
-                if source.isAppCapture {
-                    audioRouter.startAppCapture(bundleID: source.appBundleID, appCaptureService: appCaptureService)
-                } else {
-                    audioRouter.startRouting(sourceDeviceUID: source.deviceUID)
+            for target in RouteTarget.allCases {
+                let targetRoutes = routes.filter { $0.sourceId == source.id && $0.targetId == target }
+                let shouldRoute = baseEligible && !targetRoutes.isEmpty
+
+                // Push the per-source, per-target channel mix matrix so the engine knows how to
+                // fan source channels into that target's output channels.
+                let sourceRoutes: [(srcCh: Int, dstCh: Int)] = targetRoutes
+                    .map { (srcCh: $0.sourceChannelId, dstCh: $0.outputChannelId) }
+                if !mixUID.isEmpty {
+                    audioRouter.setChannelMix(sourceDeviceUID: mixUID, targetDeviceUID: target.deviceUID, routes: sourceRoutes)
                 }
-            } else {
-                if source.isAppCapture {
-                    audioRouter.stopAppCapture(bundleID: source.appBundleID, appCaptureService: appCaptureService)
-                } else if !source.deviceUID.isEmpty {
-                    audioRouter.stopRouting(sourceDeviceUID: source.deviceUID)
+
+                if shouldRoute {
+                    if source.isAppCapture {
+                        audioRouter.startAppCapture(bundleID: source.appBundleID, targetDeviceUID: target.deviceUID,
+                                                    appCaptureService: appCaptureService)
+                    } else {
+                        audioRouter.startRouting(sourceDeviceUID: source.deviceUID, targetDeviceUID: target.deviceUID)
+                    }
+                } else {
+                    if source.isAppCapture {
+                        audioRouter.stopAppCapture(bundleID: source.appBundleID, targetDeviceUID: target.deviceUID,
+                                                   appCaptureService: appCaptureService)
+                    } else if !source.deviceUID.isEmpty {
+                        audioRouter.stopRouting(sourceDeviceUID: source.deviceUID, targetDeviceUID: target.deviceUID)
+                    }
                 }
             }
 
             // Monitor: only manage stop. Start is handled by the picker in SourceCardView.
             // (Monitoring not supported for app capture sources — they don't have a CoreAudio device)
-            if !shouldRoute && !source.monitorOutputUID.isEmpty && !source.isAppCapture {
+            let routedAnywhere = routes.contains { $0.sourceId == source.id }
+            if !(baseEligible && routedAnywhere) && !source.monitorOutputUID.isEmpty && !source.isAppCapture {
                 audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(source.deviceUID)")
             }
         }
@@ -247,9 +263,10 @@ final class RoutingSync: ObservableObject {
         }
     }
 
-    /// Push the saved channel counts to the driver (the virtual mic plus every output device).
+    /// Push the saved channel counts to the driver (both virtual mics plus every output device).
     private func applyVirtualDeviceChannels() {
         setDeviceChannels(routingState.micChannelCount, deviceUID: VirtualDeviceChannels.micUID)
+        setDeviceChannels(routingState.streamMicChannelCount, deviceUID: VirtualDeviceChannels.streamUID)
         for dest in routingState.outputDestinations {
             setDeviceChannels(dest.channelCount, deviceUID: dest.virtualDeviceUID)
         }
