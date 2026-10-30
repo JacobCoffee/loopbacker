@@ -4,16 +4,25 @@ import SwiftUI
 
 /// Draggable parametric-EQ curve. Horizontal drag remaps frequency (log scale, 20 Hz...20 kHz),
 /// vertical drag remaps gain (±12 dB, skipped for the highpass band). Writes directly into
-/// `routingState.effectsPreset.eqBands` and saves when a drag ends.
+/// the EQ node's `eqBands` (identified by `nodeID`) and saves when a drag ends.
 struct InteractiveEQView: View {
     @EnvironmentObject var routingState: RoutingState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var draggingIndex: Int? = nil
+    let nodeID: UUID
+    @State private var draggingBandID: Int? = nil
     @State private var dragLabel: String = ""
     @State private var dragLabelPosition: CGPoint = .zero
 
     private var bands: [EQBandConfig] {
-        routingState.effectsPreset.eqBands
+        routingState.effectsPreset.nodes.first(where: { $0.id == nodeID })?.eqBands ?? []
+    }
+
+    private func updateBand(_ bandID: Int, _ mutate: (inout EQBandConfig) -> Void) {
+        guard let nodeIdx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == nodeID }),
+              var bands = routingState.effectsPreset.nodes[nodeIdx].eqBands,
+              let bandIdx = bands.firstIndex(where: { $0.id == bandID }) else { return }
+        mutate(&bands[bandIdx])
+        routingState.effectsPreset.nodes[nodeIdx].eqBands = bands
     }
 
     /// Log-normalize a frequency value to 0...1 range.
@@ -97,12 +106,12 @@ struct InteractiveEQView: View {
                 curvePaths(size: size, maxGain: maxGain)
 
                 // Band dots (draggable)
-                ForEach(Array(bands.enumerated()), id: \.offset) { index, band in
+                ForEach(bands) { band in
                     let normX = logNormalize(band.frequencyHz, min: 20, max: 20000)
                     let x = CGFloat(normX) * size.width
                     let yNorm = CGFloat(0.5 - band.gainDB / (maxGain * 2))
                     let y = yNorm * size.height
-                    let isDragging = draggingIndex == index
+                    let isDragging = draggingBandID == band.id
                     let radius: CGFloat = isDragging ? 8 : 6
 
                     Circle()
@@ -124,28 +133,28 @@ struct InteractiveEQView: View {
                             DragGesture(minimumDistance: 2)
                                 .onChanged { value in
                                     withAnimation(.interactiveSpring()) {
-                                        draggingIndex = index
+                                        draggingBandID = band.id
                                     }
 
                                     // Horizontal -> frequency (log scale)
                                     let clampedX = Swift.max(0, Swift.min(Float(value.location.x / size.width), 1))
                                     let newFreq = logDenormalize(clampedX, min: 20, max: 20000)
-                                    routingState.effectsPreset.eqBands[index].frequencyHz = newFreq
-
-                                    // Vertical -> gain (skip for highpass band id 0)
+                                    var newGainValue: Float?
                                     if band.id != 0 {
                                         let clampedY = Swift.max(0, Swift.min(Float(value.location.y / size.height), 1))
                                         let newGain = (0.5 - clampedY) * maxGain * 2
-                                        let clampedGain = Swift.max(-12, Swift.min(12, newGain))
-                                        routingState.effectsPreset.eqBands[index].gainDB = clampedGain
+                                        newGainValue = Swift.max(-12, Swift.min(12, newGain))
+                                    }
+                                    updateBand(band.id) { b in
+                                        b.frequencyHz = newFreq
+                                        if let newGainValue { b.gainDB = newGainValue }
                                     }
 
                                     // Update label
-                                    let currentBand = routingState.effectsPreset.eqBands[index]
-                                    let freqStr = currentBand.frequencyHz >= 1000
-                                        ? String(format: "%.1fkHz", currentBand.frequencyHz / 1000)
-                                        : String(format: "%.0fHz", currentBand.frequencyHz)
-                                    let gainStr = band.id == 0 ? "HP" : String(format: "%+.1fdB", currentBand.gainDB)
+                                    let freqStr = newFreq >= 1000
+                                        ? String(format: "%.1fkHz", newFreq / 1000)
+                                        : String(format: "%.0fHz", newFreq)
+                                    let gainStr = band.id == 0 ? "HP" : String(format: "%+.1fdB", newGainValue ?? band.gainDB)
                                     dragLabel = "\(freqStr) \(gainStr)"
                                     dragLabelPosition = CGPoint(
                                         x: Swift.max(40, Swift.min(Double(size.width) - 40, Double(value.location.x))),
@@ -154,7 +163,7 @@ struct InteractiveEQView: View {
                                 }
                                 .onEnded { _ in
                                     withAnimation(.easeOut(duration: 0.2)) {
-                                        draggingIndex = nil
+                                        draggingBandID = nil
                                     }
                                     routingState.save()
                                 }
@@ -167,13 +176,13 @@ struct InteractiveEQView: View {
                             let step: Float = 0.5
                             let delta: Float = direction == .increment ? step : -step
                             let newGain = Swift.max(-12, Swift.min(12, band.gainDB + delta))
-                            routingState.effectsPreset.eqBands[index].gainDB = newGain
+                            updateBand(band.id) { $0.gainDB = newGain }
                             routingState.save()
                         }
                 }
 
                 // Drag tooltip
-                if draggingIndex != nil {
+                if draggingBandID != nil {
                     Text(dragLabel)
                         .font(.caption2.weight(.bold).monospacedDigit())
                         .foregroundStyle(.primary)

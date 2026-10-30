@@ -10,6 +10,7 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardState: SoundboardState
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
+    @StateObject private var fxEngine: FXEngine
     // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
     // routes start and menu-bar edits reach the engine even if the main window never opens.
     @StateObject private var routingSync: RoutingSync
@@ -26,6 +27,7 @@ struct LoopbackerApp: App {
         _soundboardState = StateObject(wrappedValue: SoundboardState.load())
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
+        _fxEngine = StateObject(wrappedValue: FXEngine(audioRouter: audioRouter))
         _routingSync = StateObject(wrappedValue: RoutingSync(
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
@@ -49,6 +51,7 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardState)
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
+                .environmentObject(fxEngine)
                 .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
@@ -65,6 +68,7 @@ struct LoopbackerApp: App {
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
                 .environmentObject(appCaptureService)
+                .environmentObject(fxEngine)
                 .environment(audioRouter.meters)
         } label: {
             Image(systemName: "waveform.path")

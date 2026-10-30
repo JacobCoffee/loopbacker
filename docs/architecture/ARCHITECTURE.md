@@ -446,7 +446,9 @@ source, capped at 64) and `outputChannels` (the playback device). One block flow
 
 ```
 capture (inputChannels) → source meter → mix matrix (outputChannels × inputChannels)
-  → noise suppression on channels 1–2 (voice routes) → effects on channels 1–2
+  → noise suppression on channels 1–2 (voice routes only)
+  → voice FXChain on channels 1–2 (voice routes) or AppAudioProcessor (app-capture routes;
+    output routes get neither)
   → output meter → drift-compensated ring → playback
 ```
 
@@ -579,6 +581,61 @@ VoiceBank+DEMAND numbers for FastEnhancer-S against stronger non-causal baseline
 gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's the
 recommended engine and the default. Re-run with
 `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
+
+## Effects Chain
+
+The voice chain is an ordered list of `FXNode` stages (`EffectsPreset.nodes`, each an
+`FXNodeConfig`): built-ins (gate, EQ, compressor, leveler, de-esser, chorus, pitch shift, reverb,
+delay, limiter) plus hosted third-party effects (Audio Unit, JSFX, Airwindows). `FXChain` runs
+that list for one capture device, shared by every voice route on the device (virtual mic +
+monitor) exactly like `NoiseSuppressor`: the routes' input callbacks run back to back on the
+device's IO thread with the same HAL sample time, so the first route to see a block computes it
+and the others copy the cached result. Each block is deinterleaved into planar scratch buffers
+(processed mono when the voice pair is bitwise identical, e.g. a mono mic fanned to L+R), run
+through the nodes, then reinterleaved; blocks larger than `FXBlock.maxFrames` (4096) are split.
+
+`FXChain` also runs a `VoiceActivityDetector` on the block's mono mix and publishes the latest
+speech probability to `VoiceBus`, an app-wide atomic (max over every active chain, decaying when
+chains stop). `AppAudioProcessor`, run on app-capture routes instead of the voice chain, reads
+`VoiceBus` to duck game/music/browser audio while you're talking, and optionally runs a
+`LevelerNode` to hold it at a target loudness. Output routes (virtual device → speakers) run
+neither.
+
+**Edits.** Structural changes (add/remove/reorder a node, change its kind, or swap its hosted
+plugin) build a new immutable `ChainGraph` off the IO thread -- reusing existing node instances
+by `FXNodeConfig.id` where the kind and plugin didn't change, loading hosted nodes
+asynchronously before publishing -- then swap it in with one atomic pointer exchange. The swap is
+declicked: the outgoing graph's last block fades to silence, the incoming graph's first block
+fades in from silence. The outgoing graph is freed only after the IO thread has marked it
+retired (a busy/epoch flag), never from the IO thread itself. Param-only edits (values, `enabled`,
+EQ bands) skip the rebuild and push straight into the live instances' `FXParamStore` (and
+`EQNode.setBands`).
+
+**Bypass.** Each node's own `enabled` flag crossfades over 10 ms against a dry signal delayed by
+that node's own `latencySamples`, so toggling a node with nonzero latency doesn't jump: the dry
+tap and the node's wet output are time-aligned. Chain latency is the sum of every node's
+`latencySamples`, independent of which nodes are enabled, so toggling a node never moves the
+chain's overall delay. `FXChain.setABBypass` additionally bypasses every stage at once with
+loudness matching: it measures input vs. output RMS while voice probability is above 0.5 over a
+~3 s window and applies that ratio (smoothed) to the bypassed signal, so A/B comparison is about
+tone, not volume.
+
+**Recording.** Each `FXChain` has a lock-free SPSC `FXRecorder` that, once armed from the main
+thread, captures up to 30 s of the mono raw mic mix (before noise suppression) alongside the
+mono chain output, for an A/B listen.
+
+`FXEngine` (`@MainActor`, owned by the app alongside `RoutingSync`/`AudioRouter`) is the UI-facing
+facade: it surfaces the first active voice device's chain for meters/latency/plugin-load-error
+display, fans `setABBypass` out to every running chain, scans the three hosted-effect catalogs
+for the effect browser, and persists hosted-plugin state into the preset via
+`captureHostedStates`.
+
+**Persistence.** `EffectsPreset` is versioned (`version = 2`); `init(from:)` migrates the v1
+shape (fixed flat `gateEnabled`/`gateThresholdDB`/... fields with no `nodes` key) into an
+equivalent `nodes` array in the original fixed order, decoding v2 JSON (which carries `nodes`)
+unchanged. `EffectsPreset.appAudio` holds the app-capture ducking/leveling settings separately
+from `nodes`, since app-capture routes never run the voice chain.
+
 
 ## UI Cost
 

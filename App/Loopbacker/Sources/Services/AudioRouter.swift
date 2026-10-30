@@ -43,6 +43,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     private var activeRoutes: [String: RouteContext] = [:]
     private var activeOutputRoutes: [String: RouteContext] = [:]
+    /// Voice chains keyed by capture device UID, mirrored into `fxChainsSnapshot` for
+    /// cross-thread reads (`FXEngine`). Queue only.
+    private var fxChainsByDevice: [String: FXChain] = [:]
+    private let fxChainsLock = NSLock()
+    private var fxChainsSnapshot: [String: FXChain] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
     /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
@@ -67,7 +72,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     ///
     /// Signal path per block: capture `inputChannels` into `renderBuffer` → source meter →
     /// mix matrix into `mixBuffer` (`outputChannels` wide) → noise suppression (voice routes,
-    /// channels 1–2) → effects (channels 1–2) → output meter → ring → playback.
+    /// channels 1–2) → voice `FXChain` (voice routes) or `AppAudioProcessor` (app-capture
+    /// routes) → output meter → ring → playback.
     fileprivate final class RouteContext: @unchecked Sendable {
         var inputUnit: AudioComponentInstance?
         var outputUnit: AudioComponentInstance?
@@ -94,13 +100,26 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         private(set) var mixBuffer: UnsafeMutablePointer<Float>
         private(set) var blockFrames: UInt32 = 1024
 
-        // Audio effects chain (broadcast voice processing)
-        var effectsChain: AudioEffectsChain?
+        /// Voice-chain processor (mic → virtual mic / mic → monitor only), shared with the
+        /// other voice route on the same capture device via `fxSlot`, published unretained
+        /// exactly like `noiseSlot`. `fxOwner` holds the strong reference.
+        let fxSlot = Atomic<Unmanaged<FXChain>?>(nil)
+        /// Queue only.
+        private(set) var fxOwner: FXChain?
+        /// App-capture routes only (game/music/browser): ducking + leveling. Never set on
+        /// voice-input or output routes.
+        let appAudioProcessor: AppAudioProcessor?
+        /// Voice routes only: the dry mix just before noise suppression, snapshotted each
+        /// block for the chain's recorder.
+        private(set) var preNSBuffer: UnsafeMutablePointer<Float>?
 
-        /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these get
-        /// noise suppression: app captures carry music/game audio, and output routes replay the
-        /// already-processed virtual device.
+        /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these run
+        /// noise suppression and the voice `FXChain`: app captures carry music/game audio, and
+        /// output routes replay the already-processed virtual device.
         let isVoiceInput: Bool
+        /// App-capture routes (game/music/browser → virtual mic). Gets `appAudioProcessor`
+        /// instead of the voice chain.
+        let isAppCapture: Bool
         /// Mic → monitor output (you hearing yourself). Queue only.
         var isMonitor = false
         /// The suppressor the audio thread runs, published unretained so `queue` can swap it
@@ -125,7 +144,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
-             sampleRate: Float64, isVoiceInput: Bool = false) {
+             sampleRate: Float64, isVoiceInput: Bool = false, isAppCapture: Bool = false) {
             self.captureDeviceUID = captureDeviceUID
             self.captureDeviceID = captureDeviceID
             self.playbackDeviceID = playbackDeviceID
@@ -134,6 +153,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.outputChannels = outputChannels
             self.sampleRate = sampleRate
             self.isVoiceInput = isVoiceInput
+            self.isAppCapture = isAppCapture
+            appAudioProcessor = isAppCapture ? AppAudioProcessor(sampleRate: Float(sampleRate)) : nil
 
             meterLevelsPtr = .allocate(capacity: Int(inputChannels))
             meterLevelsPtr.initialize(repeating: 0.0, count: Int(inputChannels))
@@ -151,8 +172,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             renderBuffer.initialize(repeating: 0.0, count: Int(blockFrames * inputChannels))
             mixBuffer = .allocate(capacity: Int(blockFrames * outputChannels))
             mixBuffer.initialize(repeating: 0.0, count: Int(blockFrames * outputChannels))
+            if isVoiceInput {
+                let n = Int(blockFrames * outputChannels)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
+                buf.initialize(repeating: 0.0, count: n)
+                preNSBuffer = buf
+            }
 
-            effectsChain = AudioEffectsChain(sampleRate: Float(sampleRate))
             setIdentityMix()
         }
 
@@ -162,6 +188,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             meterLevelsPtr.deallocate()
             outMeterLevelsPtr.deallocate()
             mixMatrix.deallocate()
+            preNSBuffer?.deallocate()
+        }
+
+        /// Queue only.
+        func attachFXChain(_ chain: FXChain) {
+            fxOwner = chain
+            fxSlot.store(.passUnretained(chain), ordering: .releasing)
+        }
+
+        /// Queue only. Unpublishes the chain and hands back the strong reference.
+        func detachFXChain() -> FXChain? {
+            fxSlot.store(nil, ordering: .releasing)
+            defer { fxOwner = nil }
+            return fxOwner
         }
 
         /// Queue only.
@@ -188,6 +228,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             renderBuffer.initialize(repeating: 0.0, count: Int(frames * inputChannels))
             mixBuffer = .allocate(capacity: Int(frames * outputChannels))
             mixBuffer.initialize(repeating: 0.0, count: Int(frames * outputChannels))
+            if isVoiceInput {
+                preNSBuffer?.deallocate()
+                let n = Int(frames * outputChannels)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
+                buf.initialize(repeating: 0.0, count: n)
+                preNSBuffer = buf
+            }
         }
 
         /// Passthrough: source channel N feeds output channel N for every shared index.
@@ -204,12 +251,22 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
+            if let preNSBuffer {
+                memcpy(preNSBuffer, mixBuffer, Int(frames * outputChannels) * MemoryLayout<Float>.size)
+            }
             if let suppressor = noiseSlot.load(ordering: .acquiring) {
                 suppressor._withUnsafeGuaranteedRef {
                     $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
                 }
             }
-            effectsChain?.process(mixBuffer, frames: frames, channels: outputChannels)
+            if isVoiceInput, let chain = fxSlot.load(ordering: .acquiring) {
+                chain._withUnsafeGuaranteedRef {
+                    $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels),
+                              sampleTime: sampleTime, rawPreNS: preNSBuffer)
+                }
+            } else if let appAudioProcessor {
+                appAudioProcessor.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
+            }
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
         }
@@ -392,7 +449,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                                   inputChannels: inputChannels, outputChannels: 2, sampleRate: rate,
                                   isVoiceInput: true)
             ctx.isMonitor = true
-            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+            self.attachFXChain(to: ctx)
             self.applyNoiseSuppression(to: ctx)
             // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
             if let pending = self.pendingMixMatrices[sourceDeviceUID] {
@@ -513,9 +570,16 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 playbackDeviceUID: "LoopbackerDevice_UID",
                 inputChannels: captureChannels,
                 outputChannels: micChannels,
-                sampleRate: sampleRate
+                sampleRate: sampleRate,
+                isAppCapture: true
             )
-            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+            ctx.appAudioProcessor?.updateConfig(AppAudioProcessor.Config(
+                duckingEnabled: self.currentEffectsPreset.appAudio.duckingEnabled,
+                duckAmountDB: self.currentEffectsPreset.appAudio.duckAmountDB,
+                duckAttackMs: self.currentEffectsPreset.appAudio.duckAttackMs,
+                duckReleaseMs: self.currentEffectsPreset.appAudio.duckReleaseMs,
+                levelerEnabled: self.currentEffectsPreset.appAudio.levelerEnabled,
+                levelerTarget: self.currentEffectsPreset.appAudio.levelerTarget))
 
             // App capture needs a much larger ring than device routing: SCStream delivers
             // bursty chunks on its own schedule. 16384 frames (~340 ms) of capacity with a
@@ -642,17 +706,77 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Effects
 
-    /// Update the effects preset on all active route contexts.
+    /// Push the preset's voice-chain nodes to every running voice chain (each decides for
+    /// itself whether it's a param-only update or a structural rebuild) and its app-audio
+    /// settings to every running app-capture route.
     func updateEffectsPreset(_ preset: EffectsPreset) {
         queue.async { [weak self] in
             guard let self else { return }
-            for (_, ctx) in self.activeRoutes {
-                ctx.effectsChain?.updatePreset(preset)
+            let nodes = preset.nodes
+            for chain in self.fxChainsByDevice.values {
+                Task { await chain.updateConfigs(nodes) }
             }
-            for (_, ctx) in self.activeOutputRoutes {
-                ctx.effectsChain?.updatePreset(preset)
-            }
+            let appConfig = AppAudioProcessor.Config(
+                duckingEnabled: preset.appAudio.duckingEnabled, duckAmountDB: preset.appAudio.duckAmountDB,
+                duckAttackMs: preset.appAudio.duckAttackMs, duckReleaseMs: preset.appAudio.duckReleaseMs,
+                levelerEnabled: preset.appAudio.levelerEnabled, levelerTarget: preset.appAudio.levelerTarget)
+            for ctx in self.activeRoutes.values { ctx.appAudioProcessor?.updateConfig(appConfig) }
         }
+    }
+
+    // MARK: - Voice FX chain
+
+    /// Must run on `queue`. Attaches `ctx` to the voice chain for its capture device, sharing
+    /// the existing instance with any other voice route on the same device (virtual mic +
+    /// monitor), or creating one. No-op for non-voice routes.
+    private func attachFXChain(to ctx: RouteContext) {
+        guard ctx.isVoiceInput else { return }
+        if let sibling = voiceContexts.first(where: { $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID }),
+           let shared = sibling.fxOwner {
+            ctx.attachFXChain(shared)
+            return
+        }
+        let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
+        ctx.attachFXChain(chain)
+        fxChainsByDevice[ctx.captureDeviceUID] = chain
+        fxChainsLock.lock()
+        fxChainsSnapshot[ctx.captureDeviceUID] = chain
+        fxChainsLock.unlock()
+        let nodes = currentEffectsPreset.nodes
+        Task { await chain.updateConfigs(nodes) }
+    }
+
+    /// Must run on `queue`, after removing `ctx` from `activeRoutes`/`activeOutputRoutes`, so
+    /// `voiceContexts` no longer includes it. Frees the device's chain once no voice route
+    /// uses it anymore.
+    private func detachFXChain(from ctx: RouteContext) {
+        guard ctx.isVoiceInput else { return }
+        _ = ctx.detachFXChain()
+        guard !voiceContexts.contains(where: { $0.captureDeviceUID == ctx.captureDeviceUID }) else { return }
+        if let chain = fxChainsByDevice.removeValue(forKey: ctx.captureDeviceUID) {
+            // The last voice route on this device is gone and its audio unit(s) are already
+            // stopped (callers stop them before calling this): the IO proc is provably halted,
+            // so it's safe to free whatever graphs this chain still owns now rather than wait.
+            chain.ioStopped()
+        }
+        fxChainsLock.lock()
+        fxChainsSnapshot.removeValue(forKey: ctx.captureDeviceUID)
+        fxChainsLock.unlock()
+    }
+
+    /// Any thread. The voice chain on the first active voice device (stable key order), for
+    /// `FXEngine`'s UI-facing queries.
+    func firstVoiceFXChain() -> FXChain? {
+        fxChainsLock.lock()
+        defer { fxChainsLock.unlock() }
+        return fxChainsSnapshot.keys.sorted().first.flatMap { fxChainsSnapshot[$0] }
+    }
+
+    /// Any thread. Every running voice chain (one per capture device).
+    func allVoiceFXChains() -> [FXChain] {
+        fxChainsLock.lock()
+        defer { fxChainsLock.unlock() }
+        return Array(fxChainsSnapshot.values)
     }
 
     // MARK: - Noise suppression
@@ -933,7 +1057,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             sampleRate: sampleRate,
             isVoiceInput: true
         )
-        ctx.effectsChain?.updatePreset(currentEffectsPreset)
+        attachFXChain(to: ctx)
         applyNoiseSuppression(to: ctx)
 
         // Create input AUHAL (captures from source device)
@@ -1005,6 +1129,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain: the capture device's IO
+        // callbacks that might still be inside `FXChain.process` have been stopped.
+        detachFXChain(from: ctx)
+
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
@@ -1055,7 +1183,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             sampleRate: sampleRate
         )
         ctx.monitorChannel = monitorChannel
-        ctx.effectsChain?.updatePreset(currentEffectsPreset)
         // Speakers get the selected pair; a pair past the device's width falls back to 1–2.
         if monitorChannel >= 1 && monitorChannel + 1 <= Int(deviceChannels) {
             applyMixToContext(ctx, routes: [(srcCh: monitorChannel, dstCh: 1), (srcCh: monitorChannel + 1, dstCh: 2)])
@@ -1109,6 +1236,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain (see stopRoutingInternal).
+        detachFXChain(from: ctx)
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
