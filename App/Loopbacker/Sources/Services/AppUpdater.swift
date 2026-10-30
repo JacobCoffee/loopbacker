@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Combine
 import Sparkle
 
@@ -23,10 +23,11 @@ struct AvailableAppUpdate {
     func dismiss() { reply(.dismiss) }
 }
 
-/// Drives Sparkle without ever putting a window in front of the user. Update checks happen in the
-/// background; an available update surfaces only as state the menu bar panel and app menu read.
-/// Installing happens only when the user clicks Install, or automatically when the app quits with
-/// an update already downloaded and waiting.
+/// Drives Sparkle without its own windows. Background checks stay silent: an available update
+/// surfaces only as state the menu bar panel and app menu read. A check the user started from
+/// "Check for Updates…" that finds one asks right away (Install and Relaunch / Later), so they
+/// don't have to reopen the menu. Installing happens only when the user says so, or
+/// automatically when the app quits with an update already downloaded and waiting.
 @MainActor
 final class AppUpdater: NSObject, ObservableObject {
     /// One instance for the app's lifetime; the `AppDelegate` installs a pending update on quit
@@ -53,9 +54,14 @@ final class AppUpdater: NSObject, ObservableObject {
 
     private lazy var userDriver = GentleUserDriver(
         onUpdateFound: { [weak self] update in
-            self?.availableUpdate = update
-            self?.installingVersion = nil
-            self?.didFindNoUpdate = false
+            guard let self else { return }
+            availableUpdate = update
+            installingVersion = nil
+            didFindNoUpdate = false
+            if update.isUserInitiated {
+                // Out of Sparkle's callback, so the modal alert doesn't run inside it.
+                Task { @MainActor in self.promptToInstall(update.displayVersion) }
+            }
         },
         onDownloadProgress: { [weak self] downloading, progress in
             self?.isDownloading = downloading
@@ -136,6 +142,20 @@ final class AppUpdater: NSObject, ObservableObject {
         guard let update = availableUpdate else { return }
         availableUpdate = nil
         update.dismiss()
+    }
+
+    /// Asks once after a user-started check finds an update. "Later" leaves it pending, so the
+    /// menu still offers Install and quitting still installs it.
+    private func promptToInstall(_ version: String) {
+        guard availableUpdate?.displayVersion == version else { return }
+        let alert = NSAlert()
+        alert.messageText = "Loopbacker \(version) is available"
+        alert.informativeText = "Installing quits and relaunches Loopbacker. Your audio routes stop for a few seconds."
+        alert.addButton(withTitle: "Install and Relaunch")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate()
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        installAvailableUpdate()
     }
 
     /// Called from `applicationShouldTerminate`. If an update already finished downloading and is
