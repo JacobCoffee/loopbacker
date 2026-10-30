@@ -1,7 +1,10 @@
-# Replaces GitHub's default CodeQL setup. Default setup builds Swift with an unbounded
-# `swift build` under Rosetta; since the app links ~1,500 vendored C/C++ files that build
-# wedged the macOS runner (3 runs, none finished). It also can't skip vendored code.
-# Categories match the old default setup so existing alerts and dismissals carry over.
+# Replaces GitHub's default CodeQL setup, which can't skip vendored code and whose Swift
+# autobuild wedged the macOS runner. Categories match the old default setup so existing
+# alerts and dismissals carry over.
+#
+# Swift runs weekly and on demand, not per push: CodeQL's Swift tracer builds for x86_64
+# under Rosetta, and on the hosted macos-26 runner that traced build hasn't finished in any
+# attempt (an untraced Rosetta build of the same tree takes 26 min, mostly vendored C++).
 name: CodeQL
 
 on:
@@ -11,6 +14,7 @@ on:
   pull_request:
   schedule:
     - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,9 +45,6 @@ jobs:
           - language: c-cpp
             runner: ubuntu-latest
             build-mode: none
-          - language: swift
-            runner: macos-26
-            build-mode: manual
 
     steps:
       - name: Checkout
@@ -61,13 +62,37 @@ jobs:
               - App/Loopbacker/CWebRTCAEC
               - App/Loopbacker/CYSFX
 
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  analyze-swift:
+    name: Analyze (swift)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 150
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: swift
+          build-mode: manual
+
       # Fewer parallel compiles than the default, to keep the Rosetta-traced build light.
       - name: Build Swift app
-        if: matrix.language == 'swift'
         working-directory: App/Loopbacker
         run: swift build -j 2
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:swift
