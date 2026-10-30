@@ -245,7 +245,7 @@ struct EffectsView: View {
     private var presetMenu: some View {
         Menu {
             Section("Factory Presets") {
-                ForEach(EffectsPreset.factoryPresets, id: \.name) { item in
+                ForEach(FactoryPresets.all) { item in
                     Button(item.name) {
                         applyPreset(item.preset)
                     }
@@ -284,7 +284,7 @@ struct EffectsView: View {
             Divider()
 
             Button("Reset to Defaults") {
-                applyPreset(EffectsPreset.broadcastVoice)
+                applyPreset(EffectsPreset())
             }
 
             if !savedPresetNames.isEmpty {
