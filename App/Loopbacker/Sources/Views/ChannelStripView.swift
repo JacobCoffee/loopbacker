@@ -62,6 +62,13 @@ struct ChannelStripView: View {
         .frame(height: 28)
     }
 
+    /// Restarts (or stops) the live-level poll when either the connection state or the shared
+    /// meter-window-visibility signal changes.
+    private struct LivePollKey: Equatable {
+        let connected: Bool
+        let visible: Bool
+    }
+
     // MARK: - Connector port
 
     private var connectorPort: some View {
@@ -96,11 +103,16 @@ struct ChannelStripView: View {
                     }
                 }
             }
-            // Polled (not observed) at low frequency, and only while this port is part of a live
-            // route, so VoiceOver's value can include a dB reading without paying the per-tick
-            // SwiftUI re-render cost `MeterLevels` warns against.
-            .task(id: isConnected) {
-                guard isConnected else { liveLevelText = "Silent"; return }
+            // Polled (not observed) at low frequency, only while this port is part of a live
+            // route AND a window that shows meters is actually on screen -- the same visibility
+            // signal `AudioRouter` gates publishing `MeterLevels` on, via `MeterWindowVisibility`.
+            // SwiftUI cancels and restarts this task whenever either input changes, so a hidden/
+            // minimized/occluded window stops polling instead of running forever in the background.
+            .task(id: LivePollKey(connected: isConnected, visible: MeterWindowVisibility.shared.isVisible)) {
+                guard isConnected, MeterWindowVisibility.shared.isVisible else {
+                    if !isConnected { liveLevelText = "Silent" }
+                    return
+                }
                 while !Task.isCancelled {
                     liveLevelText = SignalMeter.dbString(currentLevel())
                     try? await Task.sleep(for: .milliseconds(250))
