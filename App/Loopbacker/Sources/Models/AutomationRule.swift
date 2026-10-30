@@ -55,16 +55,19 @@ class AutomationRulesState: ObservableObject {
     @Published var fallbackSceneName: String?
     /// Paused while the user manually picks a scene, until the triggering condition changes.
     @Published var isPaused: Bool
-    /// The signals in effect when the user paused rules, so the engine can tell when the
-    /// triggering condition has changed and resume automatically.
-    @Published var pausedSignals: RuleEngine.Signals?
+    /// The id of the rule that resolved at pause time (nil if none did), captured once so a
+    /// later rule edit/delete can't change what "should resume" means for this pause. Comparing
+    /// identity rather than re-resolving signals against the (possibly now-different) rule list
+    /// means disabling or deleting the triggering rule while paused still resumes correctly when
+    /// its condition goes away, instead of getting stuck paused forever.
+    @Published var pausedResolvedRuleID: UUID?
 
     init(rules: [AutomationRule] = [], fallbackSceneName: String? = nil, isPaused: Bool = false,
-         pausedSignals: RuleEngine.Signals? = nil) {
+         pausedResolvedRuleID: UUID? = nil) {
         self.rules = rules
         self.fallbackSceneName = fallbackSceneName
         self.isPaused = isPaused
-        self.pausedSignals = pausedSignals
+        self.pausedResolvedRuleID = pausedResolvedRuleID
     }
 
     func addRule(_ rule: AutomationRule) {
@@ -88,17 +91,17 @@ class AutomationRulesState: ObservableObject {
         save()
     }
 
-    /// Called when the user manually loads a scene: pauses automation until the signals that
-    /// were true at pause time change.
-    func pauseForManualSelection(signals: RuleEngine.Signals) {
+    /// Called when the user manually loads a scene: pauses automation until the resolved rule
+    /// differs from `resolvedRuleID` (the rule, if any, that was active at pause time).
+    func pauseForManualSelection(resolvedRuleID: UUID?) {
         isPaused = true
-        pausedSignals = signals
+        pausedResolvedRuleID = resolvedRuleID
         save()
     }
 
     func resume() {
         isPaused = false
-        pausedSignals = nil
+        pausedResolvedRuleID = nil
         save()
     }
 
@@ -116,12 +119,13 @@ class AutomationRulesState: ObservableObject {
         var rules: [AutomationRule]
         var fallbackSceneName: String?
         var isPaused: Bool
-        var pausedSignals: RuleEngine.Signals?
+        var pausedResolvedRuleID: UUID?
     }
 
     func save() {
         let snapshot = PersistedState(
-            rules: rules, fallbackSceneName: fallbackSceneName, isPaused: isPaused, pausedSignals: pausedSignals
+            rules: rules, fallbackSceneName: fallbackSceneName, isPaused: isPaused,
+            pausedResolvedRuleID: pausedResolvedRuleID
         )
         Self.saveQueue.async {
             do {
@@ -142,7 +146,7 @@ class AutomationRulesState: ObservableObject {
             let snapshot = try JSONDecoder().decode(PersistedState.self, from: data)
             return AutomationRulesState(
                 rules: snapshot.rules, fallbackSceneName: snapshot.fallbackSceneName,
-                isPaused: snapshot.isPaused, pausedSignals: snapshot.pausedSignals
+                isPaused: snapshot.isPaused, pausedResolvedRuleID: snapshot.pausedResolvedRuleID
             )
         } catch {
             return AutomationRulesState()

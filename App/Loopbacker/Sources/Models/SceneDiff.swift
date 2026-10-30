@@ -45,6 +45,24 @@ struct RoutingDesiredState: Equatable {
         return min(channel, count)
     }
 
+    /// The channel mix matrix `RoutingSync.syncAudioRouting` should push for one source's
+    /// routes, right now -- `devices` must be the just-emitted inventory from the
+    /// `$systemDevices` sink (or any other freshly known inventory), never a re-read of
+    /// `AudioDeviceManager.systemDevices`: `@Published` sends on `willSet`, so inside that sink
+    /// the stored property is still the OLD inventory and wouldn't contain a device that only
+    /// just connected, silently skipping the clamp in `clampedChannel` for it.
+    static func mixRoutes(
+        for source: AudioSource, routes: [AudioRoute], devices: [SystemAudioDevice]
+    ) -> [(srcCh: Int, dstCh: Int)] {
+        let inputDeviceChannelCounts = Dictionary(
+            devices.map { ($0.uid, $0.inputChannelCount) }, uniquingKeysWith: { a, _ in a }
+        )
+        let deviceChannelCount = source.isAppCapture ? nil : inputDeviceChannelCounts[source.deviceUID]
+        return routes
+            .filter { $0.sourceId == source.id }
+            .map { (srcCh: clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount), dstCh: $0.outputChannelId) }
+    }
+
     /// - Parameter inputDeviceChannelCounts: Real input channel count per hardware device UID
     ///   (not the virtual mic/output device counts in `deviceChannelCounts`), used to clamp
     ///   route source channels when a source is bound to a narrower device than it was
