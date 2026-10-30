@@ -10,6 +10,9 @@ let package = Package(
     products: [
         .executable(name: "Loopbacker", targets: ["Loopbacker"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.1")
+    ],
     targets: [
         .target(
             name: "CRNNoise",
@@ -111,7 +114,13 @@ let package = Package(
         ),
         .executableTarget(
             name: "Loopbacker",
-            dependencies: ["CRNNoise", "CYSFX", "CAirwindows", "CWebRTCAEC"],
+            dependencies: [
+                "CRNNoise",
+                "CYSFX",
+                "CAirwindows",
+                "CWebRTCAEC",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
@@ -121,7 +130,8 @@ let package = Package(
                 .linkedFramework("Accelerate"),
                 // Global mute/push-to-talk hotkey (Control slice): RegisterEventHotKey, no
                 // Accessibility permission needed.
-                .linkedFramework("Carbon")
+                .linkedFramework("Carbon"),
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .testTarget(

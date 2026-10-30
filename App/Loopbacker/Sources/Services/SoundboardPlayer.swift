@@ -20,15 +20,22 @@ final class SoundboardPlayer: ObservableObject {
     /// Global volume multiplier (0...1)
     var globalVolume: Float = 1.0
 
+    /// Active playback instances, keyed by a per-trigger instance id (not the pad's item id):
+    /// `.layer` retrigger lets one pad have several instances playing at once.
     private var activePlaybacks: [UUID: PlaybackContext] = [:]
-    /// Sounds whose units are still being prepared; removing an ID cancels its start.
-    private var startingIDs: Set<UUID> = []
+    /// Instance ids per pad, active or still being prepared. `playingIDs` mirrors whichever of
+    /// these sets are non-empty.
+    private var instancesByItem: [UUID: Set<UUID>] = [:]
+    /// Instances still being prepared; removing one cancels its start.
+    private var startingInstances: Set<UUID> = []
     private let engine = SoundboardEngine()
 
     // MARK: - Decoded audio buffer
 
-    /// Immutable once decoded; render callbacks only read `samples`.
-    fileprivate struct DecodedBuffer: @unchecked Sendable {
+    /// Immutable once decoded; render callbacks only read `samples`. Internal (not
+    /// `fileprivate`) so `decode(fileAt:)` below can also be used by `SoundboardLoudnessMeasurer`
+    /// (`SoundboardItem.swift`) to measure a file in the exact format it's played back in.
+    struct DecodedBuffer: @unchecked Sendable {
         let samples: UnsafeMutablePointer<Float>  // interleaved stereo float32
         let frameCount: UInt32
         let channelCount: UInt32
@@ -37,19 +44,43 @@ final class SoundboardPlayer: ObservableObject {
 
     // MARK: - Per-sound playback context
 
-    /// One per audio unit — each has its own read position into the shared buffer
+    /// One per audio unit — each has its own read position into the shared buffer. Plays the
+    /// `[startFrame, endFrame)` trim window, optionally looping it, with linear fade in/out
+    /// ramps at its edges.
     fileprivate class RenderState {
         var buffer: DecodedBuffer
+        /// Position within the trim window (0 = `startFrame`), not an absolute buffer index.
         var readPosition: UInt32 = 0
+        let startFrame: UInt32
+        let endFrame: UInt32
+        let fadeInFrames: UInt32
+        let fadeOutFrames: UInt32
+        let loop: Bool
+        /// Combined `item.volume * loudness-match gain offset`.
         var volume: Float = 1.0
         var globalVolume: Float = 1.0
         var done: Bool = false
         var meterLevel: Float = 0.0
+        /// True for the loopback (virtual mic) unit's state, false for the speaker unit's --
+        /// only the former contributes to `MicLoudnessBus`.
+        let feedsVirtualMic: Bool
 
-        init(buffer: DecodedBuffer, volume: Float, globalVolume: Float) {
+        var activeFrameCount: UInt32 { endFrame > startFrame ? endFrame - startFrame : 0 }
+
+        init(
+            buffer: DecodedBuffer, startFrame: UInt32, endFrame: UInt32,
+            fadeInFrames: UInt32, fadeOutFrames: UInt32, loop: Bool,
+            volume: Float, globalVolume: Float, feedsVirtualMic: Bool
+        ) {
             self.buffer = buffer
+            self.startFrame = startFrame
+            self.endFrame = endFrame
+            self.fadeInFrames = fadeInFrames
+            self.fadeOutFrames = fadeOutFrames
+            self.loop = loop
             self.volume = volume
             self.globalVolume = globalVolume
+            self.feedsVirtualMic = feedsVirtualMic
         }
     }
 
@@ -61,68 +92,153 @@ final class SoundboardPlayer: ObservableObject {
         var speakerState: RenderState?
         var loopbackState: RenderState?
         let itemID: UUID
+        /// Non-empty choke group this instance belongs to, if any.
+        let chokeGroup: String?
 
-        var done: Bool { speakerState?.done ?? true }
-        var meterLevel: Float { speakerState?.meterLevel ?? 0 }
+        var done: Bool { speakerState?.done ?? loopbackState?.done ?? true }
+        var meterLevel: Float { max(speakerState?.meterLevel ?? 0, loopbackState?.meterLevel ?? 0) }
 
-        init(itemID: UUID) { self.itemID = itemID }
+        init(itemID: UUID, chokeGroup: String?) {
+            self.itemID = itemID
+            self.chokeGroup = chokeGroup
+        }
     }
 
     // MARK: - Public API
 
+    /// Triggers a pad. One-shot/loop pads toggle (a second press while playing stops it) unless
+    /// `retrigger == .layer`, which starts an overlapping instance instead. Hold-to-play pads
+    /// are driven by `press(item:)`/`release(item:)`, not this.
     func play(item: SoundboardItem) {
-        // Toggle: a second press stops the sound, including while it is still being prepared.
-        if activePlaybacks[item.id] != nil || startingIDs.contains(item.id) {
+        let existing = instancesByItem[item.id, default: []]
+        if item.retrigger == .restart, !existing.isEmpty {
             stop(id: item.id)
             return
         }
+        trigger(item: item)
+    }
 
-        startingIDs.insert(item.id)
-        let volume = globalVolume
-        Task {
-            let ctx = await engine.prepare(item: item, globalVolume: volume)
-            let stillWanted = startingIDs.remove(item.id) != nil
-            guard let ctx else { return }
-            guard stillWanted else {
-                Self.teardown(ctx)
-                return
-            }
+    /// Hold-to-play: starts on press. A second press while already held is a no-op (the view
+    /// shouldn't send one, but defend against it).
+    func press(item: SoundboardItem) {
+        guard instancesByItem[item.id, default: []].isEmpty else { return }
+        trigger(item: item)
+    }
 
-            activePlaybacks[item.id] = ctx
-            playingIDs.insert(item.id)
-            if let unit = ctx.speakerUnit { AudioOutputUnitStart(unit) }
-            if let unit = ctx.loopbackUnit { AudioOutputUnitStart(unit) }
-            sbLogger.info("Playing: \(item.name) (loopback: \(ctx.loopbackUnit != nil))")
-            pollForCompletion(id: item.id)
-        }
+    /// Hold-to-play: stops on release.
+    func release(item: SoundboardItem) {
+        stop(id: item.id)
     }
 
     func stop(id: UUID) {
-        startingIDs.remove(id)
-        guard let ctx = activePlaybacks.removeValue(forKey: id) else { return }
-        Self.teardown(ctx)
+        if let pending = instancesByItem[id] {
+            for instanceID in pending { startingInstances.remove(instanceID) }
+        }
+        let instanceIDs = instancesByItem.removeValue(forKey: id) ?? []
+        pendingChokeGroups.removeValue(forKey: id)
+        for instanceID in instanceIDs {
+            guard let ctx = activePlaybacks.removeValue(forKey: instanceID) else { continue }
+            Self.teardown(ctx)
+        }
         playingIDs.remove(id)
         updateMeter()
     }
 
     func stopAll() {
-        startingIDs.removeAll()
-        for id in Array(activePlaybacks.keys) {
+        startingInstances.removeAll()
+        pendingChokeGroups.removeAll()
+        for id in Array(instancesByItem.keys) {
             stop(id: id)
         }
     }
 
     // MARK: - Internal playback
 
-    private func pollForCompletion(id: UUID) {
+    // MARK: - Choke groups
+
+    /// Choke group of each item that has at least one instance still starting (in
+    /// `startingInstances`, not yet in `activePlaybacks`) -- so a second trigger in the same
+    /// group can stop one still being decoded/prepared, not just ones already playing. Cleared
+    /// once that item has no instances left at all, starting or active (see `finishInstance` and
+    /// `stop(id:)`); an entry can outlive the specific instance that created it once that
+    /// instance activates, which is harmless since `stopChokeGroup` only needs item ids.
+    private var pendingChokeGroups: [UUID: String] = [:]
+
+    /// Stops any other pad sharing `item`'s choke group -- including ones still being prepared,
+    /// not just already-playing ones -- then starts a new instance.
+    private func trigger(item: SoundboardItem) {
+        stopChokeGroup(of: item)
+        startInstance(item: item)
+    }
+
+    private func stopChokeGroup(of item: SoundboardItem) {
+        let activeGroups = Dictionary(
+            uniqueKeysWithValues: activePlaybacks.values.compactMap { ctx in
+                ctx.chokeGroup.map { (ctx.itemID, $0) }
+            }
+        )
+        for id in soundboardChokeGroupTargets(
+            triggeredItemID: item.id, triggeredGroup: item.chokeGroup,
+            activeGroups: activeGroups, pendingGroups: pendingChokeGroups
+        ) {
+            stop(id: id)
+        }
+    }
+
+    private func startInstance(item: SoundboardItem) {
+        let instanceID = UUID()
+        startingInstances.insert(instanceID)
+        instancesByItem[item.id, default: []].insert(instanceID)
+        playingIDs.insert(item.id)
+        if let group = item.chokeGroup, !group.isEmpty {
+            pendingChokeGroups[item.id] = group
+        }
+
+        let volume = globalVolume
+        Task {
+            let ctx = await engine.prepare(item: item, globalVolume: volume)
+            let stillWanted = startingInstances.remove(instanceID) != nil
+            guard let ctx else {
+                finishInstance(instanceID: instanceID, itemID: item.id)
+                return
+            }
+            guard stillWanted else {
+                Self.teardown(ctx)
+                finishInstance(instanceID: instanceID, itemID: item.id)
+                return
+            }
+
+            activePlaybacks[instanceID] = ctx
+            if let unit = ctx.speakerUnit { AudioOutputUnitStart(unit) }
+            if let unit = ctx.loopbackUnit { AudioOutputUnitStart(unit) }
+            sbLogger.info("Playing: \(item.name) (loopback: \(ctx.loopbackUnit != nil))")
+            pollForCompletion(instanceID: instanceID, itemID: item.id)
+        }
+    }
+
+    /// Removes an instance that never made it to `activePlaybacks` (decode/unit failure, or
+    /// canceled before it started) from the per-item bookkeeping.
+    private func finishInstance(instanceID: UUID, itemID: UUID) {
+        instancesByItem[itemID]?.remove(instanceID)
+        if instancesByItem[itemID]?.isEmpty ?? true {
+            instancesByItem.removeValue(forKey: itemID)
+            playingIDs.remove(itemID)
+            pendingChokeGroups.removeValue(forKey: itemID)
+        }
+    }
+
+    private func pollForCompletion(instanceID: UUID, itemID: UUID) {
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(1.0 / 30.0))
-            guard let self, let ctx = activePlaybacks[id] else { return }
+            guard let self, let ctx = activePlaybacks[instanceID] else { return }
             if ctx.done {
-                stop(id: id)
+                activePlaybacks.removeValue(forKey: instanceID)
+                Self.teardown(ctx)
+                finishInstance(instanceID: instanceID, itemID: itemID)
+                updateMeter()
             } else {
                 updateMeter()
-                pollForCompletion(id: id)
+                pollForCompletion(instanceID: instanceID, itemID: itemID)
             }
         }
     }
@@ -162,27 +278,54 @@ private actor SoundboardEngine {
     /// Decoded files keyed by bookmark; buffers stay alive for the app's lifetime.
     private var decodedCache: [Data: DecodedBuffer] = [:]
 
-    /// Returns a context with initialized, not-yet-started units, or nil if the speaker unit fails.
+    /// Returns a context with initialized, not-yet-started units, or nil if no output unit
+    /// (speaker or loopback) could be created.
     func prepare(item: SoundboardItem, globalVolume: Float) -> PlaybackContext? {
         guard let decoded = getOrDecodeBuffer(item: item) else {
             sbLogger.error("Failed to decode audio for \(item.name)")
             return nil
         }
 
-        let ctx = PlaybackContext(itemID: item.id)
+        let sr = decoded.sampleRate
+        let totalFrames = decoded.frameCount
+        let requestedStart = UInt32(max(0, item.trimStart) * sr)
+        let requestedEnd = item.trimEnd.map { UInt32(max(0, $0) * sr) } ?? totalFrames
+        let startFrame = min(requestedStart, totalFrames)
+        let endFrame = min(max(requestedEnd, startFrame), totalFrames)
+        let fadeInFrames = UInt32(max(0, item.fadeInSeconds) * sr)
+        let fadeOutFrames = UInt32(max(0, item.fadeOutSeconds) * sr)
+        let loop = item.playMode == .loop
+        // Gain offset is dB; converting to linear here (not the render callback) keeps the
+        // per-sample multiply to a single value, computed once per playback.
+        let gainOffsetLinear = item.loudnessGainOffsetDB.map { pow(10, $0 / 20) } ?? 1.0
+        let totalVolume = item.volume * gainOffsetLinear
+        let chokeGroup = (item.chokeGroup?.isEmpty == false) ? item.chokeGroup : nil
 
-        // Speaker state + unit (so user hears the sound)
-        let spkState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
-        guard let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) else {
-            sbLogger.error("Failed to create speaker output unit")
-            return nil
+        func makeState(feedsVirtualMic: Bool) -> RenderState {
+            RenderState(
+                buffer: decoded, startFrame: startFrame, endFrame: endFrame,
+                fadeInFrames: fadeInFrames, fadeOutFrames: fadeOutFrames, loop: loop,
+                volume: totalVolume, globalVolume: globalVolume, feedsVirtualMic: feedsVirtualMic
+            )
         }
-        ctx.speakerUnit = speakerUnit
-        ctx.speakerState = spkState
+
+        let ctx = PlaybackContext(itemID: item.id, chokeGroup: chokeGroup)
+
+        // Speaker state + unit (so the user hears the sound), unless the pad targets the
+        // virtual mic only.
+        if item.outputTarget == .virtualMicAndSpeakers {
+            let spkState = makeState(feedsVirtualMic: false)
+            if let speakerUnit = createOutputUnit(state: spkState, deviceID: nil, decoded: decoded) {
+                ctx.speakerUnit = speakerUnit
+                ctx.speakerState = spkState
+            } else {
+                sbLogger.error("Failed to create speaker output unit")
+            }
+        }
 
         // Loopback state + unit (so Discord/Zoom hears it) — independent read position
         if let loopbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") {
-            let lbState = RenderState(buffer: decoded, volume: item.volume, globalVolume: globalVolume)
+            let lbState = makeState(feedsVirtualMic: true)
             if let lbUnit = createOutputUnit(state: lbState, deviceID: loopbackDeviceID, decoded: decoded) {
                 ctx.loopbackUnit = lbUnit
                 ctx.loopbackState = lbState
@@ -193,6 +336,7 @@ private actor SoundboardEngine {
             sbLogger.warning("Loopbacker virtual device not found — sound plays on speakers only")
         }
 
+        guard ctx.speakerUnit != nil || ctx.loopbackUnit != nil else { return nil }
         return ctx
     }
 
@@ -262,102 +406,12 @@ private actor SoundboardEngine {
 
         // Resolve URL from bookmark
         guard let url = item.resolveURL() else { return nil }
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
-        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
-
-        let srcFormat = audioFile.processingFormat
-        let frameCount = UInt32(audioFile.length)
-        guard frameCount > 0 else { return nil }
-
-        // Always decode to 48kHz stereo float32 to match the Loopbacker virtual device
-        let targetSampleRate: Double = 48000.0
-        let channelCount: UInt32 = 2
-        // Estimate output frame count after resampling
-        let resampledFrameCount = UInt32(Double(frameCount) * targetSampleRate / srcFormat.sampleRate) + 256
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: targetSampleRate,
-            channels: AVAudioChannelCount(channelCount),
-            interleaved: true
-        ) else { return nil }
-
-        // Read the entire file into a non-interleaved buffer (AVAudioFile's native output)
-        let readFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: srcFormat.sampleRate,
-            channels: AVAudioChannelCount(srcFormat.channelCount),
-            interleaved: false
-        )!
-        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: frameCount) else { return nil }
-        do {
-            try audioFile.read(into: srcBuffer)
-        } catch {
-            sbLogger.error("Failed to read audio file: \(error)")
+        guard let decoded = DecodedBuffer.decode(fileAt: url) else {
+            sbLogger.error("Failed to decode audio file")
             return nil
         }
-        sbLogger.info("Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz, \(srcFormat.channelCount)ch")
-        print("[Soundboard] Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz")
-
-        // Convert to interleaved stereo float32 at 48kHz
-        guard let converter = AVAudioConverter(from: readFormat, to: targetFormat) else {
-            sbLogger.error("Failed to create audio converter")
-            return nil
-        }
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: resampledFrameCount) else { return nil }
-
-        // Use the simple block-based conversion with proper data supply
-        var inputConsumed = false
-        var convError: NSError?
-        converter.convert(to: outBuffer, error: &convError) { _, outStatus in
-            if inputConsumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            inputConsumed = true
-            outStatus.pointee = .haveData
-            return srcBuffer
-        }
-
-        if let err = convError {
-            sbLogger.error("Conversion error: \(err)")
-            return nil
-        }
-
-        let actualFrames = outBuffer.frameLength
-        guard actualFrames > 0 else {
-            sbLogger.error("Conversion produced 0 frames")
-            return nil
-        }
-        sbLogger.info("Converted to \(actualFrames) frames at 48kHz stereo")
-        print("[Soundboard] Converted to \(actualFrames) frames at 48kHz stereo")
-
-        let totalSamples = Int(actualFrames * channelCount)
-        let samples = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
-
-        // Copy to interleaved buffer
-        if let floatData = outBuffer.floatChannelData {
-            if targetFormat.isInterleaved {
-                memcpy(samples, floatData[0], totalSamples * MemoryLayout<Float>.size)
-            } else {
-                // Interleave from separate channel buffers
-                let srcChannels = Int(min(channelCount, UInt32(outBuffer.format.channelCount)))
-                for frame in 0..<Int(actualFrames) {
-                    for ch in 0..<Int(channelCount) {
-                        let srcCh = min(ch, srcChannels - 1)  // mono -> duplicate to both channels
-                        samples[frame * Int(channelCount) + ch] = floatData[srcCh][frame]
-                    }
-                }
-            }
-        }
-
-        let decoded = DecodedBuffer(
-            samples: samples,
-            frameCount: actualFrames,
-            channelCount: channelCount,
-            sampleRate: targetSampleRate
-        )
+        sbLogger.info("Decoded \(decoded.frameCount) frames at \(decoded.sampleRate)Hz, \(decoded.channelCount)ch")
 
         decodedCache[item.fileBookmark] = decoded
         return decoded
@@ -402,6 +456,123 @@ private actor SoundboardEngine {
     }
 }
 
+// MARK: - Shared file decode (playback + loudness measurement)
+
+extension SoundboardPlayer.DecodedBuffer {
+    /// Decodes `url` to 48 kHz interleaved stereo float32, mono duplicated to both channels --
+    /// the exact format every unit in this file plays back. Reused by
+    /// `SoundboardLoudnessMeasurer` (`SoundboardItem.swift`) so a pad's measured loudness always
+    /// matches what's actually heard, not the file's on-disk sample rate/channel layout (a mono
+    /// file measured on its native single channel reads ~3 LU quieter than the same content
+    /// duplicated to stereo on playback, since BS.1770 sums weighted channel energy).
+    ///
+    /// Not real-time safe (allocates, reads a whole file).
+    static func decode(fileAt url: URL) -> SoundboardPlayer.DecodedBuffer? {
+        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
+
+        let srcFormat = audioFile.processingFormat
+        let frameCount = UInt32(audioFile.length)
+        guard frameCount > 0 else { return nil }
+
+        let targetSampleRate: Double = 48000.0
+        let channelCount: UInt32 = 2
+        let resampledFrameCount = UInt32(Double(frameCount) * targetSampleRate / srcFormat.sampleRate) + 256
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: targetSampleRate,
+            channels: AVAudioChannelCount(channelCount),
+            interleaved: true
+        ) else { return nil }
+
+        let readFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: srcFormat.sampleRate,
+            channels: AVAudioChannelCount(srcFormat.channelCount),
+            interleaved: false
+        )!
+        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: frameCount) else { return nil }
+        do {
+            try audioFile.read(into: srcBuffer)
+        } catch {
+            return nil
+        }
+
+        guard let converter = AVAudioConverter(from: readFormat, to: targetFormat) else { return nil }
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: resampledFrameCount) else { return nil }
+
+        var inputConsumed = false
+        var convError: NSError?
+        converter.convert(to: outBuffer, error: &convError) { _, outStatus in
+            if inputConsumed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return srcBuffer
+        }
+        guard convError == nil else { return nil }
+
+        let actualFrames = outBuffer.frameLength
+        guard actualFrames > 0 else { return nil }
+
+        let totalSamples = Int(actualFrames * channelCount)
+        let samples = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
+        if let floatData = outBuffer.floatChannelData {
+            if targetFormat.isInterleaved {
+                memcpy(samples, floatData[0], totalSamples * MemoryLayout<Float>.size)
+            } else {
+                // Interleave from separate channel buffers
+                let srcChannels = Int(min(channelCount, UInt32(outBuffer.format.channelCount)))
+                for frame in 0..<Int(actualFrames) {
+                    for ch in 0..<Int(channelCount) {
+                        let srcCh = min(ch, srcChannels - 1)  // mono -> duplicate to both channels
+                        samples[frame * Int(channelCount) + ch] = floatData[srcCh][frame]
+                    }
+                }
+            }
+        }
+
+        return SoundboardPlayer.DecodedBuffer(
+            samples: samples, frameCount: actualFrames, channelCount: channelCount, sampleRate: targetSampleRate
+        )
+    }
+}
+
+// MARK: - Choke group decision
+
+/// Every item id that must stop because it shares `triggeredGroup` with the item that was just
+/// triggered -- including items with an instance still being decoded/prepared (`pendingGroups`),
+/// not just ones already in `activePlaybacks` (`activeGroups`), so a second trigger in a choke
+/// group cancels one still starting instead of letting it start playing alongside the new one.
+func soundboardChokeGroupTargets(
+    triggeredItemID: UUID, triggeredGroup: String?,
+    activeGroups: [UUID: String], pendingGroups: [UUID: String]
+) -> Set<UUID> {
+    guard let group = triggeredGroup, !group.isEmpty else { return [] }
+    var targets = Set(activeGroups.filter { $0.value == group && $0.key != triggeredItemID }.keys)
+    targets.formUnion(pendingGroups.filter { $0.value == group && $0.key != triggeredItemID }.keys)
+    return targets
+}
+
+// MARK: - Fade envelope
+
+/// Linear fade-in/out gain for a position within the trim window. `position` must be `<
+/// activeFrames` (the caller guarantees this before calling). Overlapping fade in/out on very
+/// short trims multiplies both ramps, which tapers smoothly rather than clipping.
+@inline(__always)
+func soundboardFadeGain(position: UInt32, activeFrames: UInt32, fadeInFrames: UInt32, fadeOutFrames: UInt32) -> Float {
+    var gain: Float = 1.0
+    if fadeInFrames > 0, position < fadeInFrames {
+        gain *= Float(position) / Float(fadeInFrames)
+    }
+    let remaining = activeFrames - position
+    if fadeOutFrames > 0, remaining <= fadeOutFrames {
+        gain *= Float(remaining) / Float(fadeOutFrames)
+    }
+    return gain
+}
+
 // MARK: - Render callback (C function)
 
 private func soundboardRenderCallback(
@@ -421,29 +592,47 @@ private func soundboardRenderCallback(
     }
 
     let chCount = Int(state.buffer.channelCount)
-    let remaining = state.buffer.frameCount - state.readPosition
-    let toPlay = min(inNumberFrames, remaining)
+    let activeFrames = state.activeFrameCount
     let vol = state.volume * state.globalVolume
-
-    let srcOffset = Int(state.readPosition) * chCount
     var peak: Float = 0
-    for i in 0..<Int(toPlay) {
+
+    var i = 0
+    while i < Int(inNumberFrames) {
+        if activeFrames == 0 || (state.readPosition >= activeFrames && !state.loop) {
+            for ch in 0..<chCount { outBuf[i * chCount + ch] = 0.0 }
+            state.done = true
+            i += 1
+            continue
+        }
+        if state.readPosition >= activeFrames {
+            state.readPosition = 0 // loop wrap
+        }
+
+        let fadeGain = soundboardFadeGain(
+            position: state.readPosition, activeFrames: activeFrames,
+            fadeInFrames: state.fadeInFrames, fadeOutFrames: state.fadeOutFrames
+        )
+        let srcOffset = Int(state.startFrame + state.readPosition) * chCount
         for ch in 0..<chCount {
-            let sample = state.buffer.samples[srcOffset + i * chCount + ch] * vol
+            let sample = state.buffer.samples[srcOffset + ch] * vol * fadeGain
             outBuf[i * chCount + ch] = sample
             let s = sample < 0 ? -sample : sample
             if s > peak { peak = s }
         }
+
+        state.readPosition += 1
+        i += 1
     }
     state.meterLevel = peak
 
-    if toPlay < inNumberFrames {
-        let offset = Int(toPlay) * chCount
-        let rem = Int(inNumberFrames - toPlay) * chCount
-        for j in 0..<rem { outBuf[offset + j] = 0.0 }
-        state.done = true
+    // Contribute to the virtual mic's shared loudness measurement, combined with every other
+    // feed writing to the same device this IO cycle (see `MicLoudnessBus`'s doc comment).
+    if state.feedsVirtualMic {
+        MicLoudnessBus.shared.contribute(
+            buffer: outBuf, frames: Int(inNumberFrames), channels: chCount,
+            sampleTime: inTimeStamp.pointee.mSampleTime
+        )
     }
 
-    state.readPosition += toPlay
     return noErr
 }

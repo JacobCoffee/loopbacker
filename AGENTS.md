@@ -40,6 +40,27 @@ and do it as few times as possible, and tell them when you did.
    just a "Full Changelog" link. Once the release exists, replace the body:
    `gh release edit vX.Y.Z --notes-file notes.md`. A release without notes isn't done.
 
+### Sparkle auto-update signing
+
+Updates are signed with an EdDSA (ed25519) key pair. The private key lives in the maintainer's
+login keychain (generated with Sparkle's `generate_keys` tool, account `ed25519`) and as the
+repo secret `SPARKLE_ED_PRIVATE_KEY` (the base64 export from `generate_keys -x`), which
+`release.yml` pipes into `generate_appcast --ed-key-file -` to sign each release's appcast entry
+-- it's never written to disk or echoed. The matching public key is committed in
+`App/Loopbacker/Resources/Info.plist` as `SUPublicEDKey`; it isn't secret.
+
+If the secret is missing, the release still completes; `release.yml` logs a warning and skips
+publishing `appcast.xml`, so already-installed apps won't see that release until a later one
+re-signs with a working key.
+
+**Rotating the key** (compromise, or replacing the maintainer's machine): run
+`generate_keys` again to create a new keychain entry, export it with `-x`, update the
+`SPARKLE_ED_PRIVATE_KEY` secret, and replace `SUPublicEDKey` in `Info.plist` with the new public
+key printed alongside it. Existing installs validate updates against the public key baked into
+*their own* binary, so they won't trust appcast entries signed with the new key until they first
+update to a build that ships the new `SUPublicEDKey` -- cut one last release signed with the old
+key that also carries the new public key in its `Info.plist` before fully switching over.
+
 ## Release notes
 
 Follow the earlier releases (`gh release view v4.3.0`, `v4.4.0`). Write for users, not for

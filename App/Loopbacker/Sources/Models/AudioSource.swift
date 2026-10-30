@@ -47,6 +47,11 @@ struct AudioSource: Identifiable, Equatable, Codable {
     /// Echo cancellation for this device's voice routes, when it's switched on globally.
     /// Mirrors `noiseSuppression`'s per-source opt-out. App captures are never run through it.
     var echoCancellation: Bool
+    /// Ordered device preferences for this source (most-preferred first). When the currently
+    /// bound device disappears, the source rebinds to the next present entry; when a
+    /// higher-preference device reappears, it switches back. Empty means "no opinion" — falls
+    /// back to matching a device with the same name.
+    var fallbackDevices: [DeviceFallbackEntry]
 
     init(
         id: UUID = UUID(),
@@ -63,7 +68,8 @@ struct AudioSource: Identifiable, Equatable, Codable {
         appBundleID: String = "",
         noiseSuppression: Bool = true,
         denoiseMonitor: Bool = true,
-        echoCancellation: Bool = true
+        echoCancellation: Bool = true,
+        fallbackDevices: [DeviceFallbackEntry] = []
     ) {
         self.id = id
         self.name = name
@@ -80,14 +86,29 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.noiseSuppression = noiseSuppression
         self.denoiseMonitor = denoiseMonitor
         self.echoCancellation = echoCancellation
+        self.fallbackDevices = fallbackDevices
     }
 
     var isAppCapture: Bool { sourceType == .appCapture }
+
+    /// Adds `entry` to `fallbackDevices`, seeding the list with the device this source is
+    /// *currently* bound to first if the list was empty. Without that seed, the first fallback
+    /// the user adds would silently outrank the device the source is actually using today --
+    /// the next enumeration could switch away from a working interface it was never told about,
+    /// and never switch back since the working device was never in the preference list at all.
+    mutating func addFallbackDevice(_ entry: DeviceFallbackEntry) {
+        if fallbackDevices.isEmpty && !deviceUID.isEmpty {
+            fallbackDevices.append(DeviceFallbackEntry(uid: deviceUID, name: name))
+        }
+        guard !fallbackDevices.contains(where: { $0.uid == entry.uid }) else { return }
+        fallbackDevices.append(entry)
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
         case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression, denoiseMonitor
         case echoCancellation
+        case fallbackDevices
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +128,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         noiseSuppression = (try? container.decode(Bool.self, forKey: .noiseSuppression)) ?? true
         denoiseMonitor = (try? container.decode(Bool.self, forKey: .denoiseMonitor)) ?? true
         echoCancellation = (try? container.decode(Bool.self, forKey: .echoCancellation)) ?? true
+        fallbackDevices = (try? container.decode([DeviceFallbackEntry].self, forKey: .fallbackDevices)) ?? []
     }
 
     /// Create an AudioSource from a captured app

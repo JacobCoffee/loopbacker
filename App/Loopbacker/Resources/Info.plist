@@ -32,13 +32,23 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>4.5.0</string>
+	<string>4.6.0</string>
 	<key>CFBundleVersion</key>
-	<string>17</string>
+	<string>18</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.music</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>SUFeedURL</key>
+	<string>https://github.com/JacobCoffee/loopbacker/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>64JlLL47+CtpZTeCCsdXiwWE/AvSVMUvIWdL5moJFaM=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>NSAccentColorName</key>
 	<string>AccentColor</string>
 	<key>NSHighResolutionCapable</key>

@@ -57,7 +57,7 @@ final class RoutingSync: ObservableObject {
             // route starts below, so routes open the devices at their final width.
             self.applyVirtualDeviceChannels()
             self.rebindMissingDeviceSources(devices: self.audioDeviceManager.systemDevices)
-            self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes)
+            self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes, devices: self.audioDeviceManager.systemDevices)
             self.syncOutputRouting(destinations: self.routingState.outputDestinations)
             // Start monitoring for any sources that have a saved monitor output
             for source in self.routingState.sources where !source.monitorOutputUID.isEmpty && source.isEnabled && !source.isMuted {
@@ -72,16 +72,27 @@ final class RoutingSync: ObservableObject {
         routingState.$sources
             .dropFirst()
             .sink { [weak self] newSources in
-                guard let self else { return }
-                self.syncAudioRouting(sources: newSources, routes: self.routingState.routes)
+                guard let self, !self.routingState.isReplacingConfig else { return }
+                self.syncAudioRouting(sources: newSources, routes: self.routingState.routes, devices: self.audioDeviceManager.systemDevices)
             }
             .store(in: &cancellables)
 
         routingState.$routes
             .dropFirst()
             .sink { [weak self] newRoutes in
+                guard let self, !self.routingState.isReplacingConfig else { return }
+                self.syncAudioRouting(sources: self.routingState.sources, routes: newRoutes, devices: self.audioDeviceManager.systemDevices)
+            }
+            .store(in: &cancellables)
+
+        // Fires once after `RoutingState.applyConfig` (scene load) finishes assigning every
+        // field, so reconciliation sees the complete, consistent target state instead of a
+        // partial one (new sources paired with not-yet-updated routes, etc.) that would read a
+        // kept route as removed and restart it, losing DSP state for no reason.
+        routingState.configReplaced
+            .sink { [weak self] in
                 guard let self else { return }
-                self.syncAudioRouting(sources: self.routingState.sources, routes: newRoutes)
+                self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes, devices: self.audioDeviceManager.systemDevices)
             }
             .store(in: &cancellables)
 
@@ -89,9 +100,9 @@ final class RoutingSync: ObservableObject {
         audioDeviceManager.$systemDevices
             .dropFirst()
             .sink { [weak self] devices in
-                guard let self else { return }
+                guard let self, !self.routingState.isReplacingConfig else { return }
                 self.rebindMissingDeviceSources(devices: devices)
-                self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes)
+                self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes, devices: devices)
             }
             .store(in: &cancellables)
 
@@ -129,7 +140,19 @@ final class RoutingSync: ObservableObject {
             .map { NoisePush(settings: $0, sources: $1) }
             .removeDuplicates()
             .dropFirst()
-            .sink { [weak self] in self?.push($0) }
+            .sink { [weak self] in
+                guard let self, !self.routingState.isReplacingConfig else { return }
+                self.push($0)
+            }
+            .store(in: &cancellables)
+
+        // Reconcile noise suppression once more against the final state after a scene load,
+        // same reasoning as the routing reconcile above.
+        routingState.configReplaced
+            .sink { [weak self] in
+                guard let self else { return }
+                self.push(NoisePush(settings: self.routingState.noiseSuppression, sources: self.routingState.sources))
+            }
             .store(in: &cancellables)
 
         // Push echo-cancellation settings and start/stop `SystemAudioTap` with demand (any
@@ -198,17 +221,23 @@ final class RoutingSync: ObservableObject {
             audioRouter.stopRouting(sourceDeviceUID: change.old, targetDeviceUID: VirtualDeviceChannels.micUID)
             audioRouter.stopRouting(sourceDeviceUID: change.old, targetDeviceUID: VirtualDeviceChannels.streamUID)
             audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(change.old)")
-            guard let source = routingState.sources.first(where: { $0.deviceUID == change.new }),
+            SceneNotifier.shared.deviceFallback(sourceName: change.sourceName, toDeviceName: change.newName)
+            guard let source = routingState.sources.first(where: { $0.deviceUID == change.newUID }),
                   !source.monitorOutputUID.isEmpty, source.isEnabled, !source.isMuted else { continue }
-            audioRouter.startMonitoring(sourceDeviceUID: change.new, outputDeviceUID: source.monitorOutputUID)
+            audioRouter.startMonitoring(sourceDeviceUID: change.newUID, outputDeviceUID: source.monitorOutputUID)
         }
     }
 
     /// Starts/stops audio routing based on which sources are enabled, not muted, and have
     /// routes into a given target. Each source → target pair (virtual mic, Stream Mix) is
     /// started/stopped independently: a source can feed one, the other, both, or neither.
-    private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute]) {
+    /// `devices` is threaded in explicitly rather than read from `audioDeviceManager.systemDevices`:
+    /// when this is called from the `$systemDevices` sink on hotplug, `@Published` has emitted
+    /// but not yet stored the new value, so a re-read there would still see the old (stale)
+    /// inventory and miss a just-connected fallback device when clamping channels below.
+    private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute], devices: [SystemAudioDevice]) {
         for source in sources {
+
             let mixUID = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
             let baseEligible = source.isEnabled && !source.isMuted && !source.deviceUID.isEmpty
 
@@ -217,9 +246,13 @@ final class RoutingSync: ObservableObject {
                 let shouldRoute = baseEligible && !targetRoutes.isEmpty
 
                 // Push the per-source, per-target channel mix matrix so the engine knows how to
-                // fan source channels into that target's output channels.
-                let sourceRoutes: [(srcCh: Int, dstCh: Int)] = targetRoutes
-                    .map { (srcCh: $0.sourceChannelId, dstCh: $0.outputChannelId) }
+                // fan source channels into that target's output channels. Clamped to the bound
+                // device's real channel count so a route built for a wider device still reads
+                // somewhere valid on a narrower fallback device (see
+                // `RoutingDesiredState.clampedChannel`).
+                let sourceRoutes = RoutingDesiredState.mixRoutes(
+                    for: source, target: target, routes: routes, devices: devices
+                )
                 if !mixUID.isEmpty {
                     audioRouter.setChannelMix(sourceDeviceUID: mixUID, targetDeviceUID: target.deviceUID, routes: sourceRoutes)
                 }

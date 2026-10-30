@@ -6,16 +6,53 @@ final class DriverInstaller: ObservableObject {
     @Published var isInstalled: Bool = false
     @Published var isProcessing: Bool = false
     @Published var statusMessage: String = ""
+    /// True when the driver bundled in this app is newer than the one installed in
+    /// `/Library/Audio/Plug-Ins/HAL`. Reinstalling needs admin and restarts coreaudiod (drops
+    /// audio briefly), so this is only ever offered, never applied automatically.
+    @Published var updateAvailable: Bool = false
 
     static let driverPath = "/Library/Audio/Plug-Ins/HAL/Loopbacker.driver"
 
     init() {
         checkInstallation()
+        checkForDriverUpdate()
     }
 
     func checkInstallation() {
         isInstalled = FileManager.default.fileExists(atPath: Self.driverPath)
         statusMessage = isInstalled ? "Driver installed" : "Driver not installed"
+    }
+
+    /// Compares the bundled driver's code against the installed one by content, not version --
+    /// `Driver/CMakeLists.txt`'s `PROJECT_VERSION` is a hardcoded placeholder, not bumped per
+    /// release, so `CFBundleShortVersionString` can't tell two builds apart. Call again after
+    /// install/uninstall, since both change which installed copy is being compared.
+    func checkForDriverUpdate() {
+        guard isInstalled, let bundledPath = findDriverBundle() else {
+            updateAvailable = false
+            return
+        }
+        let installedPath = Self.driverPath
+        Task {
+            updateAvailable = await Self.driverContentDiffers(bundledPath: bundledPath, installedPath: installedPath)
+        }
+    }
+
+    /// Hashes every section's content (except `__LINKEDIT`) of each driver's executable off the
+    /// main thread and compares them. A content hash of all sections -- not the whole file, not
+    /// just `__TEXT,__text`, and not codesign's CDHash -- is required here: `install()` re-signs
+    /// the installed copy ad-hoc, which can change the embedded codesign CDHash and definitely
+    /// changes the file bytes, even when the underlying code and data (strings, constant tables,
+    /// etc) are identical.
+    private nonisolated static func driverContentDiffers(bundledPath: String, installedPath: String) async -> Bool {
+        await Task.detached(priority: .utility) {
+            let bundledExecutable = (bundledPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
+            let installedExecutable = (installedPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
+            guard let bundledDigest = MachOTextHasher.contentDigest(ofExecutableAt: bundledExecutable),
+                  let installedDigest = MachOTextHasher.contentDigest(ofExecutableAt: installedExecutable)
+            else { return false }
+            return bundledDigest != installedDigest
+        }.value
     }
 
     func install() {
@@ -48,6 +85,7 @@ final class DriverInstaller: ObservableObject {
             if success {
                 isInstalled = true
                 statusMessage = "Driver installed successfully"
+                checkForDriverUpdate()
             } else {
                 statusMessage = "Installation failed"
             }
@@ -70,6 +108,7 @@ final class DriverInstaller: ObservableObject {
             if success {
                 isInstalled = false
                 statusMessage = "Driver uninstalled"
+                checkForDriverUpdate()
             } else {
                 statusMessage = "Uninstall failed"
             }

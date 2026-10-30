@@ -37,13 +37,13 @@ public:
             if (firstChunk > toWrite) firstChunk = toWrite;
             uint32_t secondChunk = toWrite - firstChunk;
 
-            std::memcpy(&mBuffer[startIdx * samplesPerFrame],
+            std::memcpy(&mBuffer[static_cast<size_t>(startIdx) * samplesPerFrame],
                         data,
                         static_cast<size_t>(firstChunk) * mBytesPerFrame);
 
             if (secondChunk > 0) {
                 std::memcpy(&mBuffer[0],
-                            &data[firstChunk * samplesPerFrame],
+                            &data[static_cast<size_t>(firstChunk) * samplesPerFrame],
                             static_cast<size_t>(secondChunk) * mBytesPerFrame);
             }
         }
@@ -70,11 +70,11 @@ public:
             uint32_t secondChunk = toRead - firstChunk;
 
             std::memcpy(data,
-                        &mBuffer[startIdx * samplesPerFrame],
+                        &mBuffer[static_cast<size_t>(startIdx) * samplesPerFrame],
                         static_cast<size_t>(firstChunk) * mBytesPerFrame);
 
             if (secondChunk > 0) {
-                std::memcpy(&data[firstChunk * samplesPerFrame],
+                std::memcpy(&data[static_cast<size_t>(firstChunk) * samplesPerFrame],
                             &mBuffer[0],
                             static_cast<size_t>(secondChunk) * mBytesPerFrame);
             }

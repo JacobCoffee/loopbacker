@@ -129,16 +129,19 @@ struct RoutingCanvasView: View {
     // MARK: - Virtual Mic header + column
 
     /// The canvas header for the output side: the Virtual Mic title plus the Stream Mix toggle
-    /// (so it's visible whether or not Stream Mix is currently shown).
+    /// (so it's visible whether or not Stream Mix is currently shown), and the mic's loudness.
     private var outputHeader: some View {
-        HStack {
-            Text("Virtual Mic")
-                .font(.headline)
-            Spacer()
-            streamMixToggle
-            Text("Loopbacker")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            HStack {
+                Text("Virtual Mic")
+                    .font(.headline)
+                Spacer()
+                streamMixToggle
+                Text("Loopbacker")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            LoudnessPanelView()
         }
     }
 

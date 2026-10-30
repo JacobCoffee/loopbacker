@@ -541,19 +541,25 @@ mic → monitor); app captures and output routes don't.
   `mlock`ed mapping; the compiled graph is read into wired memory too, since a file mapping
   could page-fault from disk mid-callback. Kernel delay: 2400 samples (4 hops of model
   lookahead plus a hop for the second half of the analysis window).
-- **FastEnhancer** (`FastEnhancerKernel`): aask1357's FastEnhancer-S 48 kHz model (MIT) through
+- **FastEnhancer** (`FastEnhancerKernel`): aask1357's FastEnhancer-M 48 kHz model (MIT) through
   the same BNNS Graph setup as DPDFNet (they share `CompiledGraph`, generalised over the
-  model's bundle name and its four argument names). 212K parameters -- tiny next to DPDFNet --
-  so it measures ~0.2 ms per 10.67 ms hop (~2% of a core). A 1024-sample/512-hop Hann-window
-  STFT, one model execution per hop with a ping-pong recurrent state (the per-frequency-bin
-  GRUs' hidden states, flattened), then ISTFT with FastEnhancer's own COLA synthesis window
-  (not a symmetric analysis/synthesis window like DPDFNet's). FastEnhancer is zero-lookahead:
-  every layer but the GRUs is purely per-frame (strided convs and self-attention across
-  frequency bins, never across time), so unlike DPDFNet it has no model-inherent lookahead.
-  Kernel delay: 512 samples (one hop), measured by passing an impulse through the exact
-  analysis/synthesis framing with an identity mask -- matching FastEnhancer's reported
-  zero-lookahead, ~10.7 ms algorithmic latency. Zero heap allocations on the execute path,
-  checked the same way as DPDFNet (an interposed `malloc`, 500 hops).
+  model's bundle name, its four argument names, and -- since FastEnhancer ships several
+  checkpoints at different hop sizes over the same 1024-sample window -- its STFT geometry,
+  read from the model's own metadata rather than hardcoded). 520K parameters, measuring
+  ~0.39 ms per 6.67 ms hop (~5.8% of a core hot, zero allocations on the execute path, checked
+  the same way as DPDFNet with an interposed `malloc` over 200 hops); a worst-case 512-frame IO
+  callback runs `ceil(512/320) = 2` hops, ~0.77 ms (~7.2% of the callback's budget). A
+  1024-sample/320-hop Hann-window STFT, one model execution per hop with a ping-pong recurrent
+  state (the per-frequency-bin GRUs' hidden states, flattened), then ISTFT with FastEnhancer's
+  own general-overlap COLA synthesis window (not a symmetric analysis/synthesis window like
+  DPDFNet's, and not the 2x-overlap special case the earlier S checkpoint allowed). FastEnhancer
+  is zero-lookahead: every layer but the GRUs is purely per-frame (strided convs and
+  self-attention across frequency bins, never across time), so unlike DPDFNet it has no
+  model-inherent lookahead. Kernel delay: 704 samples (`windowLength - hop`), measured by
+  passing an impulse through the exact analysis/synthesis framing with an identity mask --
+  total latency (`delay + hop - 1`) is 1023 samples regardless of which FastEnhancer checkpoint
+  is loaded, since `windowLength` is 1024 for all of them (see "FastEnhancer variant choice"
+  below).
 - **RNNoise** (`RNNoiseKernel`): Xiph's RNNoise v0.2 (BSD-3-Clause), vendored as the `CRNNoise`
   C target with its default model compiled in. ~0.2 ms per hop. `rnnoise_init(_, NULL)` resets
   state without allocating. Kernel delay: 960 samples (analysis over two frames, plus
@@ -561,7 +567,7 @@ mic → monitor); app captures and output routes don't.
   read-only data (mlock refuses those pages) and are read every hop.
 
 The engine-independent part is `NoiseSuppressor`: it downmixes channels 1–2 to mono, feeds
-the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 512 for FastEnhancer -- any hop
+the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 320 for FastEnhancer -- any hop
 size works, `NoiseSuppressor` doesn't assume one), and blends the dry signal (delayed by the
 kernel's delay) back in at the user's max-reduction level. Its buffers are `mlock`ed as well.
 `process(_:frames:stride:sampleTime:)` caches the processed mono/stereo pair keyed by
@@ -583,13 +589,14 @@ suppressor when suppression is on, the engine matches, and the source hasn't opt
 slot after 100 ms, and drops its reference 0.5 s later, once no callback can still be inside
 it. Switching engines goes old wet → dry → new wet with no click. The router holds each
 model-backed engine's compiled model weakly, behind a small generic `NoiseModelLoadState`, so
-the model (DPDFNet ~13 MB, FastEnhancer <1 MB) is freed with the last kernel that uses it.
+the model (DPDFNet ~13 MB, FastEnhancer ~2 MB) is freed with the last kernel that uses it.
 
 `NoiseEngineBenchmark` times 200 hops of each engine once per launch, when the Effects section
 first shows the picker. It recommends FastEnhancer while it takes at most 20% of a core (one
 512-frame callback can run roughly two hops alongside the mix and effects), and RNNoise
 otherwise. FastEnhancer is also the default engine for new setups. DPDFNet is never the
-recommendation: it cleans up slightly more, but its 60 ms of delay matters more on a live mic.
+recommendation: it doesn't clean up any better (see "FastEnhancer variant choice" below) and
+costs 3x FastEnhancer's latency and CPU.
 
 Every voice route on the same capture device shares one suppressor: the virtual mic route,
 the Stream Mix route, and the monitor route, when more than one exists. They mix identically
@@ -616,20 +623,50 @@ is unchanged. The script checks the result against the unmodified upstream PyTor
 compute and the Neural Engine were tried: fp16 compute breaks the output (~9 dB SNR), and the
 Neural Engine gives nothing for an fp32 model.
 
-`scripts/convert-fastenhancer.py` rebuilds `App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc`
-from pinned upstream code (commit `85d98a6`) and the `fastenhancer_s` checkpoint (release
-`ckpt-v1.0.0-48khz`, epoch 500). FastEnhancer-S's `ONNXModel.forward` already takes one STFT
-frame plus the per-block GRU caches and returns the enhanced frame plus the next caches -- the
-same shape as DPDFNet's traced graph -- so the conversion is a plain `torch.jit.trace` plus
-`coremltools.convert` with no custom op lowering: a single-layer unidirectional `nn.GRU` and
-`scaled_dot_product_attention` both convert natively (unlike DPDFNet's bidirectional,
-chunked GRU). Weights stay fp32 (212K parameters is under 1 MB either way, so there's no size
-reason to compress). Parity against the unmodified upstream PyTorch model over 484 frames
-(STFT frames of a real signal plus random spectra): 127.2 dB SNR, worst frame 1.26e-5 relative
-error. Three checkpoints share this hop size (10.67 ms) at increasing size/quality -- t (29K
-params), b (104K), s (212K) -- with authors' own VoiceBank+DEMAND-48k validation PESQ/STOI of
-2.73/0.937, 2.92/0.944 and 2.98/0.947 respectively; s is shipped since BNNS Graph runs it in a
-small fraction of the ~1 ms/hop budget regardless of size, so quality decided it.
+`scripts/convert-fastenhancer.py <variant>` (`s`, `m` or `l`) rebuilds
+`App/Loopbacker/Resources/FastEnhancer_<V>_48k.mlmodelc` from pinned upstream code (commit
+`85d98a6`) and the matching checkpoint (release `ckpt-v1.0.0-48khz`, epoch 500). Every
+variant's `ONNXModel.forward` already takes one STFT frame plus the per-block GRU caches and
+returns the enhanced frame plus the next caches -- the same shape as DPDFNet's traced graph --
+so the conversion is a plain `torch.jit.trace` plus `coremltools.convert` with no custom op
+lowering: a single-layer unidirectional `nn.GRU` and `scaled_dot_product_attention` both
+convert natively (unlike DPDFNet's bidirectional, chunked GRU). Weights stay fp32 (every
+variant is under 5 MB fp32, so there's no size reason to compress). Parity against the
+unmodified upstream PyTorch model, carrying state frame to frame: S 127.2 dB SNR over 484
+frames, M 126.0 dB over 709 frames, L 124.6 dB over 1069 frames (worst frame 1.3–2.5e-5
+relative error) -- frame counts differ because the parity signal is fixed-length and each
+variant's hop size changes how many STFT frames it produces, plus 110 random spectra appended
+to every variant.
+
+#### FastEnhancer variant choice
+
+FastEnhancer ships three 48 kHz checkpoints at the pinned release, all sharing the same causal
+architecture (strided-conv encoder/decoder around a per-frequency-bin-GRU "RNNFormer"
+bottleneck) and the same 1024-sample window, differing only in width/depth and hop size:
+
+| Variant | Params | Hop | Total latency | Hot CPU | Worst-case 512-callback | PESQ | ESTOI | SI-SDR | DNSMOS OVRL |
+|---|---|---|---|---|---|---|---|---|---|
+| S | 212K | 512 (10.67 ms) | 21.3 ms | 0.20 ms/hop (1.8%) | 1 hop, 0.20 ms (1.8%) | 2.99 | 0.86 | 18.2 | 3.07 |
+| M | 520K | 320 (6.67 ms) | 21.3 ms | 0.39 ms/hop (5.8%) | 2 hops, 0.77 ms (7.2%) | 3.07 | 0.87 | 19.2 | 3.12 |
+| L | 1.15M | 200 (4.17 ms) | 21.3 ms | 0.69 ms/hop (16.5%) | 3 hops, 2.06 ms (19.3%) | 3.14 | 0.88 | 19.4 | 3.13 |
+
+Total latency (`delay + hop - 1`) is identical across variants -- `windowLength - 1` samples,
+and `windowLength` is 1024 for all three -- so a smaller hop buys nothing on latency, only a
+finer analysis grid the model can use for quality. CPU scales roughly with params and inversely
+with hop (more model executions per second at a smaller hop): measured the same way as the
+other engines (hot loop, 2000 hops, interposed `malloc`), plus the worst case a 512-frame IO
+callback can hit, `ceil(512/hop)` hops back to back, since the callback and hop boundaries
+don't line up. All three are zero-allocation on the execute path.
+
+L has the best quality but its worst-case callback (19.3%) is not "well under" the 20%-of-a-core
+budget `NoiseEngineBenchmark` uses to recommend FastEnhancer over RNNoise -- that budget already
+assumes headroom for the mix and effects sharing the IO thread, and L leaves almost none. M
+clears that budget with comfortable margin (7.2%) while still beating S on every quality metric,
+including matching or exceeding DPDFNet's cleanup (PESQ 3.07 vs 3.04, ESTOI 0.87 vs 0.86, SI-SDR
+19.2 vs 18.8 dB, DNSMOS OVRL 3.12 vs 3.13) at a third of DPDFNet's latency and similar CPU. So
+**M replaced S** as the shipped FastEnhancer model; S and L are no longer bundled, though both
+still build and score with `convert-fastenhancer.py {s,l}` and
+`eval.py --fastenhancer-model <path>` for comparison.
 
 ### Quality
 
@@ -645,14 +682,14 @@ model) at -60 dB max reduction:
 |---|---|---|---|---|---|---|
 | Noisy input | 1.97 | 0.79 | 8.4 | 3.34 | 3.13 | 2.70 |
 | DPDFNet | 3.04 | 0.86 | 18.8 | 3.40 | 4.02 | 3.13 |
-| FastEnhancer | 2.99 | 0.86 | 18.2 | 3.35 | 4.02 | 3.07 |
+| FastEnhancer | 3.07 | 0.87 | 19.2 | 3.40 | 4.03 | 3.12 |
 | RNNoise | 2.47 | 0.84 | 13.2 | 3.38 | 4.02 | 3.09 |
 
-DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with DPDFNet
-slightly ahead of FastEnhancer on every metric -- consistent with the authors' own
-VoiceBank+DEMAND numbers for FastEnhancer-S against stronger non-causal baselines. FastEnhancer
-gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's the
-recommended engine and the default. Re-run with
+DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with
+FastEnhancer matching DPDFNet on every metric (PESQ, ESTOI and SI-SDR slightly ahead; DNSMOS
+OVRL essentially tied) at a third of its latency and similar CPU, which is why it's the
+recommended engine and the default -- see "FastEnhancer variant choice" above for how the
+shipped FastEnhancer-M checkpoint was picked over S and L. Re-run with
 `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
 
 ## Effects Chain
@@ -712,6 +749,132 @@ equivalent `nodes` array in the original fixed order, decoding v2 JSON (which ca
 unchanged. `EffectsPreset.appAudio` holds the app-capture ducking/leveling settings separately
 from `nodes`, since app-capture routes never run the voice chain.
 
+## RT-Safety Rules
+
+Every node in a live `FXChain` runs on the capture device's IO thread, same constraints as the
+driver's `DoIOOperation`: no heap allocation, no locks that a non-IO thread can hold across an IO
+call, no Objective-C message send that might allocate or retain/release across a bridge that
+isn't measured allocation-free, no blocking syscall. In practice:
+
+- **No alloc/lock on IO.** Built-in DSP nodes preallocate every buffer in `init` and touch only
+  `UnsafeMutablePointer`s in `process` (see `ReverbNode`, `LimiterNode`, etc. above). Hosted nodes
+  follow the same rule through their own narrower contract (see "Hosted Plugins" below).
+  `EQNode.setBands` publishes new coefficients from the UI thread through a lock-free
+  generation-tagged slot pool rather than a mutex the IO thread could block on.
+- **Graph release off IO.** Swapping `FXChain`'s `ChainGraph` (add/remove/reorder a node, load a
+  hosted plugin) builds the new graph off the IO thread and swaps it in with one atomic pointer
+  exchange; the outgoing graph is freed only after the IO thread has marked it retired via a
+  busy/epoch flag, never `deinit`-ed from inside a `process` call.
+- **Param smoothing.** Value-only edits (slider drags, `enabled` toggles) skip the graph rebuild
+  and push straight into each node's `FXParamStore`, which the IO thread reads lock-free and
+  smooths internally (nodes ramp over a few ms rather than jump-cutting a coefficient or gain),
+  so neither a UI-thread write nor an IO-thread read ever blocks the other.
+
+## Hosted Plugins
+
+`FXHostedNode` wraps a third-party effect as an `FXNode`; three implementations, one per catalog,
+each with a different trust and crash boundary:
+
+- **Audio Units v2** (`AUHostNode`, classic C API): loaded in-process via `AudioComponentInstance`
+  and driven with `AudioUnitRender`/`AudioUnitSetParameter`/`AudioUnitReset` -- plain C calls,
+  measured allocation-free. Deliberately *not* hosted through `AUAudioUnit`'s
+  `renderBlock`/`scheduleParameterBlock` bridge to the same in-process component, which measured
+  two heap allocations per render call regardless of plugin, block size, or whether the size
+  varies -- not safe on the IO thread. In-process means a v2 plugin that crashes or corrupts
+  memory takes Loopbacker down with it; `com.apple.security.cs.disable-library-validation` is
+  required because the hardened runtime otherwise refuses to `dlopen` a component not signed with
+  Loopbacker's own team ID.
+- **Audio Units v3** (`AUHostNode`, same class, different load path): app-extension AUs have no
+  in-process C-API option, so they load out-of-process over XPC via `AUAudioUnit.instantiate` and
+  run through the captured `renderBlock`/`scheduleParameterBlock` closures. A v3 plugin crash is
+  isolated to its own extension process rather than taking down Loopbacker, at the cost of the
+  render-block bridge's per-call allocation measured above -- accepted because it's the only API
+  surface v3 offers, not a choice `AUHostNode` can avoid. `reset()` on a v3 node only clears this
+  node's own counters (it can't forward to the extension's own `AUAudioUnit.reset()`, an
+  Objective-C call this contract doesn't allow from the IO thread), so a plugin's own internal
+  history (e.g. a delay tail) persists across it.
+- **REAPER JSFX** (`JSFXNode`, vendored ysfx/EEL2): in-process, like v2 AUs, so a script that
+  crashes the EEL2 VM takes Loopbacker down too -- but the surface is narrower and more
+  controlled: `com.apple.security.cs.allow-jit` (not the broader
+  `allow-unsigned-executable-memory`) permits exactly the `MAP_JIT` + per-thread
+  `pthread_jit_write_protect_np` path the vendored EEL2 patch uses, and `JSFXNode.load` compiles
+  and runs each script's `@init` off the IO thread (`async`, serialized process-wide behind
+  `compileLock` since the EEL2 compiler isn't safe to call concurrently), so compilation failures
+  surface before a node ever reaches the chain. See `CYSFX/README.md` for the open limitation
+  around EEL2's lazy per-block RAM allocation.
+- **Airwindows** (`AirwindowsNode`, vendored airwin2rack): compiled directly into Loopbacker's own
+  binary, not a third-party dylib -- no process-boundary trust question, and `aw_process`/
+  `aw_get_param`/`aw_set_param` touch only plain data on an already-constructed effect, never
+  allocating, so they're safe straight from the IO thread. `reset()` is a documented no-op
+  (Airwindows effects have no native reset; reconstructing the instance would allocate on the IO
+  thread, which the contract forbids).
+
+No quarantine or crash-recovery layer exists yet for in-process hosts (v2 AU, JSFX): a crash in
+either currently takes the whole app down, same as any other in-process code. v3 AUs are the only
+catalog with real process isolation today, inherent to how Apple ships app-extension AUs rather
+than something `AUHostNode` added.
+
+## Echo Cancellation
+
+`EchoCanceller` (`Services/Comms/EchoCanceller.swift`) runs WebRTC's AEC3 (vendored, see
+`CWebRTCAEC/README.md`) against a far-end reference captured by `SystemAudioTap`
+(`Services/Comms/SystemAudioTap.swift`), one canceller per capture device with echo cancellation
+turned on and not opted out (`AudioSource.echoCancellation`).
+
+- **Reference capture.** `SystemAudioTap` uses the macOS 14.2+ process-tap API
+  (`CATapDescription`/`AudioHardwareCreateProcessTap`) scoped to the *current default output
+  device's* UID and first stream, not a global tap -- so audio apps rendering only into one of
+  Loopbacker's own virtual output devices never pollutes the reference. If the default output is
+  one of Loopbacker's own virtual devices, or there is no default output, the tap doesn't run at
+  all (no TCC prompt, no coreaudiod round trip) and `EchoCanceller` sees silence on its reverse
+  stream, which passes the mic straight through.
+- **Processing.** 48 kHz, 480-sample (10 ms) hops, same buffering shape as `NoiseSuppressor`:
+  `process` accepts any block size up to `FXBlock.maxFrames` and queues into hop-sized chunks.
+  Each hop pulls the matching reference window from a `DriftCompensatedRing.Reader` bound to
+  `SystemAudioTap`'s ring (each `EchoCanceller` owns its own reader, so multiple cancellers on
+  different capture devices track the far-end timeline independently), feeds it to AEC3's
+  `ProcessReverseStream`, then runs `ProcessStream` on the mic hop. AEC3 estimates and tracks the
+  render/capture delay itself; `AudioRouter.setStreamDelay` only supplies a starting estimate from
+  real HAL latency.
+- **Thread contract.** `process` runs on the capture device's IO thread as the sole reader of its
+  own ring reader, touching no Swift reference types besides itself; the shim calls into
+  `webrtc::AudioProcessing`'s steady-state path, measured allocation-free (interposed malloc over
+  2000 calls). `setEnabled`/`setStreamDelay` may be called from any thread.
+- **Permission.** Needs `NSAudioCaptureUsageDescription` (System Audio Recording) the first time
+  it's turned on; `SystemAudioTapPermission` infers denied/granted from tap-creation failure,
+  since the SDK exposes no dedicated "not authorized" status for process taps.
+
+Runs upstream of the voice `FXChain` in the capture pipeline (noise suppression → echo
+cancellation → effects chain → mic gate), independent of it.
+
+## Scenes and Routing
+
+Scenes save/load a full `RoutingConfig` (sources, routes, output destinations, effects preset,
+noise suppression) by name (`PresetManager`). `SceneLoader.load(_:)` never stops and restarts
+every route wholesale: it computes a `SceneDiff` between the running config and the target one and
+applies only the difference.
+
+- **`RoutingDesiredState`** (`Models/SceneDiff.swift`) flattens a `RoutingConfig` into the set of
+  routes that should be running, keyed by `RouteID { source: String, target: RouteTarget }` --
+  the same (source, target) key `AudioRouter.activeRoutes` uses internally. `source` is a device
+  UID or `"app:<bundleID>"`; `target` is `.virtualMic` or `.streamMix`. One source can appear
+  under two `RouteID`s (feeding the virtual mic and Stream Mix independently), which is exactly
+  why the key needs both halves, not source alone.
+- **`SceneDiff.diff(from:to:)`** compares two `RoutingDesiredState`s and produces the minimal set
+  of actions: `routesToStart`/`routesToStop` for genuinely added/removed `RouteID`s, and
+  `routesToRetarget` for a `RouteID` present in both whose mix matrix changed -- retargeted in
+  place, no stop/start, so a route shared between scenes (the same mic feeding the same target)
+  never drops audio even if its channel mix changes.
+- **Device rebinding** happens first (`SceneLoadPlanner.plan`'s `DeviceRebinder.rebind`), against
+  currently present devices, before the before/after states are computed -- so a scene that names
+  a now-absent device diffs against where it *will* actually bind, not a `RouteID` that can never
+  start.
+
+Because `RouteID` carries `RouteTarget`, the virtual mic and Stream Mix routes for the same source
+are entirely independent entries in the diff: loading a scene can start, stop, or retarget one
+without touching the other, and a source's `NoiseSuppressor`/`FXChain` instance (shared per
+capture device, not per route -- see "Effects Chain" above) keeps running across the diff as long
+as at least one voice route on that device survives it.
 
 ## UI Cost
 
@@ -754,11 +917,10 @@ on a given machine, independent of the app's own UI.
   `DYLD_INSERT_LIBRARIES`) confirming the execute path allocates nothing on the heap. `--coreml`
   additionally reports parity (SNR) against running the same frames through Core ML. On an M4
   Max: ~1.4 s single-thread compile, 0.55 ms/hop hot, paced median/p99/max ~0.7/1.9/2.3 ms, 0
-  allocations. `FastEnhancer_S_48k.mlmodelc` isn't wired into `model-bench.sh` (it's
-  DPDFNet-shaped only), but the same technique applied ad hoc gives ~0.2 ms/hop hot (BNNS
-  execute alone ~0.2 ms; full kernel including the STFT/ISTFT vDSP work ~0.2 ms, run-to-run
-  noise dominates the difference) and 0 allocations over 500 hops, both with and without the
-  STFT/ISTFT around it.
+  allocations. `FastEnhancer_M_48k.mlmodelc` isn't wired into `model-bench.sh` (it's
+  DPDFNet-shaped only), but the same technique applied ad hoc gives ~0.39 ms/hop hot (6.67 ms
+  hop, including the STFT/ISTFT vDSP work around the BNNS execute) and 0 allocations over 200
+  hops, both with and without the STFT/ISTFT around it.
 - **`tone.swift`** plays a quiet 440 Hz tone with level swinging -40..-20 dBFS at 1.5 Hz to a
   named output device via `AudioQueue`, so meters and any level-dependent processing keep
   moving during a measurement without needing real program audio.

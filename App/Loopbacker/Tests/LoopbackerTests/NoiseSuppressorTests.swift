@@ -17,7 +17,7 @@ private let model: NoiseSuppressionModel = {
 private let fastEnhancerModel: FastEnhancerModel = {
     let url = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appending(path: "Resources/FastEnhancer_S_48k.mlmodelc")
+        .appending(path: "Resources/FastEnhancer_M_48k.mlmodelc")
     guard let model = FastEnhancerModel.load(from: url) else {
         fatalError("could not load \(url.path)")
     }

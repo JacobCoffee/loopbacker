@@ -125,6 +125,19 @@ class RoutingState: ObservableObject {
     /// Positions of connector dots, reported via PreferenceKey
     @Published var connectorPositions: [ConnectorEnd: CGPoint] = [:]
 
+    /// True while `applyConfig` is assigning `sources`/`routes`/`outputDestinations` in
+    /// sequence. Each is its own `@Published` property, so a naive observer of e.g. `$sources`
+    /// alone would see new sources paired with not-yet-updated routes (or vice versa) mid-call.
+    /// `RoutingSync` checks this to skip reconciling on those partial states and instead
+    /// reconciles once, against the fully-consistent result, via `configReplaced`.
+    private(set) var isReplacingConfig = false
+    /// Fires once after `applyConfig` finishes assigning every field.
+    let configReplaced = PassthroughSubject<Void, Never>()
+
+    /// Where `save()`/`load()` read and write `config.json`. Injectable so tests never touch
+    /// the real Application Support path (and so another instance's saved config).
+    private let persistenceDirectory: URL
+
     init(
         sources: [AudioSource] = [],
         outputChannels: [AudioChannel] = [],
@@ -133,7 +146,8 @@ class RoutingState: ObservableObject {
         routes: [AudioRoute] = [],
         outputDestinations: [OutputDestination] = [],
         effectsPreset: EffectsPreset = EffectsPreset(),
-        noiseSuppression: NoiseSuppressionSettings = NoiseSuppressionSettings()
+        noiseSuppression: NoiseSuppressionSettings = NoiseSuppressionSettings(),
+        persistenceDirectory: URL = RoutingState.defaultConfigDirectoryURL
     ) {
         self.sources = sources
         self.outputChannels = outputChannels
@@ -143,6 +157,7 @@ class RoutingState: ObservableObject {
         self.outputDestinations = outputDestinations
         self.effectsPreset = effectsPreset
         self.noiseSuppression = noiseSuppression
+        self.persistenceDirectory = persistenceDirectory
     }
 
     // MARK: - Route management
@@ -207,33 +222,16 @@ class RoutingState: ObservableObject {
         save()
     }
 
-    /// Re-binds device sources whose saved UID no longer exists to a present input
-    /// device with the same name. CoreAudio UIDs change when a different driver
-    /// claims the hardware (e.g. MOTU's CoreUAC driver vs. AppleUSBAudioEngine),
-    /// which would otherwise leave the source silently unroutable.
-    /// A source is only re-bound when exactly one unclaimed input device matches.
-    /// Returns the (old, new) UID pairs that changed.
+    /// Re-binds device sources whose current device is unavailable. See `DeviceRebinder.rebind`
+    /// for the rules.
     @discardableResult
-    func rebindMissingDeviceSources(to devices: [SystemAudioDevice]) -> [(old: String, new: String)] {
-        let presentUIDs = Set(devices.map(\.uid))
-        var claimedUIDs = Set(sources.map(\.deviceUID))
-        var changes: [(old: String, new: String)] = []
-
-        for idx in sources.indices {
-            let source = sources[idx]
-            guard !source.isAppCapture, !source.deviceUID.isEmpty,
-                  !presentUIDs.contains(source.deviceUID) else { continue }
-            let candidates = devices.filter {
-                $0.isInput && $0.name == source.name && !claimedUIDs.contains($0.uid)
-            }
-            guard candidates.count == 1, let match = candidates.first else { continue }
-            claimedUIDs.insert(match.uid)
-            changes.append((old: source.deviceUID, new: match.uid))
-            sources[idx].deviceUID = match.uid
+    func rebindMissingDeviceSources(to devices: [SystemAudioDevice]) -> [RebindChange] {
+        let result = DeviceRebinder.rebind(sources: sources, devices: devices)
+        if !result.changes.isEmpty {
+            sources = result.sources
+            save()
         }
-
-        if !changes.isEmpty { save() }
-        return changes
+        return result.changes
     }
 
     func addOutputChannel() {
@@ -388,22 +386,23 @@ class RoutingState: ObservableObject {
 
     // MARK: - Persistence
 
-    private static let configDirectoryURL: URL = {
+    static let defaultConfigDirectoryURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return appSupport.appendingPathComponent("Loopbacker", isDirectory: true)
     }()
 
-    private static let configFileURL: URL = {
-        configDirectoryURL.appendingPathComponent("config.json")
-    }()
+    private var configFileURL: URL {
+        persistenceDirectory.appendingPathComponent("config.json")
+    }
 
     /// Serial background queue for config persistence -- avoids blocking
     /// the main thread with file I/O during rapid state changes.
     private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.save", qos: .utility)
 
-    func save() {
-        // Snapshot the config on the calling thread (main), then write on background.
-        let config = RoutingConfig(
+    /// Snapshot of the full routing configuration, as currently running. Used for persistence,
+    /// scene export, and as the "before" state when diffing a scene load.
+    func currentConfig() -> RoutingConfig {
+        RoutingConfig(
             sources: sources,
             outputChannels: outputChannels,
             streamOutputChannels: streamOutputChannels,
@@ -413,14 +412,21 @@ class RoutingState: ObservableObject {
             effectsPreset: effectsPreset,
             noiseSuppression: noiseSuppression
         )
+    }
+
+    func save() {
+        // Snapshot the config on the calling thread (main), then write on background.
+        let config = currentConfig()
+        let directory = persistenceDirectory
+        let fileURL = configFileURL
         Self.saveQueue.async {
             do {
                 try FileManager.default.createDirectory(
-                    at: Self.configDirectoryURL,
+                    at: directory,
                     withIntermediateDirectories: true
                 )
                 let data = try JSONEncoder().encode(config)
-                try data.write(to: Self.configFileURL, options: .atomic)
+                try data.write(to: fileURL, options: .atomic)
             } catch {
                 // Non-fatal: best-effort persistence
                 print("Loopbacker: failed to save config: \(error)")
@@ -428,9 +434,10 @@ class RoutingState: ObservableObject {
         }
     }
 
-    static func load() -> RoutingState {
+    static func load(persistenceDirectory: URL = RoutingState.defaultConfigDirectoryURL) -> RoutingState {
+        let fileURL = persistenceDirectory.appendingPathComponent("config.json")
         do {
-            let data = try Data(contentsOf: configFileURL)
+            let data = try Data(contentsOf: fileURL)
             let config = try JSONDecoder().decode(RoutingConfig.self, from: data)
             return RoutingState(
                 sources: config.sources,
@@ -440,11 +447,12 @@ class RoutingState: ObservableObject {
                 routes: config.routes,
                 outputDestinations: config.outputDestinations,
                 effectsPreset: config.effectsPreset,
-                noiseSuppression: config.noiseSuppression
+                noiseSuppression: config.noiseSuppression,
+                persistenceDirectory: persistenceDirectory
             )
         } catch {
             // No saved state or corrupt file — fall back to defaults
-            return empty()
+            return empty(persistenceDirectory: persistenceDirectory)
         }
     }
 
@@ -467,22 +475,16 @@ class RoutingState: ObservableObject {
 
     /// Encodes the current routing configuration to JSON data.
     func exportConfig() -> Data {
-        let config = RoutingConfig(
-            sources: sources,
-            outputChannels: outputChannels,
-            streamOutputChannels: streamOutputChannels,
-            streamMixEnabled: streamMixEnabled,
-            routes: routes,
-            outputDestinations: outputDestinations,
-            effectsPreset: effectsPreset,
-            noiseSuppression: noiseSuppression
-        )
-        return (try? JSONEncoder().encode(config)) ?? Data()
+        (try? JSONEncoder().encode(currentConfig())) ?? Data()
     }
 
-    /// Decodes and replaces the current routing state from JSON data.
-    func importConfig(_ data: Data) {
-        guard let config = try? JSONDecoder().decode(RoutingConfig.self, from: data) else { return }
+    /// Replaces the current routing state with `config` and persists it. Sets
+    /// `isReplacingConfig` for the whole sequence of field assignments so observers of the
+    /// individual `@Published` properties (which fire one at a time) can skip reconciling
+    /// against a state that's only partially updated, then reconcile once against the
+    /// consistent result via `configReplaced`.
+    func applyConfig(_ config: RoutingConfig) {
+        isReplacingConfig = true
         sources = config.sources
         outputChannels = config.outputChannels
         streamOutputChannels = config.streamOutputChannels
@@ -491,19 +493,28 @@ class RoutingState: ObservableObject {
         outputDestinations = config.outputDestinations
         effectsPreset = config.effectsPreset
         noiseSuppression = config.noiseSuppression
+        isReplacingConfig = false
         save()
+        configReplaced.send(())
+    }
+
+    /// Decodes and replaces the current routing state from JSON data.
+    func importConfig(_ data: Data) {
+        guard let config = try? JSONDecoder().decode(RoutingConfig.self, from: data) else { return }
+        applyConfig(config)
     }
 
     // MARK: - Empty initial state (populated from real devices on launch)
 
-    static func empty() -> RoutingState {
+    static func empty(persistenceDirectory: URL = RoutingState.defaultConfigDirectoryURL) -> RoutingState {
         RoutingState(
             sources: [],
             outputChannels: [
                 AudioChannel(id: 1, label: "1 (L)"),
                 AudioChannel(id: 2, label: "2 (R)")
             ],
-            routes: []
+            routes: [],
+            persistenceDirectory: persistenceDirectory
         )
     }
 }

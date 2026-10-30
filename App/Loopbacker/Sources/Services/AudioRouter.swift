@@ -73,6 +73,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Live meter levels for the UI; written by the 30 Hz meter timer on the main thread.
     let meters = MeterLevels()
 
+    /// Live loudness readings for each measured virtual device; same visibility-gated 30 Hz
+    /// publish path as `meters`.
+    let loudness = LoudnessLevels()
+
     /// Current effects preset — applied to new routes and propagated to existing ones
     var currentEffectsPreset = EffectsPreset()
     /// Noise suppression settings, opted-out capture devices, and devices whose monitor stays
@@ -119,6 +123,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
     /// publishing work (see `updatePublishedMeters`) instead of re-checking and re-pushing zeros.
     private var wasSilentMeters = false
+    /// The `MicLoudnessBus.changeGeneration` value last published to `loudness`; lets
+    /// `updatePublishedMeters` skip re-reading and republishing the mic loudness reading on
+    /// ticks where nothing about it has changed (see that method).
+    private var lastPublishedLoudnessGeneration = -1
 
     /// Upper bound on channels a single route captures or plays (keeps the mix matrix small
     /// for very wide interfaces).
@@ -1335,71 +1343,113 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// The decay in `drainLevels` clamps a buffer to exact `0` once it crosses the floor, so
     /// once a tick publishes an all-silent snapshot every later tick reads the same zeros until
     /// real audio returns. `isEverythingSilent` is a read-only pass over the raw buffers (no
-    /// allocation); when it agrees with `wasSilentMeters` this tick skips draining, building the
-    /// per-route dictionaries, and walking `NSApp.windows` entirely.
+    /// allocation); when it agrees with `wasSilentMeters` this tick skips draining and building
+    /// the per-route dictionaries. Loudness is cached separately (see below) and only re-read
+    /// when `MicLoudnessBus` reports something actually changed.
     ///
     /// Output levels are tracked per target device (virtual mic, Stream Mix): two routes
     /// feeding different targets never bleed into each other's post-mix meters even though
     /// their channel numbering overlaps (see `MeterLevels.updateOutputs(target:_:)`).
     private func updatePublishedMeters() {
-        guard !(wasSilentMeters && isEverythingSilent()) else { return }
+        // Cached flag, not a window walk: closing the main window only hides it (SwiftUI keeps
+        // its view graph alive), so without this every tick would still drain/publish meters and
+        // scan the loudness histogram for a window nobody sees.
+        let isVisible = MainActor.assumeIsolated { MeterWindowVisibility.shared.isVisible }
+        guard isVisible else { return }
+
+        // Drives `MicLoudnessBus`'s idle state machine (clearing momentary/short-term/true-peak
+        // once every feed has stopped, consuming a reset request made while idle) regardless of
+        // whether anything below ends up republishing.
+        MicLoudnessBus.shared.checkForIdleContributors()
+        let loudnessGeneration = MicLoudnessBus.shared.changeGeneration
+        let loudnessChanged = loudnessGeneration != lastPublishedLoudnessGeneration
+
+        // Only the legacy peak-meter work (source/output dB bars) can be skipped on a silent
+        // tick that also has no fresh loudness data -- a loudness change alone (e.g. the
+        // soundboard, which isn't an AudioRouter route, is the only thing playing) still needs
+        // this tick to run far enough to publish it.
+        let skipPeakMeters = wasSilentMeters && isEverythingSilent()
+        if skipPeakMeters && !loudnessChanged {
+            return
+        }
 
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevelsByTarget: [String: [Int: Float]] = [:]
         var sawNonZero = false
 
-        for (key, ctx) in activeRoutes {
-            newSourceLevels[key.source] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
-            // Output meter takes post-mix levels (max across every route feeding this target).
-            var targetLevels = newOutputLevelsByTarget[ctx.playbackDeviceUID] ?? [:]
-            for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
-                targetLevels[ch] = max(targetLevels[ch] ?? 0.0, level)
+        if !skipPeakMeters {
+            for (key, ctx) in activeRoutes {
+                newSourceLevels[key.source] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+                // Output meter takes post-mix levels (max across every route feeding this target).
+                var targetLevels = newOutputLevelsByTarget[ctx.playbackDeviceUID] ?? [:]
+                for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
+                    targetLevels[ch] = max(targetLevels[ch] ?? 0.0, level)
+                }
+                newOutputLevelsByTarget[ctx.playbackDeviceUID] = targetLevels
             }
-            newOutputLevelsByTarget[ctx.playbackDeviceUID] = targetLevels
-        }
 
-        // Output routes report the virtual device channels they capture.
-        for (uid, ctx) in activeOutputRoutes {
-            newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+            // Output routes report the virtual device channels they capture.
+            for (uid, ctx) in activeOutputRoutes {
+                newSourceLevels["output:\(uid)"] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+            }
         }
-
-        // Skip later silent ticks only once these zeros are on screen; a hidden window must still
-        // get them when it reappears, or it would keep showing the last levels it saw.
-        wasSilentMeters = false
 
         let sourceLevels = newSourceLevels
         let outputLevelsByTarget = newOutputLevelsByTarget
         let activeTargets = Set(activeRoutes.values.map(\.playbackDeviceUID))
-        MainActor.assumeIsolated {
-            // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
-            // publish re-renders the cables and meters of a window nobody sees. Publish only while
-            // a window that shows meters (main window, menu bar panel) is on screen. The menu bar
-            // icon's own window always reports visible, so it doesn't count.
-            let showing = NSApp.windows.contains {
-                $0.isVisible && $0.occlusionState.contains(.visible) && $0.className != "NSStatusBarWindow"
-            }
-            guard showing else { return }
-            wasSilentMeters = !sawNonZero
+        // The virtual mic's loudness is combined across every feed by `MicLoudnessBus` itself
+        // (summed per IO cycle on the shared device thread), so there's nothing to group here.
+        // `integratedLUFS()` scans a fixed-size histogram (a few hundred microseconds) -- cheap,
+        // but not free enough to redo on every 30 Hz tick regardless of whether anything
+        // changed, so it's only read when `loudnessChanged`.
+        let micLoudness: LoudnessReading? = loudnessChanged ? LoudnessReading(
+            momentaryLUFS: MicLoudnessBus.shared.momentaryLUFS,
+            shortTermLUFS: MicLoudnessBus.shared.shortTermLUFS,
+            integratedLUFS: MicLoudnessBus.shared.integratedLUFS(),
+            truePeakDBTP: MicLoudnessBus.shared.truePeakDBTP
+        ) : nil
+        if loudnessChanged { lastPublishedLoudnessGeneration = loudnessGeneration }
 
-            // Routing changes are rare (user-driven), so only pay for the `Set` and the removal
-            // scan when the route count actually moved; the common tick (nothing started or
-            // stopped) skips it.
-            if meters.sourceCount != sourceLevels.count {
-                meters.retainSources(Set(sourceLevels.keys))
-            }
-            for (key, channels) in sourceLevels {
-                meters.updateSource(key, channels: channels)
-            }
-            // Every target's channel set never changes while any route still feeds it — clear
-            // only on that target's empty transition so a stale post-mix peak doesn't linger.
-            for target in [VirtualDeviceChannels.micUID, VirtualDeviceChannels.streamUID] {
-                if activeTargets.contains(target) {
-                    meters.updateOutputs(target: target, outputLevelsByTarget[target] ?? [:])
-                } else {
-                    meters.clearOutputs(target: target)
+        MainActor.assumeIsolated {
+            if !skipPeakMeters {
+                // Skip later silent ticks only once these zeros are on screen; a hidden window
+                // must still get them when it reappears, or it would keep showing stale levels.
+                wasSilentMeters = !sawNonZero
+
+                // Routing changes are rare (user-driven), so only pay for the `Set` and the
+                // removal scan when the route count actually moved; the common tick (nothing
+                // started or stopped) skips it.
+                if meters.sourceCount != sourceLevels.count {
+                    meters.retainSources(Set(sourceLevels.keys))
+                }
+                for (key, channels) in sourceLevels {
+                    meters.updateSource(key, channels: channels)
+                }
+                // Every target's channel set never changes while any route still feeds it —
+                // clear only on that target's empty transition so a stale post-mix peak doesn't
+                // linger.
+                for target in [VirtualDeviceChannels.micUID, VirtualDeviceChannels.streamUID] {
+                    if activeTargets.contains(target) {
+                        meters.updateOutputs(target: target, outputLevelsByTarget[target] ?? [:])
+                    } else {
+                        meters.clearOutputs(target: target)
+                    }
                 }
             }
+
+            if let micLoudness {
+                loudness.update(deviceUID: VirtualDeviceChannels.micUID, micLoudness)
+            }
         }
+    }
+
+    /// Resets integrated loudness (on demand, from the UI's reset button). `deviceUID` is kept
+    /// for API symmetry with the per-device UI (`LoudnessPanelView`) even though there is
+    /// currently only one measured device (the virtual mic) -- `MicLoudnessBus` IS that device's
+    /// reading, not a per-route one, so there's nothing to look up.
+    func resetIntegratedLoudness(deviceUID: String) {
+        guard deviceUID == VirtualDeviceChannels.micUID else { return }
+        MicLoudnessBus.shared.resetIntegrated()
     }
 
     /// Snapshot 1-based channel levels, decay the RT-written meter buffer in place, and note
@@ -2252,6 +2302,15 @@ private func outputRenderCallback(
 
     // Read from the ring buffer into the output
     ctx.readFromRing(outputBuffer, frames: inNumberFrames)
+
+    // Measure loudness of exactly what's about to reach the device, combined with every other
+    // feed writing to the same virtual mic this IO cycle (see `MicLoudnessBus`'s doc comment).
+    if ctx.playbackDeviceUID == VirtualDeviceChannels.micUID {
+        MicLoudnessBus.shared.contribute(
+            buffer: outputBuffer, frames: Int(inNumberFrames), channels: Int(ctx.outputChannels),
+            sampleTime: inTimeStamp.pointee.mSampleTime
+        )
+    }
 
     return noErr
 }

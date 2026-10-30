@@ -9,6 +9,7 @@ struct MenuBarPanel: View {
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var appCaptureService: AppCaptureService
     @EnvironmentObject var micControl: MicControl
+    @EnvironmentObject var appUpdater: AppUpdater
 
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var loginItem = LoginItem.shared
@@ -29,7 +30,16 @@ struct MenuBarPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.bottom, 12)
+            if appUpdater.availableUpdate != nil || appUpdater.installingVersion != nil || driverInstaller.updateAvailable {
+                updateBanner
+                Divider()
+                    .padding(.vertical, 12)
+            }
             sourcesList
+            if routingState.sources.contains(where: { $0.isEnabled && !$0.isMuted }) {
+                LoudnessPanelView(compact: true)
+                    .padding(.top, 10)
+            }
             Divider()
                 .padding(.vertical, 12)
             noiseSuppressionRow
@@ -70,6 +80,74 @@ struct MenuBarPanel: View {
             .fixedSize()
         }
         .accessibilityElement(children: .combine)
+    }
+
+    // MARK: - Updates
+
+    /// Non-modal "update available" row for the app and/or the driver. Never pops a window;
+    /// installing only happens when the user taps a button here (or the app quits with the
+    /// app update already downloaded).
+    @ViewBuilder
+    private var updateBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let update = appUpdater.availableUpdate {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.loopbacker)
+                        .frame(width: 20)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Update available")
+                            .font(.callout)
+                        Text("Loopbacker \(update.displayVersion)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Install") { appUpdater.installAvailableUpdate() }
+                        .buttonStyle(.glassProminent)
+                        .tint(.loopbacker)
+                        .controlSize(.small)
+                        .help("Install now and relaunch, or it installs automatically on quit")
+                }
+            } else if let version = appUpdater.installingVersion {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20)
+                        .accessibilityHidden(true)
+                    Text("Installing Loopbacker \(version)…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                }
+            }
+            if driverInstaller.updateAvailable {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.body)
+                        .foregroundStyle(Color.signalWarm)
+                        .frame(width: 20)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Driver update available")
+                            .font(.callout)
+                        Text("Needs admin; briefly drops audio")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Install") { driverInstaller.install() }
+                        .buttonStyle(.glass)
+                        .controlSize(.small)
+                        .disabled(driverInstaller.isProcessing)
+                        .help("Reinstalls the driver and restarts coreaudiod")
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 
     // MARK: - Sources

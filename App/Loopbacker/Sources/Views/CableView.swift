@@ -13,6 +13,8 @@ import AppKit
 struct CableView: View {
     @EnvironmentObject var routingState: RoutingState
     @Environment(MeterLevels.self) private var meters
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+    @Environment(\.colorSchemeContrast) private var contrast
     let connectorPositions: [ConnectorEnd: CGRect]
 
     /// Glow levels per source are quantized to this many steps, so a layer update happens only
@@ -25,7 +27,9 @@ struct CableView: View {
             sources: routingState.sources,
             pending: routingState.pendingConnector,
             positions: connectorPositions,
-            meters: meters
+            meters: meters,
+            differentiateWithoutColor: differentiateWithoutColor,
+            highContrast: contrast == .increased
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // CRITICAL: hit testing must be off so clicks pass through to cards/buttons
@@ -42,11 +46,14 @@ private struct CableLayerRepresentable: NSViewRepresentable {
     let pending: ConnectorEnd?
     let positions: [ConnectorEnd: CGRect]
     let meters: MeterLevels
+    let differentiateWithoutColor: Bool
+    let highContrast: Bool
 
     func makeNSView(context: Context) -> CableLayerView { CableLayerView() }
 
     func updateNSView(_ view: CableLayerView, context: Context) {
-        view.update(routes: routes, sources: sources, pending: pending, positions: positions, meters: meters)
+        view.update(routes: routes, sources: sources, pending: pending, positions: positions, meters: meters,
+                     differentiateWithoutColor: differentiateWithoutColor, highContrast: highContrast)
     }
 }
 
@@ -59,6 +66,8 @@ private final class CableLayerView: NSView {
         let sources: [AudioSource]
         let pending: ConnectorEnd?
         let positions: [ConnectorEnd: CGRect]
+        let differentiateWithoutColor: Bool
+        let highContrast: Bool
     }
 
     private struct CableGroup {
@@ -93,6 +102,8 @@ private final class CableLayerView: NSView {
 
     private var accentColor: CGColor = NSColor.black.cgColor
     private var idleColor: CGColor = NSColor.black.cgColor
+    private var differentiateWithoutColor = false
+    private var highContrast = false
 
     init() {
         super.init(frame: .zero)
@@ -142,11 +153,16 @@ private final class CableLayerView: NSView {
         sources: [AudioSource],
         pending: ConnectorEnd?,
         positions: [ConnectorEnd: CGRect],
-        meters: MeterLevels
+        meters: MeterLevels,
+        differentiateWithoutColor: Bool,
+        highContrast: Bool
     ) {
-        let newStructure = Structure(routes: routes, sources: sources, pending: pending, positions: positions)
+        let newStructure = Structure(routes: routes, sources: sources, pending: pending, positions: positions,
+                                      differentiateWithoutColor: differentiateWithoutColor, highContrast: highContrast)
         if newStructure != structure {
             structure = newStructure
+            self.differentiateWithoutColor = differentiateWithoutColor
+            self.highContrast = highContrast
             rebuild(routes: routes, sources: sources, pending: pending, positions: positions)
         }
         startObservingGlow(sources: sources, meters: meters)
@@ -239,8 +255,10 @@ private final class CableLayerView: NSView {
         }
 
         let idle = shapeLayer()
-        idle.lineWidth = 1.5
-        idle.strokeColor = idleColor.withAlpha(0.22)
+        idle.lineWidth = highContrast ? 2 : 1.5
+        idle.strokeColor = idleColor.withAlpha(highContrast ? 0.45 : 0.22)
+        // A dashed idle cable reads as "not live" by shape, not just by its dimmer color/width.
+        if differentiateWithoutColor { idle.lineDashPattern = [4, 3] }
 
         // Glow: a wide, low-opacity stroke plus a native layer shadow for softness, instead of a
         // Gaussian blur filter that would force the canvas to be rasterized on the main thread.
@@ -366,6 +384,7 @@ private final class CableLayerView: NSView {
         let isLive = step > 0
         let rawLevel = CGFloat(step) / CGFloat(CableView.glowStepCount)
         let intensity = isLive ? min(max(rawLevel, 0.12), 1) : 0
+        let contrastFloor: CGFloat = highContrast ? 0.25 : 0
 
         group.idle.isHidden = isLive
         group.glow.isHidden = !isLive
@@ -379,12 +398,12 @@ private final class CableLayerView: NSView {
             group.glow.shadowOpacity = Float(0.35 + 0.45 * intensity)
             group.glow.shadowRadius = 4 + 6 * intensity
 
-            group.main.strokeColor = accentColor.withAlpha(0.55 + 0.3 * intensity)
-            group.core.strokeColor = accentColor.withAlpha(0.5 + 0.3 * intensity)
+            group.main.strokeColor = accentColor.withAlpha(min(1, 0.55 + 0.3 * intensity + contrastFloor))
+            group.core.strokeColor = accentColor.withAlpha(min(1, 0.5 + 0.3 * intensity + contrastFloor))
         }
 
-        group.startDot.fillColor = isLive ? accentColor.withAlpha(0.9) : idleColor.withAlpha(0.35)
-        group.endDot.fillColor = isLive ? accentColor.withAlpha(0.9) : idleColor.withAlpha(0.35)
+        group.startDot.fillColor = isLive ? accentColor.withAlpha(0.9) : idleColor.withAlpha(highContrast ? 0.6 : 0.35)
+        group.endDot.fillColor = isLive ? accentColor.withAlpha(0.9) : idleColor.withAlpha(highContrast ? 0.6 : 0.35)
     }
 
     private func applyBloomAppearance(_ bloom: BloomGroup, step: Int) {
@@ -407,7 +426,7 @@ private final class CableLayerView: NSView {
     private func reapplyColors() {
         withoutAnimation {
             for group in cableGroups {
-                group.idle.strokeColor = idleColor.withAlpha(0.22)
+                group.idle.strokeColor = idleColor.withAlpha(highContrast ? 0.45 : 0.22)
                 group.shadow.strokeColor = accentColor.withAlpha(0.3)
                 group.glow.shadowColor = accentColor
                 applyCableAppearance(group, step: glowSteps[group.sourceId] ?? 0)

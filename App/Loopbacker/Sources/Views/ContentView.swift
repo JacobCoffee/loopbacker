@@ -7,14 +7,17 @@ struct ContentView: View {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var driverInstaller: DriverInstaller
+    @EnvironmentObject var appUpdater: AppUpdater
 
     @SceneStorage("studioSection") private var section: StudioSection = .routing
     @State private var showSourcePicker = false
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
+    @AppStorage(RoutingViewMode.storageKey) private var routingViewMode: RoutingViewMode = .canvas
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
-                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller,
+                      appUpdater: appUpdater)
     }
 
     var body: some View {
@@ -36,11 +39,18 @@ struct ContentView: View {
     private var detail: some View {
         switch section {
         case .routing:
-            RoutingCanvasView(onAddSource: { showSourcePicker = true })
-                .toolbar {
-                    routingToolbar
-                    GlobalToolbar()
+            Group {
+                switch routingViewMode {
+                case .canvas:
+                    RoutingCanvasView(onAddSource: { showSourcePicker = true })
+                case .matrix:
+                    RoutingMatrixView()
                 }
+            }
+            .toolbar {
+                routingToolbar
+                GlobalToolbar()
+            }
         case .effects:
             EffectsView()
         case .soundboard:
@@ -54,6 +64,17 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var routingToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Picker("Routing View", selection: $routingViewMode) {
+                ForEach(RoutingViewMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .help("Switch between the cable canvas and the keyboard-navigable connection matrix")
+        }
+
         ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 showSourcePicker = true
@@ -92,12 +113,14 @@ struct GlobalToolbar: ToolbarContent {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var driverInstaller: DriverInstaller
+    @EnvironmentObject var appUpdater: AppUpdater
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
     @ObservedObject private var loginItem = LoginItem.shared
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
-                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller,
+                      appUpdater: appUpdater)
     }
 
     var body: some ToolbarContent {
@@ -135,11 +158,31 @@ struct GlobalToolbar: ToolbarContent {
                     actions.toggleDriver()
                 }
                 .disabled(driverInstaller.isProcessing)
+                if driverInstaller.updateAvailable {
+                    Button("Install Driver Update…", systemImage: "arrow.triangle.2.circlepath") {
+                        actions.installDriverUpdate()
+                    }
+                    .disabled(driverInstaller.isProcessing)
+                    .help("Needs admin and briefly drops audio while coreaudiod restarts")
+                }
+                Divider()
+                Button("Check for Updates…", systemImage: "arrow.down.circle.dotted") {
+                    actions.checkForUpdates()
+                }
+                .disabled(!appUpdater.canCheckForUpdates)
+                if let update = appUpdater.availableUpdate {
+                    Button("Update to \(update.displayVersion)…", systemImage: "arrow.down.circle") {
+                        actions.installAvailableUpdate()
+                    }
+                } else if let version = appUpdater.installingVersion {
+                    Text("Installing \(version)…")
+                }
+                Divider()
                 Button("Quit and Stop Routing", systemImage: "power") { AppDelegate.forceQuit() }
             } label: {
                 Label("More", systemImage: "ellipsis")
             }
-            .help("Devices, test tone, open at login, appearance, driver")
+            .help("Devices, test tone, open at login, appearance, driver, updates")
         }
     }
 }

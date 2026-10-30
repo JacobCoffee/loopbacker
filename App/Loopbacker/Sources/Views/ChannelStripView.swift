@@ -8,6 +8,13 @@ struct ChannelStripView: View {
     let isSourceEnabled: Bool
     var connectorEnd: ConnectorEnd
     @EnvironmentObject var routingState: RoutingState
+    @Environment(MeterLevels.self) private var meters
+
+    /// Polled (not observed) at low frequency only while connected, so VoiceOver's accessibility
+    /// value can include a live dB reading without the per-tick SwiftUI re-render `MeterLevels`'
+    /// doc comment warns about -- reading `meters` here happens outside a SwiftUI body, so it
+    /// never registers Observation tracking; only the explicit `liveLevelText` write does.
+    @State private var liveLevelText: String = "Silent"
 
     enum StripSide {
         /// Connector port on the right; meter reads the source's route key (`AudioSource.deviceUID`).
@@ -55,6 +62,13 @@ struct ChannelStripView: View {
         .frame(height: 28)
     }
 
+    /// Restarts (or stops) the live-level poll when either the connection state or the shared
+    /// meter-window-visibility signal changes.
+    private struct LivePollKey: Equatable {
+        let connected: Bool
+        let visible: Bool
+    }
+
     // MARK: - Connector port
 
     private var connectorPort: some View {
@@ -74,9 +88,36 @@ struct ChannelStripView: View {
             .help(isConnected
                 ? "Click to start a new route from this channel, right-click to disconnect all routes"
                 : "Click to connect this channel to a source or output")
-            .accessibilityLabel(Text(channel.label + " connector"))
-            .accessibilityValue(Text(isConnected ? "Connected" : (isPending ? "Pending" : "Not connected")))
+            .accessibilityLabel(Text(channel.label + " connector, " + connectionSummary))
+            .accessibilityValue(Text(accessibilityValueText))
             .accessibilityAddTraits(.isButton)
+            // VoiceOver's default activation gesture: `onTapGesture` alone isn't wired to it.
+            .accessibilityAction(.default) { handleTap() }
+            .accessibilityActions {
+                ForEach(connectableTargets, id: \.end) { target in
+                    Button("Connect to \(target.label)") { connect(to: target.end) }
+                }
+                ForEach(connectedTargets, id: \.end) { target in
+                    Button("Disconnect from \(target.label)") {
+                        withAnimation { routingState.removeRouteBetween(from: connectorEnd, to: target.end) }
+                    }
+                }
+            }
+            // Polled (not observed) at low frequency, only while this port is part of a live
+            // route AND a window that shows meters is actually on screen -- the same visibility
+            // signal `AudioRouter` gates publishing `MeterLevels` on, via `MeterWindowVisibility`.
+            // SwiftUI cancels and restarts this task whenever either input changes, so a hidden/
+            // minimized/occluded window stops polling instead of running forever in the background.
+            .task(id: LivePollKey(connected: isConnected, visible: MeterWindowVisibility.shared.isVisible)) {
+                guard isConnected, MeterWindowVisibility.shared.isVisible else {
+                    if !isConnected { liveLevelText = "Silent" }
+                    return
+                }
+                while !Task.isCancelled {
+                    liveLevelText = SignalMeter.dbString(currentLevel())
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
             .background(
                 GeometryReader { geo in
                     Color.clear
@@ -86,6 +127,73 @@ struct ChannelStripView: View {
                         )
                 }
             )
+    }
+
+    private func currentLevel() -> Float {
+        switch side {
+        case .source(let key): return meters.level(source: key, channel: channel.id)
+        case .output(let target): return meters.output(target: target.deviceUID, channel: channel.id)
+        }
+    }
+
+    // MARK: - Accessibility: opposite-side targets
+
+    private struct ConnectorTarget {
+        let end: ConnectorEnd
+        let label: String
+    }
+
+    /// Every opposite-side port this connector could reach: output channels (virtual mic, plus
+    /// Stream Mix while it's shown) for a source port, or every source's channels for an output
+    /// port.
+    private var oppositeEnds: [ConnectorTarget] {
+        switch connectorEnd {
+        case .source:
+            let micEnds = routingState.outputChannels.map {
+                ConnectorTarget(end: .output(target: .virtualMic, channelId: $0.id), label: "Channel \($0.label)")
+            }
+            guard routingState.streamMixEnabled else { return micEnds }
+            return micEnds + routingState.streamOutputChannels.map {
+                ConnectorTarget(end: .output(target: .streamMix, channelId: $0.id), label: "Stream Mix channel \($0.label)")
+            }
+        case .output:
+            return routingState.sources.flatMap { source in
+                source.channels.map {
+                    ConnectorTarget(end: .source(sourceId: source.id, channelId: $0.id),
+                                     label: "\(source.name) input \($0.label)")
+                }
+            }
+        }
+    }
+
+    private var connectableTargets: [ConnectorTarget] {
+        oppositeEnds.filter { routingState.findRoute(from: connectorEnd, to: $0.end) == nil }
+    }
+
+    private var connectedTargets: [ConnectorTarget] {
+        oppositeEnds.filter { routingState.findRoute(from: connectorEnd, to: $0.end) != nil }
+    }
+
+    private var connectionSummary: String {
+        let names = connectedTargets.map(\.label)
+        return names.isEmpty ? "not connected" : "connected to \(names.joined(separator: ", "))"
+    }
+
+    private var accessibilityValueText: String {
+        if isPending { return "Pending connection" }
+        guard isConnected else { return "Not connected" }
+        return "Connected, \(liveLevelText)"
+    }
+
+    private func connect(to target: ConnectorEnd) {
+        switch (connectorEnd, target) {
+        case (.source(let sid, let sch), .output(let target, let och)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och) }
+        case (.output(let target, let och), .source(let sid, let sch)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och) }
+        default:
+            break
+        }
     }
 
     private func handleTap() {
@@ -138,8 +246,10 @@ private struct ConnectorPortView: View {
 
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
+        let highContrast = contrast == .increased
         ZStack {
             if isPending {
                 Circle()
@@ -151,7 +261,10 @@ private struct ConnectorPortView: View {
             Circle()
                 .fill(isConnected ? Color.loopbacker : Color.clear)
                 .overlay(
-                    Circle().strokeBorder(isConnected ? Color.clear : Color.secondary.opacity(0.5), lineWidth: 1.25)
+                    Circle().strokeBorder(
+                        isConnected ? Color.primary.opacity(highContrast ? 0.6 : 0) : Color.secondary.opacity(highContrast ? 0.85 : 0.5),
+                        lineWidth: highContrast ? 1.75 : 1.25
+                    )
                 )
                 .frame(width: 12, height: 12)
 

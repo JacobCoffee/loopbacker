@@ -16,8 +16,8 @@ struct NoiseEngineProfile {
             NoiseEngineProfile(engine: engine, name: "DPDFNet", latencyMs: 60, cleanup: "Strongest",
                                tradeoff: "Removes fans, keyboards, traffic and chatter. The delay is noticeable when monitoring yourself.")
         case .fastenhancer:
-            NoiseEngineProfile(engine: engine, name: "FastEnhancer", latencyMs: 21, cleanup: "Strong",
-                               tradeoff: "Removes fans, hum and most chatter, close to DPDFNet's cleanup, at less than half DPDFNet's latency and a fraction of its CPU.")
+            NoiseEngineProfile(engine: engine, name: "FastEnhancer", latencyMs: 21, cleanup: "Strongest",
+                               tradeoff: "Removes fans, hum and most chatter, matching DPDFNet's cleanup at a third of its latency.")
         case .rnnoise:
             NoiseEngineProfile(engine: engine, name: "RNNoise", latencyMs: 30, cleanup: "Light",
                                tradeoff: "Removes steady hiss and hum. Clicks and keyboard taps get through.")
@@ -52,10 +52,10 @@ final class NoiseEngineBenchmark: ObservableObject {
 
     private var started = false
 
-    /// FastEnhancer: within a few percent of DPDFNet's cleanup on real speech (PESQ 2.99 vs
-    /// 3.04 on VoiceBank+DEMAND) at a third of its latency and CPU, which matters more for a
-    /// live mic. RNNoise if FastEnhancer measures over budget on this Mac. DPDFNet is never the
-    /// default pick: it's for users who want every last bit of cleanup and don't mind 60 ms.
+    /// FastEnhancer: matches DPDFNet's cleanup on real speech (PESQ 3.07 vs 3.04, SI-SDR 19.2 vs
+    /// 18.8 dB on VoiceBank+DEMAND) at a third of its latency and similar CPU, and latency matters
+    /// for a live mic. RNNoise if FastEnhancer measures over budget on this Mac. DPDFNet is never
+    /// the default pick: it doesn't clean up any better and costs 3x the latency.
     /// Unmeasured counts as within budget, so the tag doesn't flip while measuring.
     var recommended: NoiseSuppressionEngine {
         if let load = coreLoad[.fastenhancer], load > Self.fastEnhancerLoadLimit { return .rnnoise }

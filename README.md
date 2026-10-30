@@ -39,43 +39,112 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 - Route any channel of any input device to any virtual mic channel; add mic channels in pairs with ⊕
 - Monitor output (hear yourself through speakers)
 - Per-channel routing with visual cable connections
-- 2 independent virtual loopback devices
+- 3 independent virtual loopback devices: the virtual mic, a second device for multichannel output routing, and Stream Mix (a separate virtual mic target -- see **Stream Mix** below)
 - Output routing: send one channel pair of a multichannel device to your speakers while apps record the other channels
-- Scenes system for saving/loading routing configs
+- Scenes system for saving/loading routing configs, applied as a diff so routes shared between scenes (e.g. the same mic) never drop
+- Automation rules switch scenes on their own — app launched/quit/frontmost, or a device connected/removed — with a fallback scene and a manual-override pause
+- Per-source fallback device list: rebinds to the next available device if the active one disappears, and switches back when it returns, with a notification
 - Open at Login: starts in the menu bar with routing live, no window (menu bar panel or **More** menu)
 
 **Noise Suppression**
 
 - On-device noise removal for mic inputs, run inline on the audio thread, with three engines:
   - [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz neural model through BNNS Graph: strongest cleanup (fans, keyboards, chatter), 60 ms of latency
-  - [aask1357's FastEnhancer-S](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: close to DPDFNet's cleanup, 21 ms of latency, a fraction of DPDFNet's CPU
+  - [aask1357's FastEnhancer-M](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: matches DPDFNet's cleanup, 21 ms of latency, similar CPU
   - [Xiph's RNNoise](https://github.com/xiph/rnnoise): lighter cleanup (steady hiss and hum), 30 ms of latency, about a third of DPDFNet's CPU
 - The Effects section compares them with CPU measured on your Mac and recommends one; switching frees the other engine's memory
 - Runs before the effects chain, independent of its bypass and presets; toggle it from the Effects section or the menu bar
 - Per-mic opt-out in each source's Options
 - Max Reduction control (-60 to -6 dB) to keep some room tone instead of dead silence
 - Latency is constant at any buffer size
-- Applies to mic → virtual mic and monitor routes, not app captures
+- Applies to mic → virtual mic, Stream Mix, and monitor routes, not app captures
 
-**Effects Chain** (9 real-time DSP effects, all processed on the audio thread)
+**Effects Chain** (10 real-time DSP stages, hosted plugins, all processed on the audio thread)
 
-- Noise Gate -- soft expander with configurable threshold
-- 5-band Parametric EQ -- draggable frequency response curve, highpass/peaking/shelf filters
+Built-in stages, in any order you drag them into:
+
+- Noise Gate -- level-triggered or voice-activity-keyed (so word endings and breaths don't chatter), with hold/attack/release and a lookahead
+- Parametric EQ -- up to 16 bands (highpass/lowshelf/peaking/highshelf/lowpass/notch), draggable frequency response curve, selectable filter slopes
 - Compressor -- linked stereo detection, adjustable ratio/threshold/makeup
-- De-Esser -- bandpass sidechain targeting 4-8kHz sibilance
+- Leveler -- auto-gain that holds your voice at a target LUFS (ITU-R BS.1770 K-weighting), only adjusting while you're talking so it doesn't pump room noise during pauses
+- De-Esser -- split-band (Linkwitz-Riley crossover) or wideband sibilance control
 - Chorus -- modulated delay line with stereo LFO
-- Pitch Shift -- -12 to +12 semitones, dual-head overlap-add
-- Reverb -- Freeverb algorithm (8 comb filters + 4 allpass diffusers)
+- Pitch Shift -- -12 to +12 semitones, phase-vocoder with independent formant preservation
+- Reverb -- 8-line feedback delay network (Hadamard-mixed, per-line LFO modulation)
 - Delay -- echo with feedback + soft-clip safety
-- Limiter -- brick-wall peak limiter, always last in chain
+- Limiter -- true-peak brickwall limiter with lookahead
 
-12 factory presets: Broadcast Masculine Voice, Podcast Clean, Radio Announcer, Chipmunk, Deep Voice, Robot, Telephone, Cathedral, Dreamy, Space Station, and more. Save your own presets, import/export as JSON to share with others.
+Reorder, bypass, or A/B any stage individually; drop in third-party plugins (see **Plugins** below)
+anywhere in the chain. Runs only on mic (voice) routes -- virtual mic, Stream Mix, and monitor --
+never on app-capture routes, which get their own ducking and leveling instead (see **Stream Mix**
+below). Toggling a stage crossfades instead of clicking, and the whole chain's A/B bypass
+loudness-matches so comparisons are about tone, not volume.
 
-The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gist.github.com/jtrv/47542c8be6345951802eebcf9dc7da31) -- the same signal chain used by podcasters and streamers on Linux, ported to native macOS with zero dependencies.
+17 factory presets across four categories -- Business (Meeting – Natural, Presentation/Webinar, Open
+Office, Laptop Mic Rescue), Gaming (Headset, Speakers), Streaming (Stream/Broadcast, Podcast, Late
+Night), and Creative (Chipmunk, Deep Voice, Robot, Telephone, Radio Announcer, Cathedral, Dreamy,
+Space Station). Each business/gaming/streaming preset also dials in noise suppression and echo
+cancellation to match. Save your own presets, import/export as JSON to share with others.
+
+**Auto Setup** records a few seconds of you talking and silence, measures your noise floor,
+speech loudness, peaks, sibilance, and spectral tilt, and tunes the current preset's built-in
+stages to match -- without touching its node order or any hosted plugins. **Mic Check** plays
+back raw vs. processed audio through your speakers for an A/B listen, waveforms included.
 
 <p align="center">
   <img src="docs/screenshots/effects-dark.png" alt="Effects section: vertical insert chain beside the parametric EQ editor" width="720">
 </p>
+
+**Plugins**
+
+- Audio Units -- v2 effects load in-process through their classic C API (no extra permission
+  prompt); v3 effects load out-of-process over XPC. Both appear in the effect browser's "Audio
+  Units" tab alongside their native editor UI, when they have one
+- REAPER JSFX -- drop a `.jsfx` script into `~/Library/Application Support/REAPER/Effects` (REAPER
+  itself, or anything installed through ReaPack) or `~/Library/Application Support/Loopbacker/JSFX`
+  (your own), and it shows up in the "JSFX" tab, sliders and `@gfx` UI included. Runs on the vendored
+  ysfx/EEL2 JIT compiler, the same engine REAPER itself uses
+- Airwindows -- ~500 of [baconpaul's airwin2rack](https://github.com/baconpaul/airwin2rack) effects
+  bundled in, searchable in the "Airwindows" tab; turn the whole library off in Settings › General if
+  you don't want it cluttering the picker
+
+Any plugin inserts anywhere in the chain alongside the built-in stages, drag-reorderable the same way.
+
+**Echo Cancellation**
+
+- Removes your speakers' own output from your mic (WebRTC's AEC3), so playing back a call's audio
+  on speakers -- instead of headphones -- doesn't echo back to the other side
+- Needs System Audio Recording permission (macOS asks the first time it's turned on) to capture what
+  your speakers are playing as the reference signal
+- Per-source opt-out; off by default
+- A live "echo removed" indicator in the Effects section while a call-shaped signal is present
+
+**Stream Mix**
+
+- A second virtual mic ("Loopbacker Stream"), independent of your main virtual mic -- route a source
+  into one, the other, or both, with its own channel count and routing
+- Built for a stream mix that folds in music or alerts for OBS without touching what Discord/Zoom hear
+  on your main virtual mic
+- Off by default; enable it from the toggle in the Routing canvas header
+- Shares the same voice effects chain and noise suppression as your main virtual mic when they're fed
+  by the same source
+
+**Hotkeys and Automation**
+
+- Global push-to-talk, push-to-mute, or toggle-mute hotkey (no Accessibility permission needed), with
+  a muted overlay showing your mute state and the hotkey itself
+- Auto-switch the effects preset by frontmost or running app -- e.g. a louder "Stream/Broadcast" preset
+  while OBS is frontmost, reverting when it quits
+- Shortcuts app support (mute/unmute, apply a preset, load a scene) and a `loopbacker://` URL scheme
+  for other apps/web pages to trigger the same actions, both off by default (opt in under Settings ›
+  General)
+
+**Loudness Meter** (ITU-R BS.1770-4 / EBU R128)
+
+- Momentary (400 ms), short-term (3 s), and gated integrated loudness, plus true peak, on each virtual device's output
+- Target presets: Voice/Podcast (-16 LUFS), Broadcast EBU R128 (-23 LUFS), or a custom target
+- "Too quiet / on target / too loud" readout in the menu bar panel and the Routing page, with a reset-integrated button
+- Measuring only -- pair with the Effects limiter/compressor for gain control
 
 **Soundboard**
 
@@ -83,6 +152,8 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 - Add individual files or scan an entire folder
 - Drag and drop audio files onto the grid
 - Multiple simultaneous sounds (CoreAudio mixes them on the device)
+- Per-pad trim (waveform editor), fade in/out, play mode (one-shot/loop/hold-to-play), choke groups, restart-vs-layer retrigger, and output target (virtual mic only, or mic + speakers)
+- Loudness-matched pads: each clip's integrated loudness is measured on import and gain-matched so pads play at a consistent level, independent of per-pad volume
 - Global volume control
 - Sounds appear in Discord/Zoom/OBS as if they're your mic
 
@@ -94,10 +165,14 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 
 - macOS 26 Liquid Glass design, light and dark, with an in-app appearance override
 - Sidebar with Routing, Effects, Soundboard, and Scenes (⌘1–⌘4), plus every source's live level and on/off switch
-- Routing canvas where cables glow with the signal running through them
+- Routing canvas where cables glow with the signal running through them, or a keyboard- and VoiceOver-navigable connection matrix (toggle in the Routing toolbar; each cell is a labeled, togglable connection, and canvas ports offer VoiceOver "Connect to…"/"Disconnect from…" actions)
 - Effects shown as a vertical insert chain, like a channel strip
 - Menu bar panel with live meters, per-source switches, Reconnect, and Test Tone
 - Audio menu with keyboard shortcuts: Reconnect (⌘R), Stop All Routing (⇧⌘.), Test Tone (⌥⌘T)
+- Background auto-update (Sparkle, EdDSA-signed): checks silently, never pops a window in front
+  of you -- "Update available" shows in the menu bar panel and the app menu, and installs on your
+  click or on quit. Driver updates are offered the same way but always need your click, since
+  installing one needs admin and briefly drops audio
 
 <p align="center">
   <img src="docs/screenshots/menubar-dark.png" alt="Menu bar panel with engine status, per-source meters and switches, Reconnect, and Test Tone" width="300">
@@ -109,19 +184,19 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 Mic / App Output                        Discord / OBS / Zoom
        |                                       ^
        | capture                               | reads as mic input
-   [ Noise Suppression ]  (mic inputs)         |
-   [ Effects Chain ]                           |
-   Gate > EQ > Comp > DeEss >                 |
-   Chorus > Pitch > Reverb > Delay > Limiter  |
+   [ Noise Suppression ]  (mic routes only)    |
+   [ Echo Cancellation ]                       |
+   [ Effects Chain ]      user-ordered stages  |
+   [ Mic Gate ]                                |
        |                                       |
        v                                       |
    +---+---------------------------------------+---+
    |              Lock-free Ring Buffer             |
    +------------------------------------------------+
-                  Loopbacker Virtual Device
+            Loopbacker virtual mic / Stream Mix
 ```
 
-A CoreAudio HAL plugin provides the virtual device. The SwiftUI app handles routing, effects processing, and driver installation. The effects chain and noise suppression run on the real-time audio thread with no allocations or locks; the noise model executes through BNNS Graph with preallocated, wired buffers.
+A CoreAudio HAL plugin provides the virtual devices. The SwiftUI app handles routing, effects processing, and driver installation. The effects chain, noise suppression, and echo cancellation run on the real-time audio thread with no allocations or locks; the noise and AEC3 models execute through preallocated, wired buffers. See [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) for how the chain, hosted plugins, and routing fit together.
 
 ## Install
 
@@ -159,6 +234,20 @@ make uninstall    # Remove driver + app
 2. In DaVinci Resolve (or any app), output to **Loopbacker 2** and put the timecode on channel 3.
 3. Point your timecode-to-MIDI tool at **Loopbacker 2**, channel 3. You hear channels 1–2; channel 3 never reaches the speakers.
 
+### Using your REAPER JSFX scripts or Audio Units
+
+1. Open **Effects** (⌘2), click **+** to open the effect browser, and pick the **Audio Units** or
+   **JSFX** tab.
+2. **Audio Units**: every effect Audio Unit installed on your Mac that can run a stereo voice pair
+   at 48 kHz shows up automatically -- no setup needed.
+3. **JSFX**: drop your `.jsfx` scripts into `~/Library/Application Support/Loopbacker/JSFX` (or
+   install them into REAPER/ReaPack as usual -- Loopbacker reads REAPER's own
+   `~/Library/Application Support/REAPER/Effects` folder too), then reopen the effect browser to
+   pick them up.
+4. Click an effect to insert it into the chain at the position you clicked **+** from; drag it
+   anywhere else in the chain afterward. Plugins with their own editor window or `@gfx` UI show an
+   **Edit** button on their stage.
+
 ## Project structure
 
 ```
@@ -167,9 +256,15 @@ loopbacker/
 │   └── src/         Lock-free ring buffer, driver vtable, device management
 ├── App/             SwiftUI companion app (Swift 6 language mode, macOS 26)
 │   ├── CRNNoise/    Vendored RNNoise (C)
+│   ├── CWebRTCAEC/  Vendored WebRTC AEC3 + abseil (echo cancellation)
+│   ├── CYSFX/       Vendored ysfx/EEL2 (REAPER JSFX hosting)
+│   ├── CAirwindows/ Vendored Airwindows effects (airwin2rack)
 │   └── Sources/
-│       ├── Models/      AudioSource, AudioRoute, EffectsPreset, SoundboardItem
-│       ├── Services/    AudioRouter, AudioEffectsChain, NoiseSuppressor, SoundboardPlayer
+│       ├── Models/      AudioSource, AudioRoute, EffectsPreset, FXNodeConfig, FactoryPresets, SoundboardItem
+│       ├── Services/    AudioRouter, NoiseSuppressor, LoudnessMeter, SoundboardPlayer
+│       │   ├── FX/      FXChain, FXEngine, FXNodeFactory, built-in DSP stages, Hosted/ (AU/JSFX/Airwindows)
+│       │   ├── Comms/   EchoCanceller, SystemAudioTap
+│       │   └── Control/ GlobalHotkeyManager, PresetAutoSwitcher, LoopbackerURLCommand
 │       └── Views/       ContentView, EffectsView, SoundboardView, ...
 ├── scripts/         Install/uninstall helpers, model conversion, denoiser quality eval
 └── docs/            Architecture docs
@@ -185,6 +280,12 @@ loopbacker/
 
 [FSL-1.1-MIT](LICENSE) -- free to use for any non-competing purpose, converts to MIT after 2 years.
 
-The bundled noise suppression models are converted from upstream sources: `DPDFNet2_48k.mlmodelc` from [CEVA's DPDFNet](https://github.com/ceva-ip/DPDFNet) ([Apache-2.0](App/Loopbacker/Resources/DPDFNet-LICENSE.txt), `scripts/convert-dpdfnet.py`) and `FastEnhancer_S_48k.mlmodelc` from [aask1357's FastEnhancer](https://github.com/aask1357/fastenhancer) ([MIT](App/Loopbacker/Resources/FastEnhancer-LICENSE.txt), `scripts/convert-fastenhancer.py`); both need [uv](https://docs.astral.sh/uv/) to rebuild.
+The bundled noise suppression models are converted from upstream sources: `DPDFNet2_48k.mlmodelc` from [CEVA's DPDFNet](https://github.com/ceva-ip/DPDFNet) ([Apache-2.0](App/Loopbacker/Resources/DPDFNet-LICENSE.txt), `scripts/convert-dpdfnet.py`) and `FastEnhancer_M_48k.mlmodelc` from [aask1357's FastEnhancer](https://github.com/aask1357/fastenhancer) ([MIT](App/Loopbacker/Resources/FastEnhancer-LICENSE.txt), `scripts/convert-fastenhancer.py m`); both need [uv](https://docs.astral.sh/uv/) to rebuild.
 
 [RNNoise](https://github.com/xiph/rnnoise) (v0.2, default model) is vendored in `App/Loopbacker/CRNNoise` under the [BSD-3-Clause license](App/Loopbacker/Resources/RNNoise-LICENSE.txt).
+
+Echo cancellation vendors [webrtc-audio-processing](https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing) (the freedesktop/PulseAudio fork of Chromium's WebRTC audio processing module, tag `v2.1`) in `App/Loopbacker/CWebRTCAEC` under [BSD-3-Clause](App/Loopbacker/CWebRTCAEC/LICENSE-webrtc-audio-processing.txt), plus the `abseil-cpp` subset it pulls in under [Apache-2.0](App/Loopbacker/CWebRTCAEC/LICENSE-abseil.txt).
+
+REAPER JSFX hosting vendors [JoepVanlier/ysfx](https://github.com/JoepVanlier/ysfx) in `App/Loopbacker/CYSFX` under [Apache-2.0](App/Loopbacker/Resources/YSFX-LICENSE.txt), plus Cockos WDL (EEL2, LICE, SWELL) under a [zlib-style license](App/Loopbacker/Resources/WDL-LICENSE.txt).
+
+The bundled Airwindows library vendors [baconpaul/airwin2rack](https://github.com/baconpaul/airwin2rack) (~500 effects) in `App/Loopbacker/CAirwindows` under [MIT](App/Loopbacker/CAirwindows/LICENSE.md).

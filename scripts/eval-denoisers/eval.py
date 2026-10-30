@@ -24,6 +24,7 @@ docs/architecture/ARCHITECTURE.md -- this script only covers audio quality).
 Usage:
     scripts/eval-denoisers/build.sh                 # once, after `swift build -c release`
     scripts/eval-denoisers/eval.py [--limit N] [--data-dir path] [--out results.json] [--per-clip path]
+        [--fastenhancer-model path/to/FastEnhancer_<V>_48k.mlmodelc]
 
 Writes a Markdown table to stdout and the averages to `results.json` (or --out). Per-clip
 numbers go to --per-clip only when given (they're ~900 KB, so they aren't committed).
@@ -54,7 +55,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI = SCRIPT_DIR / ".build" / "denoise-cli"
 DPDFNET_MODEL = ROOT / "App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc"
-FASTENHANCER_MODEL = ROOT / "App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc"
+FASTENHANCER_MODEL = ROOT / "App/Loopbacker/Resources/FastEnhancer_M_48k.mlmodelc"
 
 CLEAN_URL = "https://datashare.ed.ac.uk/server/api/core/bitstreams/dec213d3-bf57-4777-9663-c24bdce92d5e/content"
 NOISY_URL = "https://datashare.ed.ac.uk/server/api/core/bitstreams/13c1bfbf-14a6-41db-9b41-8f7310f01ad5/content"
@@ -135,12 +136,12 @@ class DNSMOS:
         return float(p_sig(sig)), float(p_bak(bak)), float(p_ovr(ovr))
 
 
-def run_cli(engine: str, input_wav: Path, output_wav: Path) -> None:
+def run_cli(engine: str, input_wav: Path, output_wav: Path, fastenhancer_model: Path = FASTENHANCER_MODEL) -> None:
     args = [str(CLI), engine, str(input_wav), str(output_wav)]
     if engine == "dpdfnet":
         args += ["--dpdfnet-model", str(DPDFNET_MODEL)]
     elif engine == "fastenhancer":
-        args += ["--fastenhancer-model", str(FASTENHANCER_MODEL)]
+        args += ["--fastenhancer-model", str(fastenhancer_model)]
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -166,6 +167,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="only score the first N clips (default: all 824)")
     parser.add_argument("--out", type=Path, default=SCRIPT_DIR / "results.json")
     parser.add_argument("--per-clip", type=Path, default=None, help="also write every clip's scores here")
+    parser.add_argument("--fastenhancer-model", type=Path, default=FASTENHANCER_MODEL,
+                         help="FastEnhancer .mlmodelc to score as the 'fastenhancer' engine (default: shipped S variant)")
     args = parser.parse_args()
 
     if not CLI.exists():
@@ -199,7 +202,7 @@ def main() -> None:
 
             for engine in ENGINES:
                 out_wav = tmp_path / f"{engine}.wav"
-                run_cli(engine, noisy_path, out_wav)
+                run_cli(engine, noisy_path, out_wav, fastenhancer_model=args.fastenhancer_model)
                 processed48, _ = sf.read(out_wav, dtype="float32")
                 aligned_clean, aligned_processed = align(clean48, processed48, DELAY[engine])
                 processed16 = librosa.resample(aligned_processed, orig_sr=SR, target_sr=16_000)
