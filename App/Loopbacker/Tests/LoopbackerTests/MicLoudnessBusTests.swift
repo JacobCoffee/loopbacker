@@ -87,14 +87,17 @@ struct MicLoudnessBusTests {
         #expect(combined > wideAlone)
     }
 
-    @Test("Once every feed stops, idle detection discards the pending cycle and clears momentary/short-term/true-peak, leaving integrated alone")
-    func idleClearsLiveWindowsButKeepsIntegrated() {
+    @Test("Once every feed stops, the main thread's idle check alone masks momentary/short-term/true-peak as absent without touching the meter, and integrated stays untouched")
+    func idleChecksAloneMaskReadsWithoutMutatingState() {
         let bus = MicLoudnessBus.shared
         var t: Float64 = 3_000_000
 
         func block(_ samples: [Float]) -> [Float] { Array(samples[0..<(blockFrames * 2)]) }
-        let feedBlock = block(tone(amplitude: 0.2, blocks: 1, channels: 2))
-        _ = measureMomentary(bus, [(feedBlock, 2)], startingAt: &t)
+        let loudBlock = block(tone(amplitude: 0.5, blocks: 1, channels: 2))
+        _ = measureMomentary(bus, [(loudBlock, 2)], startingAt: &t)
+        // Real activity just happened, so the main thread's next tick must see it -- clearing
+        // any stale `isIdle` a previous test might have left set on this process-wide singleton.
+        bus.checkForIdleContributors()
         #expect(bus.momentaryLUFS.isFinite)
         #expect(bus.truePeakDBTP.isFinite)
         let integratedBefore = bus.integratedLUFS()
@@ -102,16 +105,59 @@ struct MicLoudnessBusTests {
 
         // Nothing contributes for several ticks: simulate the main thread's 30 Hz idle check
         // (`AudioRouter.updatePublishedMeters`) after the feed's route/soundboard unit stopped.
+        // These calls are the main thread's *only* interaction with the bus here -- no
+        // `contribute()` call is interleaved -- so this alone exercises the "reads only, never
+        // mutates meter/bus state" contract.
         for _ in 0..<6 { bus.checkForIdleContributors() }
 
+        // Reads mask as absent even though the underlying meter was never touched by the calls
+        // above (see the next test for proof the meter itself only changes once the IO thread's
+        // `contribute()` runs again).
         #expect(bus.momentaryLUFS == -.infinity)
         #expect(bus.shortTermLUFS == -.infinity)
         #expect(bus.truePeakDBTP == -.infinity)
         #expect(bus.integratedLUFS() == integratedBefore) // untouched
     }
 
-    @Test("resetIntegrated still applies while idle, with no audio thread left to consume it")
-    func resetAppliesWhileIdle() {
+    @Test("Resuming after idle (the IO thread's own next contribute()) discards the stale cycle and clears live windows, instead of blending it with new content")
+    func resumingAfterIdleClearsRingInsteadOfBlendingIt() {
+        let bus = MicLoudnessBus.shared
+        var t: Float64 = 5_000_000
+
+        func block(_ samples: [Float]) -> [Float] { Array(samples[0..<(blockFrames * 2)]) }
+        let loudBlock = block(tone(amplitude: 0.5, blocks: 1, channels: 2))
+        _ = measureMomentary(bus, [(loudBlock, 2)], startingAt: &t)
+        // Real activity just happened, so the main thread's next tick must see it -- clearing
+        // any stale `isIdle` a previous test might have left set on this process-wide singleton.
+        bus.checkForIdleContributors()
+        #expect(bus.momentaryLUFS.isFinite)
+
+        for _ in 0..<6 { bus.checkForIdleContributors() } // idle: requests a discard, mutates nothing
+        #expect(bus.momentaryLUFS == -.infinity) // masked at read time
+
+        // Resume with a single ~100 ms step's worth of near-silence -- not nearly enough to
+        // flush a stale 4-step ring on its own (a real elapsed-time gap advances sample time the
+        // same way CoreAudio's device clock would have while nothing contributed).
+        t += Float64(blockFrames) * 20
+        let quietBlock = block(tone(amplitude: 0.0001, blocks: 1, channels: 2))
+        let blocksPerStep = Int((sampleRate * 0.1 / Double(blockFrames)).rounded(.up))
+        for _ in 0..<blocksPerStep {
+            quietBlock.withUnsafeBufferPointer { buf in
+                bus.contribute(buffer: buf.baseAddress!, frames: blockFrames, channels: 2, sampleTime: t)
+            }
+            t += Float64(blockFrames)
+        }
+        // The main thread's next tick notices the resumed heartbeat and un-masks reads.
+        bus.checkForIdleContributors()
+
+        // If the stale loud ring had survived (the regression this fixes), this would still read
+        // close to the earlier loud level; the first `contribute()` after idle must have cleared
+        // it so this reads close to true silence instead.
+        #expect(bus.momentaryLUFS < -60)
+    }
+
+    @Test("resetIntegrated is visible immediately, and still applies once the IO thread resumes after idle")
+    func resetAppliesAfterIdle() {
         let bus = MicLoudnessBus.shared
         var t: Float64 = 4_000_000
 
@@ -120,15 +166,17 @@ struct MicLoudnessBusTests {
         _ = measureMomentary(bus, [(feedBlock, 2)], startingAt: &t)
         #expect(bus.integratedLUFS().isFinite)
 
-        for _ in 0..<6 { bus.checkForIdleContributors() } // go idle
+        for _ in 0..<6 { bus.checkForIdleContributors() } // idle: no meter mutation
         bus.resetIntegrated()
         // Visible immediately: `LoudnessMeter.integratedLUFS()` reports a pending reset the
-        // instant it's requested, before anything physically consumes it.
+        // instant it's requested, before anything physically consumes it -- independent of
+        // whether the IO thread ever gets a chance to.
         #expect(bus.integratedLUFS() == -.infinity)
 
-        // A later idle tick (no audio thread will ever reach a step boundary to do this) still
-        // consumes and applies the request.
-        bus.checkForIdleContributors()
-        #expect(bus.integratedLUFS() == -.infinity)
+        // The IO thread's next step (resuming after idle) is what actually consumes it; fresh
+        // accumulation afterward proves it was applied, not left stuck masking every future read.
+        t += Float64(blockFrames) * 20
+        _ = measureMomentary(bus, [(feedBlock, 2)], startingAt: &t)
+        #expect(bus.integratedLUFS().isFinite)
     }
 }

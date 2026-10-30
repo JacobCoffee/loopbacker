@@ -12,9 +12,18 @@ import Foundation
 /// same `mSampleTime`/`mHostTime`. `contribute` uses that shared sample time as the cycle key:
 /// each call for a cycle sums its buffer into a shared accumulator; the first call for a *new*
 /// cycle finalizes the previous cycle through `LoudnessMeter.process` first. No locks are needed
-/// because every contributor for this device runs on that one shared IO thread -- there is no
-/// cross-thread access to the accumulator (reads from the main-thread meter timer are the same
-/// benign race `LoudnessMeter`'s own published readouts already accept).
+/// because every contributor for this device runs on that one shared IO thread.
+///
+/// That single-writer invariant extends to the mix/meter state as a whole: `contribute` (the IO
+/// thread) is the *only* code path that ever mutates `mixBuffer`, `currentSampleTime`,
+/// `currentFrames`, or the underlying `LoudnessMeter`. The main-thread meter timer
+/// (`checkForIdleContributors`) only reads `contributionHeartbeat` and sets `discardRequested` --
+/// a flag the IO thread checks and clears itself, the same pattern `LoudnessMeter.resetIntegrated`
+/// already uses for its own histogram. A feed starting at the exact moment the main thread would
+/// otherwise have mutated this state directly used to race it (both threads touching the same
+/// filter/ring/histogram memory); routing every mutation through the IO thread removes that race
+/// entirely, at the cost of the main thread's idle readouts being a one-tick-late *request*
+/// rather than an immediate clear (masked at read time instead -- see `momentaryLUFS` etc. below).
 final class MicLoudnessBus: @unchecked Sendable {
     static let shared = MicLoudnessBus()
 
@@ -29,6 +38,8 @@ final class MicLoudnessBus: @unchecked Sendable {
     /// out-of-bounds write.
     private let maxFrames = 4096
 
+    // MARK: - IO-thread-owned state (written only from `contribute`)
+
     private var mixBuffer: UnsafeMutablePointer<Float>
     private var currentSampleTime: Float64 = -1
     private var currentFrames: Int = 0
@@ -36,16 +47,27 @@ final class MicLoudnessBus: @unchecked Sendable {
     /// Bumped on every `contribute()` call -- not cycle-keyed like `currentSampleTime`, just a
     /// heartbeat the idle-detection state machine below watches for "has anything contributed
     /// recently." Read/written across threads (IO thread writes, main thread reads via
-    /// `checkForIdleContributors`) without synchronization, same benign-race pattern as
-    /// `LoudnessMeter`'s own published readouts.
+    /// `checkForIdleContributors`) without synchronization: a benign race on a monotonically
+    /// increasing counter the main thread only ever compares for (in)equality.
     private var contributionHeartbeat: Int = 0
+    /// Set by the main thread (`checkForIdleContributors`), cleared and acted on only by the IO
+    /// thread (`contribute`, alongside a sample-time discontinuity -- see there). The one piece
+    /// of state the main thread is allowed to write, and even that is a request, never a mutation
+    /// of `mixBuffer`/the meter itself.
+    private var discardRequested = false
 
-    // MARK: - Idle detection (main-thread only state; see `checkForIdleContributors`)
+    // MARK: - Main-thread-only state (idle detection + read-time masking)
 
     private static let idleTicksThreshold = 3 // ~100 ms at the 30 Hz meter-timer cadence
     private var lastSeenHeartbeat = -1
     private var idleTicks = 0
     private var isIdle = false
+    /// Bumped whenever `isIdle` flips to `true`. Folded into `changeGeneration` below: going
+    /// idle changes what every reader should see (momentary/short-term/true-peak now read as
+    /// absent) without the IO thread necessarily running `process` again any time soon to bump
+    /// its own `meter.changeGeneration`, so callers that cache on that generation (`AudioRouter`)
+    /// still notice and republish.
+    private var idleGeneration = 0
 
     private init() {
         meter = LoudnessMeter(sampleRate: 48000, channelCount: maxChannels)
@@ -54,25 +76,32 @@ final class MicLoudnessBus: @unchecked Sendable {
     }
 
     /// Adds one feed's contribution to the virtual mic's current IO cycle. Real-time safe: no
-    /// allocation, no locks, preallocated buffer only.
+    /// allocation, no locks, preallocated buffer only. The sole writer of every piece of mutable
+    /// state this class and its `LoudnessMeter` hold -- see the type doc comment.
     func contribute(buffer: UnsafePointer<Float>, frames: Int, channels: Int, sampleTime: Float64) {
         guard frames > 0, frames <= maxFrames, channels > 0 else { return }
         let clampedChannels = min(channels, maxChannels)
         contributionHeartbeat &+= 1
 
+        // Either the main thread noticed every feed had gone quiet for a while and requested a
+        // discard, or this cycle's sample time doesn't follow on from the last one this thread
+        // itself finalized (a route/soundboard unit restarting, a device change, or simply
+        // resuming after a gap long enough that real device time moved on without anyone
+        // contributing). Either way, whatever's pending has no real continuity with what's about
+        // to arrive: discard it (don't finalize it through the meter -- it's stale, not worth
+        // measuring) and clear momentary/short-term/true-peak before this cycle's audio joins
+        // them, so a feed resuming doesn't wrongly blend unrelated audio across the gap.
+        // Integrated loudness, which intentionally spans the whole session, is unaffected.
+        let isDiscontinuous = currentSampleTime >= 0 && abs(sampleTime - currentSampleTime) > Double(maxFrames) * 4
+        if discardRequested || isDiscontinuous {
+            discardRequested = false
+            currentFrames = 0
+            mixBuffer.update(repeating: 0, count: maxFrames * maxChannels)
+            meter.clearLiveWindows()
+        }
+
         if sampleTime != currentSampleTime {
-            let previousSampleTime = currentSampleTime
             finalizeCycle()
-            // A gap far larger than one IO cycle -- a route/soundboard unit restarting, a device
-            // change, or resuming right after `checkForIdleContributors` already went idle --
-            // means whatever's about to be measured has no real continuity with what came
-            // before. Averaging it into the momentary/short-term windows anyway would wrongly
-            // blend unrelated audio across the gap, so treat it like the idle path: clear the
-            // live windows before this cycle's audio joins them. Integrated loudness, which
-            // intentionally spans the whole session, is unaffected.
-            if previousSampleTime >= 0, abs(sampleTime - previousSampleTime) > Double(maxFrames) * 4 {
-                meter.clearLiveWindows()
-            }
             currentSampleTime = sampleTime
             currentFrames = frames
             // Clears the whole buffer (not just this cycle's frame count) so a later block this
@@ -98,7 +127,7 @@ final class MicLoudnessBus: @unchecked Sendable {
         currentFrames = 0
     }
 
-    // MARK: - Contributor lifecycle (main thread)
+    // MARK: - Contributor lifecycle (main thread: reads only, never mutates meter/bus state)
 
     /// Called once per meter tick (the main thread's 30 Hz timer) to notice when every feed has
     /// stopped. No route/soundboard teardown talks to this class directly -- a vanished feed
@@ -106,12 +135,11 @@ final class MicLoudnessBus: @unchecked Sendable {
     /// consecutive idle ticks (long enough to not misfire between two IO cycles of the same
     /// ongoing feed) before deciding nothing is playing.
     ///
-    /// Once idle, discards whatever partial cycle never got finalized (it's stale by now, not
-    /// worth measuring) and clears the momentary/short-term/true-peak windows so the UI doesn't
-    /// keep showing a stale "on target" reading after nothing is playing; integrated loudness is
-    /// left untouched. Also the only place a `resetIntegrated()` request made while already idle
-    /// gets consumed -- nothing else will ever reach a step boundary to do it, since idle by
-    /// definition means the audio thread isn't running `process` anymore.
+    /// Only ever sets `isIdle` (this type's own state, read only by `momentaryLUFS` etc. below)
+    /// and requests a discard (`discardRequested`) for the IO thread to act on next time it runs
+    /// -- never touches `mixBuffer`, `currentSampleTime`/`currentFrames`, or the meter itself, so
+    /// a feed starting back up at the exact moment this runs can't race a main-thread mutation of
+    /// the same state (see the type doc comment).
     func checkForIdleContributors() {
         let heartbeat = contributionHeartbeat
         if heartbeat != lastSeenHeartbeat {
@@ -122,27 +150,30 @@ final class MicLoudnessBus: @unchecked Sendable {
         }
 
         idleTicks += 1
-        guard idleTicks >= Self.idleTicksThreshold else { return }
-
-        if !isIdle {
-            isIdle = true
-            currentFrames = 0
-            currentSampleTime = -1
-            meter.clearLiveWindows()
-        } else {
-            meter.consumePendingReset()
-        }
+        guard idleTicks >= Self.idleTicksThreshold, !isIdle else { return }
+        isIdle = true
+        discardRequested = true
+        idleGeneration &+= 1
     }
 
     // MARK: - Reads (main thread)
 
-    var momentaryLUFS: Float { meter.momentaryLUFS }
-    var shortTermLUFS: Float { meter.shortTermLUFS }
-    var truePeakDBTP: Float { meter.truePeakDBTP }
+    /// `-infinity` (reported as "no signal" by `LoudnessStatus`) while idle, regardless of
+    /// whatever the meter's actually still holding -- the IO thread only clears that on its next
+    /// `contribute()` call, which may be arbitrarily far in the future (or never). Masking the
+    /// read here, rather than mutating the meter from the main thread to force it, is what keeps
+    /// the main thread a read-only observer of this state.
+    var momentaryLUFS: Float { isIdle ? -.infinity : meter.momentaryLUFS }
+    var shortTermLUFS: Float { isIdle ? -.infinity : meter.shortTermLUFS }
+    var truePeakDBTP: Float { isIdle ? -.infinity : meter.truePeakDBTP }
     /// Bumped whenever a published reading could have changed -- a new 100 ms step, an applied
-    /// reset, or a live-window clear. `AudioRouter`'s meter timer compares this against the
-    /// value it last published instead of re-reading and republishing every tick.
-    var changeGeneration: Int { meter.changeGeneration }
+    /// reset, a live-window clear, or (since those don't necessarily involve the meter itself)
+    /// going idle. `AudioRouter`'s meter timer compares this against the value it last published
+    /// instead of re-reading and republishing every tick.
+    var changeGeneration: Int { meter.changeGeneration &+ idleGeneration }
+    /// Integrated loudness is never masked by `isIdle`: it intentionally spans the whole session,
+    /// not just the current feed, and `LoudnessMeter.integratedLUFS()` already reports a pending
+    /// `resetIntegrated()` immediately regardless of whether anything is currently playing.
     func integratedLUFS() -> Float { meter.integratedLUFS() }
     func resetIntegrated() { meter.resetIntegrated() }
 }

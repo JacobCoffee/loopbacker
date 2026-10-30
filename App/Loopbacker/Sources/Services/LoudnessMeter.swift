@@ -407,20 +407,20 @@ final class LoudnessMeter {
     /// be cleared, without touching momentary/short-term state. Safe to call from any thread (a
     /// UI button): only sets a flag here -- `integratedLUFS()` reports the reset immediately
     /// (see its doc comment), but the actual histogram/totals mutation is deferred to
-    /// `consumePendingReset()`, which only ever runs somewhere with no concurrent writer, so the
-    /// histogram is never torn by a main-thread clear racing an audio-thread write.
+    /// `consumePendingReset()`, applied only at the next 100 ms step boundary on this meter's own
+    /// audio thread, so the histogram is never torn by a main-thread clear racing an audio-thread
+    /// write. If audio never resumes, the request just sits unconsumed in memory -- harmless,
+    /// since every reader already sees the reset via the flag check.
     func resetIntegrated() {
         resetRequestedPtr.pointee = true
         changeGenerationPtr.pointee &+= 1
     }
 
     /// Applies a pending `resetIntegrated()` request if one is set, returning whether it did.
-    /// Only ever safe to call from a context with no concurrent writer: a 100 ms step boundary
-    /// inside `process` (this meter's own audio thread, via `finalizeStep`), or externally once
-    /// a caller (`MicLoudnessBus`, confirmed idle) knows nothing else is writing this meter
-    /// concurrently.
+    /// Only called from `finalizeStep` and `clearLiveWindows`, both of which only ever run on
+    /// this meter's own audio thread, so there's never a concurrent writer.
     @discardableResult
-    func consumePendingReset() -> Bool {
+    private func consumePendingReset() -> Bool {
         guard resetRequestedPtr.pointee else { return false }
         resetRequestedPtr.pointee = false
         sumAbsGatedZ = 0
@@ -431,10 +431,11 @@ final class LoudnessMeter {
     }
 
     /// Clears momentary/short-term/true-peak state (as if freshly constructed) and applies any
-    /// pending reset, but otherwise leaves integrated-loudness accumulation untouched. Called
-    /// when a feed goes idle so the UI doesn't keep showing a stale momentary/short-term/
-    /// true-peak reading -- so "On target" doesn't linger once nothing is playing. Like
-    /// `consumePendingReset()`, only safe to call where there's no concurrent writer.
+    /// pending reset, but otherwise leaves integrated-loudness accumulation untouched. Called by
+    /// `MicLoudnessBus.contribute` -- on its own audio thread, never the main thread -- the first
+    /// time a feed resumes after being idle or after a sample-time discontinuity, so a resuming
+    /// feed doesn't blend stale pre-gap content into momentary/short-term, and the UI doesn't keep
+    /// showing a stale "On target" once nothing was playing.
     func clearLiveWindows() {
         consumePendingReset()
         changeGenerationPtr.pointee &+= 1
