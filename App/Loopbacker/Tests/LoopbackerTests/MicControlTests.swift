@@ -108,7 +108,13 @@ struct MicControlTests {
             control.hotkeyReleased()
             #expect(control.isMuted == true) // still muted right after release
 
-            try await Task.sleep(nanoseconds: 150_000_000)
+            // The tail fires on a timer; poll instead of one fixed sleep so a loaded CI runner
+            // can't make this flaky. 2 s is far past the 40 ms tail.
+            var waited = 0
+            while control.isMuted, waited < 2_000 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+                waited += 10
+            }
             #expect(control.isMuted == false) // live again
         }
     }
