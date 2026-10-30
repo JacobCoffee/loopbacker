@@ -39,6 +39,61 @@ Hand-reconstructing GN's dependency graph was what sank the first attempt. This 
 
 Re-running `generate.py` against a fresh meson build is how to pick up a new upstream tag.
 
+## x86_64 support
+
+The app ships for Apple silicon only, but GitHub's CodeQL Swift analysis builds the whole
+package as x86_64 (see `../AGENTS.md`), so this target has to compile — not run correctly,
+just compile — under `swift build --arch x86_64` too.
+
+`rtc_base/system/arch.h` already derives `WEBRTC_ARCH_X86_FAMILY`/`WEBRTC_ARCH_ARM_FAMILY` from
+compiler macros (`__x86_64__`/`__aarch64__`), so Package.swift does not hard-code an arch
+define (it used to hard-code `WEBRTC_ARCH_ARM64`, which was simply wrong on an x86_64 build —
+harmless in practice since nothing here keys behavior on that macro alone, but misleading and
+the thing that made `generate.py` only ever vendor an arm64 closure). The real gap was that the
+single arm64 meson build this was vendored from never compiles the x86 SIMD translation units
+(SSE2/AVX2 `FIRFilter`, `SincResampler`, the Ooura FFT, and several AEC3 kernels) — they are
+arch-conditional in upstream's own `meson.build`, so an arm64-only vendoring pass can't produce
+them no matter how it walks the dependency graph.
+
+`generate.py` now also accepts `--x86-64-build-dir <dir>` (point it at an x86_64 meson
+cross-build; see the usage comment at the top of the script for the cross file) and unions in
+whatever extra translation units that closure has over the primary (arm64) one — currently 14
+files, all under `common_audio/` and `modules/audio_processing/{aec3,agc2/rnn_vad}/`.
+
+Those 14 files are patched on the way in, because SwiftPM compiles one source list per target
+regardless of `--arch` (no per-file or per-arch source list exists), and they unconditionally
+`#include <xmmintrin.h>`/`<immintrin.h>`, which themselves `#error` outside
+`__i386__`/`__x86_64__` — so left unpatched they would break `swift build` (arm64, what ships):
+- Every x86-only `.cc`/`.c` is wrapped in `#if defined(__x86_64__)` / `#endif`, so it compiles
+  to an empty translation unit on arm64 (confirmed: stripped arm64 release binary is
+  byte-for-byte identical before/after this vendoring — see `../AGENTS.md`'s "x86_64" build
+  line and `generate.py`'s module docstring for the measurement).
+- The subset whose original meson compile command used `-mavx2`/`-mfma` (ground truth from
+  `compdb`, not guessed from the filename — `adaptive_fir_filter_avx2.cc`,
+  `adaptive_fir_filter_erl_avx2.cc`, `fft_data_avx2.cc`, `fir_filter_avx2.cc`,
+  `matched_filter_avx2.cc`, `sinc_resampler_avx2.cc`, and both `vector_math_avx2.cc`s) is
+  additionally wrapped in
+  `#pragma clang attribute push(__attribute__((target("avx2,fma"))), apply_to = function)` /
+  `pop`, since SwiftPM also can't pass `-mavx2 -mfma` to only those files — raising the whole
+  target's baseline ISA instead would make the output binary require a newer-than-SSE2 CPU and
+  would break compiling the same target for arm64. The plain `*_sse.cc`/`*_sse2.cc` files need
+  no such attribute: SSE2 is baseline for x86-64, no special compile flag required.
+- The 3 new headers (`fir_filter_avx2.h`, `fir_filter_sse.h`,
+  `ooura_fft_tables_neon_sse2.h`) are copied unpatched — none of them use raw intrinsics outside
+  an existing `#if defined(WEBRTC_ARCH_X86_FAMILY)` guard (itself already arch-safe via
+  `arch.h`), so they compile cleanly on both arches as-is.
+
+`GetCPUInfo(kAVX2)`'s runtime CPUID check (`system_wrappers/source/cpu_features.cc`) is gated on
+`WEBRTC_ENABLE_AVX2`, which Package.swift now defines (an x86_64 meson build adds it
+automatically; an arm64 one doesn't) — harmless on arm64, since it only guards code already
+behind `#if defined(WEBRTC_ARCH_X86_FAMILY)`.
+
+No equivalent patching is needed for `../CYSFX` or `../CAirwindows`: CYSFX's EEL2 JIT already
+selects `glue_aarch64.h` vs `glue_x86_64_sse.h` via the same compiler macros, and its vendored
+x86-64 JIT trampoline (`../CYSFX/ysfx-sources/eel2-gas/asm-nseel-x64-sse.S`) ships
+pre-wrapped in `#if defined(__x86_64__)` upstream; CAirwindows has no architecture-specific code
+at all. Both compile under `swift build --arch x86_64` unmodified.
+
 ## Why the AGC/NS/VAD code is in here too
 
 `AudioProcessingImpl` (the class behind the public `webrtc::AudioProcessing` interface) is

@@ -87,7 +87,12 @@ let package = Package(
                 .headerSearchPath("abseil-cpp"),
                 .define("WEBRTC_POSIX"),
                 .define("WEBRTC_MAC"),
-                .define("WEBRTC_ARCH_ARM64"),
+                // Architecture is detected by rtc_base/system/arch.h from compiler macros
+                // (__aarch64__/__x86_64__), not a hard-coded define here: this target has to
+                // compile under both `swift build` (arm64, what ships) and
+                // `swift build --arch x86_64` (what CodeQL's Swift analysis uses). See
+                // CWebRTCAEC/README.md "x86_64 support".
+                .define("WEBRTC_ENABLE_AVX2"),
                 .define("WEBRTC_LIBRARY_IMPL"),
                 .define("WEBRTC_APM_DEBUG_DUMP", to: "0"),
                 .define("NDEBUG")
@@ -97,7 +102,7 @@ let package = Package(
                 .headerSearchPath("abseil-cpp"),
                 .define("WEBRTC_POSIX"),
                 .define("WEBRTC_MAC"),
-                .define("WEBRTC_ARCH_ARM64"),
+                .define("WEBRTC_ENABLE_AVX2"),
                 .define("WEBRTC_LIBRARY_IMPL"),
                 .define("WEBRTC_APM_DEBUG_DUMP", to: "0"),
                 .define("NDEBUG"),
