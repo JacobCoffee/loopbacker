@@ -23,37 +23,34 @@ final class DriverInstaller: ObservableObject {
         statusMessage = isInstalled ? "Driver installed" : "Driver not installed"
     }
 
-    /// Compares the bundled driver's version against the installed one. Call again after
-    /// install/uninstall, since both change which versions are being compared.
+    /// Compares the bundled driver's code against the installed one by content, not version --
+    /// `Driver/CMakeLists.txt`'s `PROJECT_VERSION` is a hardcoded placeholder, not bumped per
+    /// release, so `CFBundleShortVersionString` can't tell two builds apart. Call again after
+    /// install/uninstall, since both change which installed copy is being compared.
     func checkForDriverUpdate() {
-        guard isInstalled,
-              let bundledPath = findDriverBundle(),
-              let bundledVersion = Self.driverVersion(atBundlePath: bundledPath),
-              let installedVersion = Self.driverVersion(atBundlePath: Self.driverPath)
-        else {
+        guard isInstalled, let bundledPath = findDriverBundle() else {
             updateAvailable = false
             return
         }
-        updateAvailable = Self.isVersion(bundledVersion, newerThan: installedVersion)
-    }
-
-    private static func driverVersion(atBundlePath path: String) -> String? {
-        let plistPath = (path as NSString).appendingPathComponent("Contents/Info.plist")
-        guard let plist = NSDictionary(contentsOfFile: plistPath) else { return nil }
-        return plist["CFBundleShortVersionString"] as? String
-    }
-
-    /// Dotted-numeric comparison (e.g. "0.2.0" > "0.1.0"); missing components count as 0.
-    /// Internal (not private) so `LoopbackerTests` can exercise it directly.
-    nonisolated static func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
-        let lhsParts = lhs.split(separator: ".").map { Int($0) ?? 0 }
-        let rhsParts = rhs.split(separator: ".").map { Int($0) ?? 0 }
-        for index in 0..<max(lhsParts.count, rhsParts.count) {
-            let l = index < lhsParts.count ? lhsParts[index] : 0
-            let r = index < rhsParts.count ? rhsParts[index] : 0
-            if l != r { return l > r }
+        let installedPath = Self.driverPath
+        Task {
+            updateAvailable = await Self.driverContentDiffers(bundledPath: bundledPath, installedPath: installedPath)
         }
-        return false
+    }
+
+    /// Hashes `__TEXT,__text` of each driver's executable off the main thread and compares them.
+    /// A content hash (not the whole file or the codesign CDHash) is required here: `install()`
+    /// re-signs the installed copy ad-hoc, which can change the embedded codesign CDHash and
+    /// definitely changes the file bytes, even when the underlying code is identical.
+    private nonisolated static func driverContentDiffers(bundledPath: String, installedPath: String) async -> Bool {
+        await Task.detached(priority: .utility) {
+            let bundledExecutable = (bundledPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
+            let installedExecutable = (installedPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
+            guard let bundledDigest = MachOTextHasher.textSectionDigest(ofExecutableAt: bundledExecutable),
+                  let installedDigest = MachOTextHasher.textSectionDigest(ofExecutableAt: installedExecutable)
+            else { return false }
+            return bundledDigest != installedDigest
+        }.value
     }
 
     func install() {

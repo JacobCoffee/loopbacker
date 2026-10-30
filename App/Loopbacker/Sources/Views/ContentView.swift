@@ -155,6 +155,8 @@ struct GlobalToolbar: ToolbarContent {
                     Button("Update to \(update.displayVersion)…", systemImage: "arrow.down.circle") {
                         actions.installAvailableUpdate()
                     }
+                } else if let version = appUpdater.installingVersion {
+                    Text("Installing \(version)…")
                 }
                 Divider()
                 Button("Quit and Stop Routing", systemImage: "power") { AppDelegate.forceQuit() }

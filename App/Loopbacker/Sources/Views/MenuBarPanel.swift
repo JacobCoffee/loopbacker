@@ -21,7 +21,7 @@ struct MenuBarPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.bottom, 12)
-            if appUpdater.availableUpdate != nil || driverInstaller.updateAvailable {
+            if appUpdater.availableUpdate != nil || appUpdater.installingVersion != nil || driverInstaller.updateAvailable {
                 updateBanner
                 Divider()
                     .padding(.vertical, 12)
@@ -97,6 +97,18 @@ struct MenuBarPanel: View {
                         .tint(.loopbacker)
                         .controlSize(.small)
                         .help("Install now and relaunch, or it installs automatically on quit")
+                }
+            } else if let version = appUpdater.installingVersion {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20)
+                        .accessibilityHidden(true)
+                    Text("Installing Loopbacker \(version)…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
                 }
             }
             if driverInstaller.updateAvailable {
