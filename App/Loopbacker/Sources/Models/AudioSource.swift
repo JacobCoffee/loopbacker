@@ -44,6 +44,11 @@ struct AudioSource: Identifiable, Equatable, Codable {
     /// The monitor (hearing yourself) is denoised too. Off, it skips suppression and its delay;
     /// the virtual mic stays denoised.
     var denoiseMonitor: Bool
+    /// Ordered device preferences for this source (most-preferred first). When the currently
+    /// bound device disappears, the source rebinds to the next present entry; when a
+    /// higher-preference device reappears, it switches back. Empty means "no opinion" — falls
+    /// back to matching a device with the same name.
+    var fallbackDevices: [DeviceFallbackEntry]
 
     init(
         id: UUID = UUID(),
@@ -59,7 +64,8 @@ struct AudioSource: Identifiable, Equatable, Codable {
         sourceType: SourceType = .device,
         appBundleID: String = "",
         noiseSuppression: Bool = true,
-        denoiseMonitor: Bool = true
+        denoiseMonitor: Bool = true,
+        fallbackDevices: [DeviceFallbackEntry] = []
     ) {
         self.id = id
         self.name = name
@@ -75,6 +81,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.appBundleID = appBundleID
         self.noiseSuppression = noiseSuppression
         self.denoiseMonitor = denoiseMonitor
+        self.fallbackDevices = fallbackDevices
     }
 
     var isAppCapture: Bool { sourceType == .appCapture }
@@ -82,6 +89,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
         case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression, denoiseMonitor
+        case fallbackDevices
     }
 
     init(from decoder: Decoder) throws {
@@ -100,6 +108,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         appBundleID = (try? container.decode(String.self, forKey: .appBundleID)) ?? ""
         noiseSuppression = (try? container.decode(Bool.self, forKey: .noiseSuppression)) ?? true
         denoiseMonitor = (try? container.decode(Bool.self, forKey: .denoiseMonitor)) ?? true
+        fallbackDevices = (try? container.decode([DeviceFallbackEntry].self, forKey: .fallbackDevices)) ?? []
     }
 
     /// Create an AudioSource from a captured app

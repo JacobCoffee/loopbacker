@@ -177,6 +177,8 @@ struct SourceCardView: View {
                     .padding(.leading, 12)
                     .help("Whether the monitor output gets noise suppression too")
                 }
+
+                fallbackDevicesSection
             }
 
             HStack(spacing: 8) {
@@ -236,5 +238,102 @@ struct SourceCardView: View {
         .pickerStyle(.menu)
         .labelsHidden()
         .tint(.loopbacker)
+    }
+
+    // MARK: - Fallback devices
+
+    private var fallbackDevicesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Fallback Devices")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                addFallbackDeviceMenu
+            }
+
+            if source.fallbackDevices.isEmpty {
+                Text("None set. Loopbacker falls back to any present device with the same name.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(Array(source.fallbackDevices.enumerated()), id: \.element.id) { index, entry in
+                    fallbackDeviceRow(index: index, entry: entry)
+                }
+            }
+        }
+        .help("Ordered list of devices to try if \(source.name) disappears; Loopbacker switches back to a higher one when it returns")
+    }
+
+    @ViewBuilder
+    private var addFallbackDeviceMenu: some View {
+        let claimed = Set(source.fallbackDevices.map(\.uid))
+        let candidates = audioDeviceManager.systemDevices.filter { $0.isInput && !claimed.contains($0.uid) }
+
+        Menu {
+            if candidates.isEmpty {
+                Text("No other input devices").foregroundStyle(.secondary)
+            } else {
+                ForEach(candidates) { device in
+                    Button(device.name) {
+                        source.fallbackDevices.append(DeviceFallbackEntry(uid: device.uid, name: device.name))
+                        routingState.save()
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Add a fallback device")
+        .accessibilityLabel("Add a fallback device")
+    }
+
+    private func fallbackDeviceRow(index: Int, entry: DeviceFallbackEntry) -> some View {
+        HStack(spacing: 6) {
+            Text("\(index + 1).")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 16, alignment: .trailing)
+            Text(entry.name)
+                .font(.caption)
+                .lineLimit(1)
+            Spacer()
+            Button {
+                guard index > 0 else { return }
+                source.fallbackDevices.swapAt(index, index - 1)
+                routingState.save()
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(index == 0)
+            .help("Move \(entry.name) up")
+            .accessibilityLabel("Move \(entry.name) up")
+
+            Button {
+                guard index < source.fallbackDevices.count - 1 else { return }
+                source.fallbackDevices.swapAt(index, index + 1)
+                routingState.save()
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.borderless)
+            .disabled(index == source.fallbackDevices.count - 1)
+            .help("Move \(entry.name) down")
+            .accessibilityLabel("Move \(entry.name) down")
+
+            Button {
+                source.fallbackDevices.remove(at: index)
+                routingState.save()
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove \(entry.name)")
+            .accessibilityLabel("Remove \(entry.name)")
+        }
     }
 }

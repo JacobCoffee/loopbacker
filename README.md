@@ -41,7 +41,9 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 - Per-channel routing with visual cable connections
 - 2 independent virtual loopback devices
 - Output routing: send one channel pair of a multichannel device to your speakers while apps record the other channels
-- Scenes system for saving/loading routing configs
+- Scenes system for saving/loading routing configs, applied as a diff so routes shared between scenes (e.g. the same mic) never drop
+- Automation rules switch scenes on their own — app launched/quit/frontmost, or a device connected/removed — with a fallback scene and a manual-override pause
+- Per-source fallback device list: rebinds to the next available device if the active one disappears, and switches back when it returns, with a notification
 - Open at Login: starts in the menu bar with routing live, no window (menu bar panel or **More** menu)
 
 **Noise Suppression**
