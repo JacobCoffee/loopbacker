@@ -35,7 +35,7 @@ final class RoutingSync: ObservableObject {
         // Apply saved effects preset to the audio router
         audioRouter.currentEffectsPreset = routingState.effectsPreset
         audioRouter.updateEffectsPreset(routingState.effectsPreset)
-        audioRouter.updateNoiseSuppression(routingState.noiseSuppression, excludedDeviceUIDs: Self.excludedDeviceUIDs(routingState.sources))
+        push(NoisePush(settings: routingState.noiseSuppression, sources: routingState.sources))
 
         // Start routing for saved state after the audio system settles.
         // After a driver reinstall, coreaudiod can take 2-3s to fully
@@ -102,30 +102,35 @@ final class RoutingSync: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Push noise suppression settings (global toggle/engine/reduction, or a source opting
-        // out/in, or a source's device UID changing) to the engine. `removeDuplicates` skips
-        // no-op re-emissions; `dropFirst` skips the value already pushed in `start()`.
+        // Push noise suppression settings (global toggle/engine/reduction, or a source's opt-out,
+        // monitor choice or device UID changing) to the engine. `removeDuplicates` skips no-op
+        // re-emissions; `dropFirst` skips the value already pushed in `start()`.
         Publishers.CombineLatest(routingState.$noiseSuppression, routingState.$sources)
-            .map { settings, sources in NoisePush(settings: settings, excludedDeviceUIDs: Self.excludedDeviceUIDs(sources)) }
+            .map { NoisePush(settings: $0, sources: $1) }
             .removeDuplicates()
             .dropFirst()
-            .sink { [weak self] push in
-                self?.audioRouter.updateNoiseSuppression(push.settings, excludedDeviceUIDs: push.excludedDeviceUIDs)
-            }
+            .sink { [weak self] in self?.push($0) }
             .store(in: &cancellables)
+    }
+
+    private func push(_ noise: NoisePush) {
+        audioRouter.updateNoiseSuppression(noise.settings, excludedDeviceUIDs: noise.excludedDeviceUIDs,
+                                           dryMonitorDeviceUIDs: noise.dryMonitorDeviceUIDs)
     }
 
     private struct NoisePush: Equatable {
         let settings: NoiseSuppressionSettings
+        /// Device sources that opted out. App captures are never denoised, so they're left out.
         let excludedDeviceUIDs: Set<String>
-    }
+        /// Device sources whose monitor stays dry.
+        let dryMonitorDeviceUIDs: Set<String>
 
-    /// Device UIDs of device sources that have opted out of noise suppression. App capture
-    /// sources are never denoised, so they're excluded regardless of their flag.
-    private static func excludedDeviceUIDs(_ sources: [AudioSource]) -> Set<String> {
-        Set(sources
-            .filter { !$0.isAppCapture && !$0.noiseSuppression && !$0.deviceUID.isEmpty }
-            .map(\.deviceUID))
+        init(settings: NoiseSuppressionSettings, sources: [AudioSource]) {
+            self.settings = settings
+            let devices = sources.filter { !$0.isAppCapture && !$0.deviceUID.isEmpty }
+            excludedDeviceUIDs = Set(devices.filter { !$0.noiseSuppression }.map(\.deviceUID))
+            dryMonitorDeviceUIDs = Set(devices.filter { !$0.denoiseMonitor }.map(\.deviceUID))
+        }
     }
 
     // MARK: - Audio routing sync

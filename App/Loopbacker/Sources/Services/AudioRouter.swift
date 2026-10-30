@@ -28,9 +28,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     /// Current effects preset — applied to new routes and propagated to existing ones
     var currentEffectsPreset = EffectsPreset()
-    /// Noise suppression settings and opted-out capture devices; read and written only on `queue`.
+    /// Noise suppression settings, opted-out capture devices, and devices whose monitor stays
+    /// dry; read and written only on `queue`.
     private var noiseSuppression = NoiseSuppressionSettings()
     private var noiseExcludedDevices: Set<String> = []
+    private var dryMonitorDevices: Set<String> = []
     /// A model-backed engine's compiled model while any kernel uses it. Kernels hold it
     /// strongly, so it's freed once the last one is gone (engine switched, suppression off,
     /// opted out, or route stopped). Queue only.
@@ -99,6 +101,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// noise suppression: app captures carry music/game audio, and output routes replay the
         /// already-processed virtual device.
         let isVoiceInput: Bool
+        /// Mic → monitor output (you hearing yourself). Queue only.
+        var isMonitor = false
         /// The suppressor the audio thread runs, published unretained so `queue` can swap it
         /// without racing a release on the audio thread. `noiseOwner` holds the strong reference.
         /// Shared with the other voice route on the same capture device (virtual mic + monitor),
@@ -387,6 +391,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                                   playbackDeviceID: outputID, playbackDeviceUID: outputDeviceUID,
                                   inputChannels: inputChannels, outputChannels: 2, sampleRate: rate,
                                   isVoiceInput: true)
+            ctx.isMonitor = true
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
             self.applyNoiseSuppression(to: ctx)
             // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
@@ -653,12 +658,17 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Noise suppression
 
     /// Apply noise suppression settings to every voice-input route, and to routes started later.
-    /// - Parameter excludedDeviceUIDs: capture devices whose source opted out.
-    func updateNoiseSuppression(_ settings: NoiseSuppressionSettings, excludedDeviceUIDs: Set<String>) {
+    /// - Parameters:
+    ///   - excludedDeviceUIDs: capture devices whose source opted out.
+    ///   - dryMonitorDeviceUIDs: capture devices whose monitor route skips suppression (no
+    ///     added delay when hearing yourself); their virtual mic route is still suppressed.
+    func updateNoiseSuppression(_ settings: NoiseSuppressionSettings, excludedDeviceUIDs: Set<String>,
+                                dryMonitorDeviceUIDs: Set<String>) {
         queue.async { [weak self] in
             guard let self else { return }
             self.noiseSuppression = settings
             self.noiseExcludedDevices = excludedDeviceUIDs
+            self.dryMonitorDevices = dryMonitorDeviceUIDs
             self.applyNoiseSuppressionToAllRoutes()
         }
     }
@@ -681,6 +691,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         guard ctx.isVoiceInput, !ctx.noiseDetaching else { return }
         let settings = noiseSuppression
         let wanted = settings.isEnabled && !noiseExcludedDevices.contains(ctx.captureDeviceUID)
+            && !(ctx.isMonitor && dryMonitorDevices.contains(ctx.captureDeviceUID))
 
         if let current = ctx.noiseOwner {
             if wanted && current.engine == settings.engine {

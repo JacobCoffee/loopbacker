@@ -153,6 +153,30 @@ struct SourceCardView: View {
                 .controlSize(.mini)
                 .tint(.loopbacker)
                 .help(source.noiseSuppression ? "Don't denoise this mic" : "Denoise this mic when noise suppression is on")
+
+                if source.noiseSuppression && routingState.noiseSuppression.isEnabled && !source.monitorOutputUID.isEmpty {
+                    let latency = NoiseEngineProfile.of(routingState.noiseSuppression.engine).latencyMs
+                    Toggle(isOn: Binding(
+                        get: { source.denoiseMonitor },
+                        set: { source.denoiseMonitor = $0; routingState.save() }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Denoise Monitor")
+                                .font(.callout)
+                            Text(source.denoiseMonitor
+                                 ? "You hear what callers hear, \(latency) ms late."
+                                 : "You hear yourself with no added delay. Callers still get the denoised mic.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .tint(.loopbacker)
+                    .padding(.leading, 12)
+                    .help("Whether the monitor output gets noise suppression too")
+                }
             }
 
             HStack(spacing: 8) {
