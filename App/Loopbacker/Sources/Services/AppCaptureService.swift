@@ -21,6 +21,18 @@ struct CaptureApp: Identifiable, Equatable {
 /// Receives (interleaved Float32 samples, frame count, channel count) on the capture queue.
 typealias AppAudioWriter = @Sendable (UnsafePointer<Float>, UInt32, UInt32) -> Void
 
+/// Identifies one running capture session: a bundle ID captured for one target virtual device
+/// (`AudioRouter.startAppCapture`'s `targetDeviceUID`, e.g. Virtual Mic or Stream Mix). An app
+/// can be captured for both targets at once -- each target gets its own `SCStream`/delegate/
+/// writer, keyed separately here, instead of one `startCapture` call tearing down another
+/// target's still-running capture for the same bundle (the old bundle-ID-only keying: starting
+/// Stream Mix for an already-captured-to-Virtual-Mic app would `stopCapture(bundleID:)` the
+/// Virtual Mic's stream first, since both calls shared one dictionary entry per bundle).
+private struct AppCaptureSessionKey: Hashable {
+    let bundleID: String
+    let target: String
+}
+
 /// Manages ScreenCaptureKit-based audio capture from running applications.
 /// Each active capture delivers Float32 interleaved audio into a caller-provided ring buffer writer.
 /// Bookkeeping lives on the main actor; sample buffers arrive on `captureQueue`.
@@ -29,12 +41,12 @@ final class AppCaptureService: NSObject, ObservableObject {
     @Published var availableApps: [CaptureApp] = []
     @Published var permissionGranted: Bool = false
 
-    /// Active stream delegates keyed by bundle identifier
-    private var activeDelegates: [String: AppStreamDelegate] = [:]
-    private var activeStreams: [String: SCStream] = [:]
+    /// Active stream delegates keyed by session (bundle ID + target).
+    private var activeDelegates: [AppCaptureSessionKey: AppStreamDelegate] = [:]
+    private var activeStreams: [AppCaptureSessionKey: SCStream] = [:]
 
-    /// Tracks in-flight start operations to prevent start/stop races
-    private var pendingStarts: Set<String> = []
+    /// Tracks in-flight start operations to prevent start/stop races, per session.
+    private var pendingStarts: Set<AppCaptureSessionKey> = []
 
     /// Audio callback queue — not the main thread, not the CoreAudio IO thread
     private let captureQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.appcapture", qos: .userInteractive)
@@ -131,21 +143,27 @@ final class AppCaptureService: NSObject, ObservableObject {
 
     // MARK: - Capture
 
-    /// Start audio-only capture for a specific app.
-    /// The `ringBufferWriter` closure receives (pointer, frameCount, channelCount) and must be safe
-    /// to call from a non-main, non-RT queue.
+    /// Start audio-only capture for a specific app, for one target. Independent of any other
+    /// target currently capturing the same app: each (bundle, target) pair gets its own
+    /// `SCStream`, so starting Stream Mix for an app already feeding the Virtual Mic doesn't
+    /// stop the Virtual Mic's delivery, and stopping either target only stops that target.
+    /// The `ringBufferWriter` closure receives (pointer, frameCount, channelCount) and must be
+    /// safe to call from a non-main, non-RT queue.
     func startCapture(
         bundleID: String,
+        target: String,
         ringBufferWriter: @escaping AppAudioWriter,
         sampleRate: Float64,
         channelCount: UInt32
     ) async throws {
-        // Stop existing capture for this bundle if any
-        await stopCapture(bundleID: bundleID)
+        let session = AppCaptureSessionKey(bundleID: bundleID, target: target)
+
+        // Stop this session only (not other targets capturing the same bundle).
+        await stopCapture(bundleID: bundleID, target: target)
 
         // Mark as pending to prevent stop racing with start
-        pendingStarts.insert(bundleID)
-        defer { pendingStarts.remove(bundleID) }
+        pendingStarts.insert(session)
+        defer { pendingStarts.remove(session) }
 
         // Find the target app in SCShareableContent
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -177,7 +195,7 @@ final class AppCaptureService: NSObject, ObservableObject {
         config.showsCursor = false    // don't composite cursor
         config.pixelFormat = kCVPixelFormatType_32BGRA
 
-        let streamDelegate = AppCaptureStreamDelegate(bundleID: bundleID, service: self)
+        let streamDelegate = AppCaptureStreamDelegate(session: session, service: self)
         let stream = SCStream(filter: filter, configuration: config, delegate: streamDelegate)
 
         let outputDelegate = AppStreamDelegate(
@@ -190,50 +208,54 @@ final class AppCaptureService: NSObject, ObservableObject {
 
         try await stream.startCapture()
 
-        activeDelegates[bundleID] = outputDelegate
-        activeStreams[bundleID] = stream
+        activeDelegates[session] = outputDelegate
+        activeStreams[session] = stream
         // Hold a strong ref to the stream delegate so it doesn't get deallocated
-        streamDelegates[bundleID] = streamDelegate
+        streamDelegates[session] = streamDelegate
 
-        logger.info("Started app audio capture for \(bundleID)")
+        logger.info("Started app audio capture for \(bundleID) -> \(target)")
     }
 
-    /// Stop capture for a specific app.
-    func stopCapture(bundleID: String) async {
+    /// Stop capture for a specific app → target session. Other targets still capturing the
+    /// same bundle are untouched.
+    func stopCapture(bundleID: String, target: String) async {
+        let session = AppCaptureSessionKey(bundleID: bundleID, target: target)
+
         // If a start is in-flight, wait briefly for it to complete
-        if pendingStarts.contains(bundleID) {
+        if pendingStarts.contains(session) {
             try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
         }
 
-        guard let stream = activeStreams.removeValue(forKey: bundleID) else { return }
-        activeDelegates.removeValue(forKey: bundleID)
-        streamDelegates.removeValue(forKey: bundleID)
+        guard let stream = activeStreams.removeValue(forKey: session) else { return }
+        activeDelegates.removeValue(forKey: session)
+        streamDelegates.removeValue(forKey: session)
 
         do {
             try await stream.stopCapture()
         } catch {
-            logger.warning("Error stopping capture for \(bundleID): \(error.localizedDescription)")
+            logger.warning("Error stopping capture for \(bundleID) -> \(target): \(error.localizedDescription)")
         }
 
-        logger.info("Stopped app audio capture for \(bundleID)")
+        logger.info("Stopped app audio capture for \(bundleID) -> \(target)")
     }
 
     /// Strong references to stream delegates (SCStream holds them weakly)
-    private var streamDelegates: [String: AppCaptureStreamDelegate] = [:]
+    private var streamDelegates: [AppCaptureSessionKey: AppCaptureStreamDelegate] = [:]
 
     /// Called by the stream delegate when the stream encounters an error or stops
-    fileprivate func handleStreamError(bundleID: String, error: Error) {
-        logger.error("SCStream error for \(bundleID): \(error.localizedDescription)")
-        activeStreams.removeValue(forKey: bundleID)
-        activeDelegates.removeValue(forKey: bundleID)
-        streamDelegates.removeValue(forKey: bundleID)
+    fileprivate func handleStreamError(bundleID: String, target: String, error: Error) {
+        logger.error("SCStream error for \(bundleID) -> \(target): \(error.localizedDescription)")
+        let session = AppCaptureSessionKey(bundleID: bundleID, target: target)
+        activeStreams.removeValue(forKey: session)
+        activeDelegates.removeValue(forKey: session)
+        streamDelegates.removeValue(forKey: session)
     }
 
-    /// Stop all active captures.
+    /// Stop every active capture session, across every bundle and target.
     func stopAll() async {
-        let bundleIDs = Array(activeStreams.keys)
-        for bid in bundleIDs {
-            await stopCapture(bundleID: bid)
+        let sessions = Array(activeStreams.keys)
+        for session in sessions {
+            await stopCapture(bundleID: session.bundleID, target: session.target)
         }
     }
 }
@@ -242,18 +264,21 @@ final class AppCaptureService: NSObject, ObservableObject {
 
 private class AppCaptureStreamDelegate: NSObject, SCStreamDelegate {
     let bundleID: String
+    let target: String
     weak var service: AppCaptureService?
 
-    init(bundleID: String, service: AppCaptureService) {
-        self.bundleID = bundleID
+    init(session: AppCaptureSessionKey, service: AppCaptureService) {
+        self.bundleID = session.bundleID
+        self.target = session.target
         self.service = service
     }
 
     // SCStream calls this on its own queue.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         let bundleID = bundleID
+        let target = target
         Task { @MainActor [weak service] in
-            service?.handleStreamError(bundleID: bundleID, error: error)
+            service?.handleStreamError(bundleID: bundleID, target: target, error: error)
         }
     }
 }

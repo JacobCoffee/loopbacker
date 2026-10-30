@@ -28,6 +28,43 @@ private struct RouteKey: Hashable {
     let target: String
 }
 
+/// Identifies a set of voice routes that may safely share one echo canceller, noise
+/// suppressor, or FX chain instance: the same capture device, the same sample rate, and the
+/// same "voice pair" mix -- the gains feeding output channels 1-2, the only channels those
+/// stages ever read or write (see `AudioRouter.RouteContext.voicePairMixSignature`). Two
+/// routes on one capture device with different per-route mixes (e.g. input 1 patched into
+/// Virtual Mic's channels 1-2, input 2 patched into Stream Mix's channels 1-2) land in
+/// different groups and get separate instances, instead of one silently processing (or
+/// caching) the wrong route's signal for the other. Internal (not `private`/`fileprivate`) so
+/// its signature math is independently unit-testable without needing a real `RouteContext` or
+/// CoreAudio device.
+struct ProcessingGroupKey: Hashable, Comparable {
+    let captureDeviceUID: String
+    let sampleRate: Float64
+    let voicePairSignature: [UInt32]
+
+    /// The gains (as bit patterns, for exact equality) that a row-major `dst * inputChannels +
+    /// src` mix matrix (like `RouteContext.mixMatrix`) sends into output channels 1 and 2.
+    static func voicePairSignature(matrix: UnsafePointer<Float>, inputChannels: Int, outputChannels: Int) -> [UInt32] {
+        guard inputChannels > 0, outputChannels > 0 else { return [] }
+        let rows = min(2, outputChannels)
+        var signature = [UInt32](repeating: 0, count: rows * inputChannels)
+        for r in 0..<rows {
+            let row = matrix + r * inputChannels
+            for s in 0..<inputChannels { signature[r * inputChannels + s] = row[s].bitPattern }
+        }
+        return signature
+    }
+
+    /// Stable, deterministic ordering for `.sorted().first` (`AudioRouter.firstVoiceFXChain`'s
+    /// UI-facing "first active voice device" pick) -- not otherwise meaningful.
+    static func < (lhs: ProcessingGroupKey, rhs: ProcessingGroupKey) -> Bool {
+        if lhs.captureDeviceUID != rhs.captureDeviceUID { return lhs.captureDeviceUID < rhs.captureDeviceUID }
+        if lhs.sampleRate != rhs.sampleRate { return lhs.sampleRate < rhs.sampleRate }
+        return lhs.voicePairSignature.lexicographicallyPrecedes(rhs.voicePairSignature)
+    }
+}
+
 /// Routes audio from real input devices to the Loopbacker virtual output device(s),
 /// providing real-time meter levels back to the UI.
 class AudioRouter: ObservableObject, @unchecked Sendable {
@@ -71,11 +108,12 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Keyed by (source, target) so one source can feed both the virtual mic and Stream Mix.
     private var activeRoutes: [RouteKey: RouteContext] = [:]
     private var activeOutputRoutes: [String: RouteContext] = [:]
-    /// Voice chains keyed by capture device UID, mirrored into `fxChainsSnapshot` for
-    /// cross-thread reads (`FXEngine`). Queue only.
-    private var fxChainsByDevice: [String: FXChain] = [:]
+    /// Voice chains keyed by processing group (capture device + sample rate + voice-pair mix
+    /// signature; see `ProcessingGroupKey`), mirrored into `fxChainsSnapshot` for cross-thread
+    /// reads (`FXEngine`). Queue only.
+    private var fxChainsByDevice: [ProcessingGroupKey: FXChain] = [:]
     private let fxChainsLock = NSLock()
-    private var fxChainsSnapshot: [String: FXChain] = [:]
+    private var fxChainsSnapshot: [ProcessingGroupKey: FXChain] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
     /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
@@ -177,6 +215,27 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// Written on `queue` and read on the RT thread; a race across a routing change can
         /// at worst produce one block with a half-applied matrix, which is inaudible.
         let mixMatrix: UnsafeMutablePointer<Float>
+
+        /// This route's own mute/push-to-talk ramp cursor (see `MicGate.RouteState`'s doc
+        /// comment for why it can't be the gate's single shared `currentGain`).
+        let micGateState = MicGate.RouteState()
+
+        /// Incremented by the IO thread at the very end of every `processCapturedBlock`, after
+        /// it's done touching `echoSlot`/`noiseSlot`/`fxSlot`. CoreAudio never calls one
+        /// device's IO proc reentrantly, so one full increment after a slot is cleared proves
+        /// any callback that raced the clear (loaded the old unretained pointer just before
+        /// it) has finished using it -- `fadeOutNoiseSuppressor`/`fadeOutEchoCanceller` poll
+        /// this instead of freeing a detached instance after a fixed deadline a stalled
+        /// callback could still be running past.
+        let ioGeneration = Atomic<UInt64>(0)
+
+        /// Queue only. The `ProcessingGroupKey` this context's `FXChain` was published into
+        /// `fxChainsByDevice` under, captured at attach time since `mixMatrix` (and so the
+        /// live key `processingGroupKey` would compute) can change afterwards via
+        /// `setChannelMix` without the FX chain being reattached (see `setChannelMix`'s doc
+        /// comment on that gap). `detachFXChain` uses this instead of recomputing, so it always
+        /// cleans up the dictionary entry this context actually occupies.
+        var fxGroupKey: ProcessingGroupKey?
 
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
@@ -296,6 +355,25 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             }
         }
 
+        /// The gains (as bit patterns, for exact comparison) feeding output channels 1 and 2
+        /// from each input channel -- the only channels echo cancellation, noise suppression,
+        /// and the voice `FXChain` ever read or write. Two routes on the same capture device
+        /// with different values here (e.g. one patched input 1 into channels 1-2, the other
+        /// input 2) must not share any of those stages: sharing would run them on the wrong
+        /// source signal, or skip them for a route whose actual input they never saw. Queue
+        /// only (reads `mixMatrix`, which is only written on `queue`).
+        var voicePairMixSignature: [UInt32] {
+            ProcessingGroupKey.voicePairSignature(matrix: mixMatrix, inputChannels: Int(inputChannels),
+                                                  outputChannels: Int(outputChannels))
+        }
+
+        /// Queue only. This context's current sharing group for echo cancellation, noise
+        /// suppression, and the voice FX chain (see `AudioRouter.sameProcessingGroup`).
+        var processingGroupKey: ProcessingGroupKey {
+            ProcessingGroupKey(captureDeviceUID: captureDeviceUID, sampleRate: sampleRate,
+                               voicePairSignature: voicePairMixSignature)
+        }
+
         /// Run one captured block (already in `renderBuffer`) through the route and enqueue it.
         /// - Parameter sampleTime: the block's HAL input sample time, when the callback has one.
         func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
@@ -326,10 +404,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             // virtual mic, right after the FX chain -- never the monitor route (you hearing
             // yourself should stay live even while the outgoing mic is muted).
             if isVoiceInput, !isMonitor {
-                MicGate.shared.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
+                MicGate.shared.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), state: micGateState)
             }
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
+            ioGeneration.add(1, ordering: .releasing)
         }
 
         func readFromRing(_ data: UnsafeMutablePointer<Float>, frames: UInt32) {
@@ -513,15 +592,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                                   inputChannels: inputChannels, outputChannels: 2, sampleRate: rate,
                                   isVoiceInput: true)
             ctx.isMonitor = true
+            // Monitor hears the same channel mix as the virtual mic route (e.g. mono mic
+            // fanned to L+R); the virtual mic is the monitor's reference target. Applied
+            // *before* attaching NS/AEC/FX below: those decide which processing group (see
+            // `ProcessingGroupKey`) this context joins from its mix, so attaching against the
+            // still-identity mix here would sibling-match (or dict-key) on the wrong signature.
+            if let pending = self.pendingMixMatrices[RouteKey(source: sourceDeviceUID, target: VirtualDeviceChannels.micUID)] {
+                self.applyMixToContext(ctx, routes: pending)
+            }
             self.attachFXChain(to: ctx)
             self.applyNoiseSuppression(to: ctx)
             self.applyEchoCancellation(to: ctx)
             self.refreshEchoCancellersSnapshot()
-            // Monitor hears the same channel mix as the virtual mic route (e.g. mono mic fanned
-            // to L+R); the virtual mic is the monitor's reference target.
-            if let pending = self.pendingMixMatrices[RouteKey(source: sourceDeviceUID, target: VirtualDeviceChannels.micUID)] {
-                self.applyMixToContext(ctx, routes: pending)
-            }
             guard self.setupInputUnit(ctx) else { return }
             guard self.setupOutputUnit(ctx) else { self.teardownUnit(&ctx.inputUnit); return }
             if let u = ctx.inputUnit { AudioOutputUnitStart(u) }
@@ -700,6 +782,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 do {
                     try await appCaptureService.startCapture(
                         bundleID: bundleID,
+                        target: targetDeviceUID,
                         ringBufferWriter: ringWriter,
                         sampleRate: sampleRate,
                         channelCount: captureChannels
@@ -723,7 +806,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self?.stopAppCaptureInternal(bundleID: bundleID, targetDeviceUID: targetDeviceUID)
         }
         Task { @MainActor in
-            await appCaptureService.stopCapture(bundleID: bundleID)
+            await appCaptureService.stopCapture(bundleID: bundleID, target: targetDeviceUID)
         }
     }
 
@@ -749,6 +832,19 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// single source → target pair. An empty list falls back to identity passthrough
     /// (src1→out1, src2→out2). Applied immediately if the route is active, and cached so it's
     /// re-applied on restart.
+    ///
+    /// A live mix edit can move an already-running voice route into a different processing
+    /// group (see `ProcessingGroupKey`): `applyNoiseSuppression`/`applyEchoCancellation`
+    /// re-evaluate afterwards, which safely detaches-and-reattaches via their existing
+    /// crossfade-then-quiesce path if the route's new mix no longer matches whatever it was
+    /// sharing. The voice `FXChain` does *not* get the same live reconciliation: unlike
+    /// NS/AEC, swapping which `FXChain` instance a running route is attached to has no
+    /// crossfade-safe path at this layer (that would need support from `FXChain` itself, e.g.
+    /// an IO-acknowledged handoff) -- a running route keeps its originally-attached chain
+    /// until it's next stopped and restarted. In practice this only matters for the rare case
+    /// of editing per-channel routing on an already-active, already-differently-mixed sibling
+    /// route; a fresh route (the common case) always attaches with its final mix already
+    /// applied (see `startRoutingInternal`/`startMonitoring`).
     func setChannelMix(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
                        routes: [(srcCh: Int, dstCh: Int)]) {
         queue.async { [weak self] in
@@ -757,12 +853,17 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.pendingMixMatrices[key] = routes
             if let ctx = self.activeRoutes[key] {
                 self.applyMixToContext(ctx, routes: routes)
+                self.applyNoiseSuppression(to: ctx)
+                self.applyEchoCancellation(to: ctx)
             }
             // The monitor route always mirrors the virtual mic's mix (see `startMonitoring`).
             if targetDeviceUID == VirtualDeviceChannels.micUID,
                let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
                 self.applyMixToContext(monitor, routes: routes)
+                self.applyNoiseSuppression(to: monitor)
+                self.applyEchoCancellation(to: monitor)
             }
+            self.refreshEchoCancellersSnapshot()
         }
     }
 
@@ -806,42 +907,59 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Voice FX chain
 
-    /// Must run on `queue`. Attaches `ctx` to the voice chain for its capture device, sharing
-    /// the existing instance with any other voice route on the same device (virtual mic,
-    /// Stream Mix, monitor), or creating one. No-op for non-voice routes.
+    /// Must run on `queue`. Whether `a` and `b` may safely share one noise suppressor, echo
+    /// canceller, or FX chain instance -- see `ProcessingGroupKey`'s doc comment for why this
+    /// is more than just "same capture device".
+    private func sameProcessingGroup(_ a: RouteContext, _ b: RouteContext) -> Bool {
+        a.processingGroupKey == b.processingGroupKey
+    }
+
+    /// Must run on `queue`. Attaches `ctx` to the voice chain for its processing group,
+    /// sharing the existing instance with any other voice route in the same group (same
+    /// capture device, sample rate, and voice-pair mix -- see `ProcessingGroupKey`), or
+    /// creating one. No-op for non-voice routes.
     private func attachFXChain(to ctx: RouteContext) {
         guard ctx.isVoiceInput else { return }
-        if let sibling = voiceContexts.first(where: { $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID }),
+        let key = ctx.processingGroupKey
+        if let sibling = voiceContexts.first(where: { $0 !== ctx && sameProcessingGroup($0, ctx) }),
            let shared = sibling.fxOwner {
             ctx.attachFXChain(shared)
+            ctx.fxGroupKey = key
+            // ChainFix: setMasterEnabled(currentEffectsPreset.isEnabled) call site.
             return
         }
         let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
         chain.setMasterEnabled(currentEffectsPreset.isEnabled)
         ctx.attachFXChain(chain)
-        fxChainsByDevice[ctx.captureDeviceUID] = chain
+        ctx.fxGroupKey = key
+        fxChainsByDevice[key] = chain
         fxChainsLock.lock()
-        fxChainsSnapshot[ctx.captureDeviceUID] = chain
+        fxChainsSnapshot[key] = chain
         fxChainsLock.unlock()
         let nodes = currentEffectsPreset.nodes
         Task { await chain.updateConfigs(nodes) }
+        // ChainFix: setMasterEnabled(currentEffectsPreset.isEnabled) call site.
     }
 
     /// Must run on `queue`, after removing `ctx` from `activeRoutes`/`activeOutputRoutes`, so
-    /// `voiceContexts` no longer includes it. Frees the device's chain once no voice route
-    /// uses it anymore.
+    /// `voiceContexts` no longer includes it. Frees the group's chain once no voice route in
+    /// that exact group uses it anymore. Uses `ctx.fxGroupKey` (captured at attach time)
+    /// rather than `ctx.processingGroupKey` (computed from the live, possibly since-mutated
+    /// `mixMatrix`): see `RouteContext.fxGroupKey`'s doc comment.
     private func detachFXChain(from ctx: RouteContext) {
         guard ctx.isVoiceInput else { return }
         _ = ctx.detachFXChain()
-        guard !voiceContexts.contains(where: { $0.captureDeviceUID == ctx.captureDeviceUID }) else { return }
-        if let chain = fxChainsByDevice.removeValue(forKey: ctx.captureDeviceUID) {
-            // The last voice route on this device is gone and its audio unit(s) are already
+        guard let key = ctx.fxGroupKey else { return }
+        ctx.fxGroupKey = nil
+        guard !voiceContexts.contains(where: { $0.fxGroupKey == key }) else { return }
+        if let chain = fxChainsByDevice.removeValue(forKey: key) {
+            // The last voice route in this group is gone and its audio unit(s) are already
             // stopped (callers stop them before calling this): the IO proc is provably halted,
             // so it's safe to free whatever graphs this chain still owns now rather than wait.
             chain.ioStopped()
         }
         fxChainsLock.lock()
-        fxChainsSnapshot.removeValue(forKey: ctx.captureDeviceUID)
+        fxChainsSnapshot.removeValue(forKey: key)
         fxChainsLock.unlock()
     }
 
@@ -890,9 +1008,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     }
 
     /// Must run on `queue`. Gives `ctx` a suppressor running the selected engine, or takes it
-    /// away. Voice routes on the same capture device share one suppressor. Suppressors nobody
-    /// wants (off, opted out, or the other engine) fade out and are freed, and with them a
-    /// model-backed engine's model once nothing uses it.
+    /// away. Voice routes in the same processing group (see `ProcessingGroupKey`) share one
+    /// suppressor. Suppressors nobody wants (off, opted out, the other engine, or whose group
+    /// has diverged -- e.g. a live `setChannelMix` edit moved `ctx` out of the group it was
+    /// sharing with) fade out and are freed, and with them a model-backed engine's model once
+    /// nothing uses it.
     private func applyNoiseSuppression(to ctx: RouteContext) {
         guard ctx.isVoiceInput, !ctx.noiseDetaching else { return }
         let settings = noiseSuppression
@@ -900,7 +1020,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             && !(ctx.isMonitor && dryMonitorDevices.contains(ctx.captureDeviceUID))
 
         if let current = ctx.noiseOwner {
-            if wanted && current.engine == settings.engine {
+            let groupMismatch = voiceContexts.contains { $0 !== ctx && $0.noiseOwner === current && !sameProcessingGroup($0, ctx) }
+            if wanted && current.engine == settings.engine && !groupMismatch {
                 current.setMaxReduction(dB: settings.maxReductionDB)
                 current.setEnabled(true)
             } else {
@@ -911,8 +1032,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         guard wanted else { return }
 
         let sibling = voiceContexts.first {
-            $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID && $0.sampleRate == ctx.sampleRate
-                && !$0.noiseDetaching && $0.noiseOwner?.engine == settings.engine
+            $0 !== ctx && sameProcessingGroup($0, ctx) && !$0.noiseDetaching && $0.noiseOwner?.engine == settings.engine
         }
         if let shared = sibling?.noiseOwner {
             ctx.attachNoiseSuppressor(shared)
@@ -927,6 +1047,23 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         logger.info("Noise suppression (\(settings.engine.rawValue, privacy: .public)) started on \(ctx.captureDeviceUID)")
     }
 
+    /// Must run on `queue`. Frees `instance` once `ctx`'s own IO thread has completed a full
+    /// block since the slot it came from was cleared -- an acquisition-safe acknowledgement
+    /// (see `RouteContext.ioGeneration`'s doc comment) instead of a fixed deadline a stalled
+    /// callback could still be running past. Polls at a short interval rather than guessing a
+    /// wait time; a genuinely stalled IO thread means the device died, in which case `instance`
+    /// simply outlives the app rather than risking a use-after-free.
+    private func releaseOnceQuiescent<T: AnyObject & Sendable>(_ instance: T?, generationAtDetach: UInt64, ctx: RouteContext) {
+        guard instance != nil else { return }
+        guard ctx.ioGeneration.load(ordering: .acquiring) == generationAtDetach else {
+            withExtendedLifetime(instance) {}
+            return
+        }
+        queue.asyncAfter(deadline: .now() + 0.005) { [weak self] in
+            self?.releaseOnceQuiescent(instance, generationAtDetach: generationAtDetach, ctx: ctx)
+        }
+    }
+
     /// Must run on `queue`. Crossfades `ctx`'s suppressor to dry (10 ms), then detaches it and
     /// re-applies the settings, which may attach the other engine. Waiting out the fade keeps
     /// an engine switch click-free: old wet → dry → new wet.
@@ -936,12 +1073,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.noiseOwner === current && !$0.noiseDetaching }
         if !sharedWithKeeper { current.setEnabled(false) }
         queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
             let old = ctx.detachNoiseSuppressor()
             ctx.noiseDetaching = false
-            // An audio callback that loaded the slot just before it was cleared may still be
-            // running `old`; one IO cycle is a few ms, so half a second is ample.
-            self?.queue.asyncAfter(deadline: .now() + 0.5) { withExtendedLifetime(old) {} }
-            guard let self, self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.releaseOnceQuiescent(old, generationAtDetach: ctx.ioGeneration.load(ordering: .acquiring), ctx: ctx)
+            guard self.voiceContexts.contains(where: { $0 === ctx }) else { return }
             self.applyNoiseSuppression(to: ctx)
         }
     }
@@ -1014,15 +1150,17 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     }
 
     /// Must run on `queue`. Gives `ctx` an echo canceller reading the shared far-end reference
-    /// ring, or takes it away. Voice routes on the same capture device share one canceller,
-    /// the same sharing shape `applyNoiseSuppression` uses for `NoiseSuppressor`.
+    /// ring, or takes it away. Voice routes in the same processing group (see
+    /// `ProcessingGroupKey`) share one canceller, the same sharing shape `applyNoiseSuppression`
+    /// uses for `NoiseSuppressor`.
     private func applyEchoCancellation(to ctx: RouteContext) {
         guard ctx.isVoiceInput, !ctx.echoDetaching else { return }
         let wanted = noiseSuppression.echoCancellation && echoReference != nil
             && !echoExcludedDevices.contains(ctx.captureDeviceUID)
 
         if let current = ctx.echoOwner {
-            if wanted {
+            let groupMismatch = voiceContexts.contains { $0 !== ctx && $0.echoOwner === current && !sameProcessingGroup($0, ctx) }
+            if wanted && !groupMismatch {
                 current.setEnabled(true)
             } else {
                 fadeOutEchoCanceller(of: ctx)
@@ -1032,8 +1170,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         guard wanted, let reference = echoReference else { return }
 
         let sibling = voiceContexts.first {
-            $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID && $0.sampleRate == ctx.sampleRate
-                && !$0.echoDetaching
+            $0 !== ctx && sameProcessingGroup($0, ctx) && !$0.echoDetaching
         }
         if let shared = sibling?.echoOwner {
             ctx.attachEchoCanceller(shared)
@@ -1049,19 +1186,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     /// Must run on `queue`. Crossfades `ctx`'s canceller to dry (10 ms, inside
     /// `EchoCanceller.process`), then detaches it -- the same two-phase shape
-    /// `fadeOutNoiseSuppressor` uses.
+    /// `fadeOutNoiseSuppressor` uses, including the generation-based quiescent release.
     private func fadeOutEchoCanceller(of ctx: RouteContext) {
         guard let current = ctx.echoOwner else { return }
         ctx.echoDetaching = true
         let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.echoOwner === current && !$0.echoDetaching }
         if !sharedWithKeeper { current.setEnabled(false) }
         queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
             let old = ctx.detachEchoCanceller()
             ctx.echoDetaching = false
-            // An audio callback that loaded the slot just before it was cleared may still be
-            // running `old`; one IO cycle is a few ms, so half a second is ample.
-            self?.queue.asyncAfter(deadline: .now() + 0.5) { withExtendedLifetime(old) {} }
-            guard let self, self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.releaseOnceQuiescent(old, generationAtDetach: ctx.ioGeneration.load(ordering: .acquiring), ctx: ctx)
+            guard self.voiceContexts.contains(where: { $0 === ctx }) else { return }
             self.applyEchoCancellation(to: ctx)
             self.refreshEchoCancellersSnapshot()
         }
@@ -1338,6 +1474,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             sampleRate: sampleRate,
             isVoiceInput: true
         )
+        // Restore any previously-configured channel mix for this source -> target pair
+        // *before* attaching NS/AEC/FX below: those decide which processing group (see
+        // `ProcessingGroupKey`) this context joins from its mix, so attaching against the
+        // still-identity mix would sibling-match (or dict-key) on the wrong signature.
+        if let pending = pendingMixMatrices[routeKey] {
+            applyMixToContext(ctx, routes: pending)
+        }
         attachFXChain(to: ctx)
         applyNoiseSuppression(to: ctx)
         applyEchoCancellation(to: ctx)
@@ -1376,12 +1519,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 teardownUnit(&ctx.outputUnit)
                 return
             }
-        }
-
-        // Restore any previously-configured channel mix for this source -> target pair so it
-        // survives restarts (wake, sample rate change) without the UI having to reapply it.
-        if let pending = pendingMixMatrices[routeKey] {
-            applyMixToContext(ctx, routes: pending)
         }
 
         activeRoutes[routeKey] = ctx

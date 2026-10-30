@@ -1,6 +1,7 @@
 import CoreAudio
 import AudioToolbox
 import Foundation
+import Synchronization
 import os.log
 
 private let tapLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category: "SystemAudioTap")
@@ -82,10 +83,9 @@ enum SystemAudioTapState: Sendable, Equatable {
 /// Thread contract: `start`/`stop`/`rebuild` run on the main actor and are not real-time safe —
 /// they allocate Objective-C tap/aggregate-device objects and talk to coreaudiod. The IOProc
 /// installed on the aggregate device's real-time thread (`systemAudioTapIOProc`, a top-level C
-/// function, never a method) touches only the raw pointer in `IOContext` — no Swift reference
-/// counting, locks, or allocation — and writes into `ring`, which `EchoCanceller` reads on its
-/// own capture device's IO thread via `DriftCompensatedRing`'s single-writer/single-reader
-/// contract.
+/// function, never a method) touches only the raw pointers/atomics in `IOContext` — no Swift
+/// reference counting, locks, or allocation — and writes into `ring`, which `EchoCanceller`
+/// reads on its own capture device's IO thread via its own `DriftCompensatedRing.Reader`.
 @MainActor
 final class SystemAudioTap: ObservableObject {
     /// Ring capacity: ~1.4 s at 48 kHz stereo, comfortably covering the 40–150 ms bulk delays
@@ -100,24 +100,69 @@ final class SystemAudioTap: ObservableObject {
     /// `AudioRouter` reads this to fold the ring's own latency into its HAL-based stream-delay
     /// estimate for AEC3.
     nonisolated static let referenceTargetFillFrames: UInt32 = 960
+    /// Upper bound on frames the IOProc's sample-rate converter will emit from one callback.
+    /// Sized generously (worst case: a very low native device rate like 8 kHz upsampled to
+    /// 48 kHz, 6x, against an unusually large multi-thousand-frame IO buffer) -- the converter
+    /// defensively drops anything past this rather than overflow, so an overly conservative
+    /// bound only risks dropped reference audio in an extreme, unrealistic configuration, never
+    /// memory safety.
+    private static let conversionScratchCapacityFrames = 32_768
 
     @Published private(set) var state: SystemAudioTapState = .stopped
     @Published private(set) var permission: SystemAudioTapPermission = .unknown
 
-    /// Far-end reference ring, stereo at 48 kHz. `EchoCanceller` reads from this.
+    /// Far-end reference ring, stereo at 48 kHz. `EchoCanceller` reads from this (one
+    /// `DriftCompensatedRing.Reader` per canceller -- see that type's multi-reader doc comment).
     let ring: DriftCompensatedRing
 
     private var tapID: AudioObjectID = 0
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
     private var defaultOutputListenerInstalled = false
+    /// The exact block registered with `AudioObjectAddPropertyListenerBlock`, so
+    /// `AudioObjectRemovePropertyListenerBlock` is given that same object back -- Core Audio
+    /// only removes a listener when the block identity matches; passing a *new* empty closure
+    /// (as this used to) is a silent no-op; see `removeDefaultOutputListener`.
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+    /// The aggregate device's own nominal-sample-rate listener block, same identity
+    /// requirement as `defaultOutputListenerBlock`. Installed per-aggregate in `rebuild()`,
+    /// implicitly invalidated by `teardown()` destroying the aggregate (removal would fail
+    /// with `kAudioHardwareBadObjectError` on an already-destroyed device, which is fine to
+    /// ignore -- there's nothing left to listen to).
+    private var sampleRateListenerBlock: AudioObjectPropertyListenerBlock?
+    /// Set in `start()`, cleared in `stop()`: whether anything currently wants the tap
+    /// running. Guards both the default-output-change callback and `rebuild()` itself, so a
+    /// late or duplicate callback that fires after `stop()` (Core Audio delivers listener
+    /// callbacks asynchronously on the `.main` queue, so one can already be queued when
+    /// `stop()` runs) can never recreate the tap -- the bug `removeDefaultOutputListener`'s
+    /// old no-op removal caused (Hosting LB-TAP-001): every stop/start cycle left the original
+    /// listener installed, so a later default-output change kept calling `rebuild()` even
+    /// though demand was off.
+    private var wantsTap = false
     private let ioContext: UnsafeMutablePointer<IOContext>
 
     init() {
         ring = DriftCompensatedRing(capacityFrames: Self.ringCapacityFrames, channels: 2,
                                      targetFill: Self.referenceTargetFillFrames, sampleRate: 48_000)
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: Self.conversionScratchCapacityFrames * 2)
+        scratch.initialize(repeating: 0, count: Self.conversionScratchCapacityFrames * 2)
+        if mlock(scratch, Self.conversionScratchCapacityFrames * 2 * MemoryLayout<Float>.size) != 0 {
+            tapLogger.error("Could not wire system audio tap conversion buffer: errno \(errno)")
+        }
+        // `Atomic` is non-copyable, so it can't be a stored field of `IOContext` itself (that
+        // struct is read/written whole via `UnsafeMutablePointer.pointee` in the IOProc);
+        // allocate it separately and hold a stable pointer to it instead.
+        let ratioBits = UnsafeMutablePointer<Atomic<UInt64>>.allocate(capacity: 1)
+        ratioBits.initialize(to: Atomic(Double(1).bitPattern))
         ioContext = UnsafeMutablePointer<IOContext>.allocate(capacity: 1)
-        ioContext.initialize(to: IOContext(ring: Unmanaged.passUnretained(ring).toOpaque()))
+        ioContext.initialize(to: IOContext(
+            ring: Unmanaged.passUnretained(ring).toOpaque(),
+            ratioBits: ratioBits,
+            phase: 0,
+            prevFrameL: 0,
+            prevFrameR: 0,
+            scratch: scratch,
+            scratchCapacityFrames: Self.conversionScratchCapacityFrames))
     }
 
     isolated deinit {
@@ -125,6 +170,8 @@ final class SystemAudioTap: ObservableObject {
         // `stop()` doesn't leak the HAL-side tap/aggregate past the object's lifetime.
         if aggregateID != 0 { AudioHardwareDestroyAggregateDevice(aggregateID) }
         if tapID != 0 { AudioHardwareDestroyProcessTap(tapID) }
+        ioContext.pointee.ratioBits.deallocate()
+        ioContext.pointee.scratch.deallocate()
         ioContext.deallocate()
     }
 
@@ -132,11 +179,13 @@ final class SystemAudioTap: ObservableObject {
 
     func start() {
         guard state != .running else { return }
+        wantsTap = true
         installDefaultOutputListenerIfNeeded()
         rebuild()
     }
 
     func stop() {
+        wantsTap = false
         removeDefaultOutputListener()
         teardown()
         state = .stopped
@@ -146,8 +195,11 @@ final class SystemAudioTap: ObservableObject {
     /// start and recovery from a default-output device change: a device-scoped tap's format
     /// tracks whatever device it names, so switching outputs (e.g. built-in speakers to a USB
     /// interface, or to/from one of Loopbacker's own virtual devices) means re-pointing it at
-    /// the new default, or dropping it entirely if there's no physical device to tap.
+    /// the new default, or dropping it entirely if there's no physical device to tap. Guarded
+    /// on `wantsTap` so a stray call after `stop()` (e.g. a listener callback queued just
+    /// before it ran) can never resurrect the tap.
     private func rebuild() {
+        guard wantsTap else { return }
         teardown()
 
         guard let outputDeviceUID = Self.defaultOutputDeviceUID() else {
@@ -205,6 +257,8 @@ final class SystemAudioTap: ObservableObject {
             return
         }
         aggregateID = newAggregateID
+        updateConversionRatio(deviceID: newAggregateID)
+        installSampleRateListener(on: newAggregateID)
 
         var newIOProcID: AudioDeviceIOProcID?
         let createStatus = AudioDeviceCreateIOProcID(aggregateID, systemAudioTapIOProc, ioContext, &newIOProcID)
@@ -230,6 +284,7 @@ final class SystemAudioTap: ObservableObject {
             if aggregateID != 0 { AudioDeviceDestroyIOProcID(aggregateID, ioProcID) }
             self.ioProcID = nil
         }
+        removeSampleRateListener()
         if aggregateID != 0 {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = 0
@@ -238,12 +293,85 @@ final class SystemAudioTap: ObservableObject {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = 0
         }
+        // Reset conversion/resampling state so a rebuilt tap doesn't interpolate across the
+        // gap or carry a stale ratio before the new aggregate's rate is read.
+        ioContext.pointee.ratioBits.pointee.store(Double(1).bitPattern, ordering: .relaxed)
+        ioContext.pointee.phase = 0
+        ioContext.pointee.prevFrameL = 0
+        ioContext.pointee.prevFrameR = 0
     }
 
     private func fail(_ error: SystemAudioTapError) {
         tapLogger.error("\(error.localizedDescription, privacy: .public)")
         teardown()
         state = .failed(error)
+    }
+
+    // MARK: - Sample-rate conversion
+
+    /// Reads `deviceID`'s actual nominal sample rate and republishes the ratio (device rate /
+    /// 48 kHz) the IOProc converts by. The aggregate's rate tracks the tapped device's (a
+    /// default output running at 44.1/96 kHz produces a same-rate aggregate), so this is the
+    /// only way to know the reference needs conversion at all: `DriftCompensatedRing`'s own
+    /// ±0.1% drift steering is for clock *drift*, not a whole different nominal rate.
+    private func updateConversionRatio(deviceID: AudioObjectID) {
+        guard let rate = Self.nominalSampleRate(of: deviceID), rate > 0 else {
+            tapLogger.warning("Could not read the tap aggregate's sample rate; assuming 48 kHz")
+            ioContext.pointee.ratioBits.pointee.store(Double(1).bitPattern, ordering: .relaxed)
+            return
+        }
+        let ratio = rate / 48_000.0
+        if abs(ratio - 1.0) > 1e-9 {
+            tapLogger.info("System audio tap running at \(rate) Hz; converting to 48 kHz (ratio \(ratio))")
+        }
+        ioContext.pointee.ratioBits.pointee.store(ratio.bitPattern, ordering: .relaxed)
+    }
+
+    private static func nominalSampleRate(of deviceID: AudioObjectID) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
+        return status == noErr ? rate : nil
+    }
+
+    /// Installed per-aggregate (torn down with it) so a nominal-rate change on the tapped
+    /// device while the tap keeps running the same aggregate -- not just a default-output
+    /// device change, which already rebuilds everything via `installDefaultOutputListenerIfNeeded`
+    /// -- still updates the conversion ratio.
+    private func installSampleRateListener(on deviceID: AudioObjectID) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, self.wantsTap, self.aggregateID == deviceID else { return }
+                self.updateConversionRatio(deviceID: deviceID)
+            }
+        }
+        let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, .main, block)
+        guard status == noErr else {
+            tapLogger.error("Could not install sample-rate listener on tap aggregate: \(status)")
+            return
+        }
+        sampleRateListenerBlock = block
+    }
+
+    private func removeSampleRateListener() {
+        guard let block = sampleRateListenerBlock, aggregateID != 0 else {
+            sampleRateListenerBlock = nil
+            return
+        }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectRemovePropertyListenerBlock(aggregateID, &address, .main, block)
+        sampleRateListenerBlock = nil
     }
 
     // MARK: - Default output device lookup
@@ -288,40 +416,71 @@ final class SystemAudioTap: ObservableObject {
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
-        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main) { [weak self] _, _ in
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             MainActor.assumeIsolated {
-                // Rebuilds whenever the listener is installed (i.e. demand is active, from
-                // `start()` through `stop()`), not only while currently `.running`: this is
-                // exactly how `.noPhysicalOutput` -> real-device transitions get picked up.
-                guard let self else { return }
+                // Rebuilds whenever demand is still active (not only while currently
+                // `.running`): this is exactly how `.noPhysicalOutput` -> real-device
+                // transitions get picked up. Guarded on `wantsTap` so a callback that was
+                // already queued on `.main` when `stop()` ran can never recreate the tap --
+                // `rebuild()` re-checks this too, but checking here as well avoids even
+                // logging a spurious rebuild attempt.
+                guard let self, self.wantsTap else { return }
                 tapLogger.info("Default output device changed; rebuilding system audio tap")
                 self.rebuild()
             }
         }
+        let status = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        guard status == noErr else {
+            tapLogger.error("Could not install default-output listener: \(status)")
+            return
+        }
+        defaultOutputListenerBlock = block
         defaultOutputListenerInstalled = true
     }
 
     private func removeDefaultOutputListener() {
-        guard defaultOutputListenerInstalled else { return }
+        guard defaultOutputListenerInstalled, let block = defaultOutputListenerBlock else { return }
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
-        AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main) { _, _ in }
+        // Pass the exact block identity that was registered: `AudioObjectRemovePropertyListenerBlock`
+        // only removes a listener when given the same block object, not merely an
+        // equivalent-looking closure (Hosting LB-TAP-001 / the matching [ReviewRT] finding --
+        // the old code passed a brand-new `{ _, _ in }` here, which Core Audio silently
+        // ignored while this flag still claimed the listener was gone).
+        let status = AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        if status != noErr {
+            tapLogger.error("Could not remove default-output listener: \(status)")
+        }
+        defaultOutputListenerBlock = nil
         defaultOutputListenerInstalled = false
     }
 }
 
 /// Raw state the real-time IOProc may touch: a pointer to the `DriftCompensatedRing` it writes
-/// into. Plain struct, no ARC — passed as `inClientData` to `AudioDeviceCreateIOProcID`.
+/// into, the current sample-rate-conversion ratio, and resampling state. Plain struct, no ARC
+/// (aside from the atomic, which owns no heap storage of its own) — passed as `inClientData` to
+/// `AudioDeviceCreateIOProcID`.
 private struct IOContext {
     let ring: UnsafeRawPointer
+    /// (tap aggregate's actual nominal sample rate) / 48000, as an atomic bit pattern: written
+    /// off the IO thread by `SystemAudioTap.updateConversionRatio`, read every callback.
+    let ratioBits: UnsafeMutablePointer<Atomic<UInt64>>
+    /// IO-thread-owned resampling state, carried across callbacks for continuity.
+    var phase: Double
+    var prevFrameL: Float
+    var prevFrameR: Float
+    let scratch: UnsafeMutablePointer<Float>
+    let scratchCapacityFrames: Int
 }
 
-/// Top-level `AudioDeviceIOProc`: writes the tap's input audio into the far-end reference ring.
-/// Runs on the aggregate device's real-time thread. No allocation, locks, or Swift reference
-/// counting — `Unmanaged.fromOpaque` does not retain, and `DriftCompensatedRing.write` is a
-/// bounded copy loop.
+/// Top-level `AudioDeviceIOProc`: writes the tap's input audio into the far-end reference ring,
+/// converting from the tap's actual nominal sample rate to the ring's fixed 48 kHz if they
+/// differ. Runs on the aggregate device's real-time thread. No allocation, locks, or Swift
+/// reference counting — `Unmanaged.fromOpaque` does not retain, the atomic load is lock-free,
+/// and both the direct-write and conversion paths are bounded copy/interpolation loops into
+/// the pre-allocated, `mlock`ed `scratch` buffer.
 private func systemAudioTapIOProc(
     _ device: AudioObjectID,
     _ now: UnsafePointer<AudioTimeStamp>,
@@ -332,8 +491,8 @@ private func systemAudioTapIOProc(
     _ clientData: UnsafeMutableRawPointer?
 ) -> OSStatus {
     guard let clientData else { return noErr }
-    let context = clientData.assumingMemoryBound(to: IOContext.self).pointee
-    let ring = Unmanaged<DriftCompensatedRing>.fromOpaque(context.ring).takeUnretainedValue()
+    let context = clientData.assumingMemoryBound(to: IOContext.self)
+    let ring = Unmanaged<DriftCompensatedRing>.fromOpaque(context.pointee.ring).takeUnretainedValue()
 
     let bufferList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
     guard let buffer = bufferList.first, let data = buffer.mData else { return noErr }
@@ -348,6 +507,44 @@ private func systemAudioTapIOProc(
     // stereo) ever needs to handle. Drop anything else rather than reshaping on the IO
     // thread, which would need an allocation.
     guard channels == ring.channels else { return noErr }
-    ring.write(floats, frames: UInt32(frames))
+
+    let ratio = Double(bitPattern: context.pointee.ratioBits.pointee.load(ordering: .relaxed))
+    guard abs(ratio - 1.0) > 1e-9 else {
+        // Common case: the tapped device is already (nominally) 48 kHz. Straight copy, same
+        // as before sample-rate conversion existed.
+        ring.write(floats, frames: UInt32(frames))
+        return noErr
+    }
+
+    // Linear interpolation from the tap's actual nominal rate to 48 kHz.
+    // `DriftCompensatedRing`'s own ±0.1% steering only corrects small clock drift, not a
+    // whole different nominal rate (e.g. a 44.1 kHz default output). `phase`/`prevFrameL/R`
+    // carry continuity across callback boundaries: virtual index 0 of this callback is the
+    // previous callback's last frame, so there's no discontinuity at every buffer edge and no
+    // out-of-bounds read into a buffer this IOProc doesn't own.
+    let scratch = context.pointee.scratch
+    let capacity = context.pointee.scratchCapacityFrames
+    var pos = context.pointee.phase
+    var outFrames = 0
+    let framesD = Double(frames)
+    while pos < framesD, outFrames < capacity {
+        let whole = Int(pos.rounded(.down))
+        let t = Float(pos - pos.rounded(.down))
+        let x0L: Float = whole == 0 ? context.pointee.prevFrameL : floats[(whole - 1) * channels]
+        let x0R: Float = whole == 0 ? context.pointee.prevFrameR : floats[(whole - 1) * channels + 1]
+        let x1L = floats[whole * channels]
+        let x1R = floats[whole * channels + 1]
+        scratch[outFrames * 2] = x0L + (x1L - x0L) * t
+        scratch[outFrames * 2 + 1] = x0R + (x1R - x0R) * t
+        outFrames += 1
+        pos += ratio
+    }
+    context.pointee.phase = pos - framesD
+    context.pointee.prevFrameL = floats[(frames - 1) * channels]
+    context.pointee.prevFrameR = floats[(frames - 1) * channels + 1]
+
+    if outFrames > 0 {
+        ring.write(scratch, frames: UInt32(outFrames))
+    }
     return noErr
 }
