@@ -23,36 +23,46 @@ enum PresetAutoSwitchEngine {
         rules.first { $0.isEnabled && matches($0, signals: signals) }
     }
 
-    /// What `decide` tells the caller to do; `apply`/`restorePrevious` both mean "set this
-    /// preset", kept distinct only so a caller can log/notify differently.
+    /// What `decide` tells the caller to do.
     enum Action: Equatable {
         case none
         case apply(presetID: String)
-        case restorePrevious(presetID: String)
+        /// Restore the live state snapshot the caller captured before the first rule engaged
+        /// (see `Decision.shouldCaptureBeforeApplying`) — not a named preset, since the state
+        /// before automation took over may be unsaved/customized and have no preset id at all.
+        case restorePrevious
     }
 
     struct Decision: Equatable {
         let action: Action
-        /// Carry these forward into the next `decide` call's `activeRuleID`/`presetBeforeActiveRule`.
+        /// Carry forward into the next `decide` call's `activeRuleID`.
         let activeRuleID: UUID?
-        let presetBeforeActiveRule: String?
+        /// Carry forward into the next `decide` call's `hasCapturedBefore`.
+        let hasCapturedBefore: Bool
+        /// True exactly when the caller must snapshot the actual live state (not a named
+        /// preset id) right now, before applying `action` — the moment any rule first takes
+        /// over from no rule being active.
+        let shouldCaptureBeforeApplying: Bool
     }
 
-    /// One pure evaluation step. `activeRuleID`/`presetBeforeActiveRule`/`lastAppliedPresetID`
-    /// are the caller's bookkeeping from the previous call (or initial values); `decide` never
-    /// touches global state itself.
+    /// One pure evaluation step. `activeRuleID`/`hasCapturedBefore`/`lastAppliedPresetID` are
+    /// the caller's bookkeeping from the previous call (or initial values); `decide` never
+    /// touches global state itself, and never holds the live `EffectsPreset`/noise-suppression
+    /// snapshot itself — that's the caller's job (`PresetAutoSwitcher`), triggered by
+    /// `shouldCaptureBeforeApplying`.
     ///
     /// - `activeRuleID`: the rule the previous call applied, or nil.
-    /// - `presetBeforeActiveRule`: what was active just before `activeRuleID` took over, so a
-    ///   `restorePreviousOnQuit` rule can revert to it instead of falling through.
-    /// - `lastAppliedPresetID`: whatever this engine itself last applied (rule or fallback), the
-    ///   seed for `presetBeforeActiveRule` the first time a rule activates.
+    /// - `hasCapturedBefore`: whether the caller is holding a live-state snapshot captured
+    ///   before the current/most recent automation episode started, so a `restorePreviousOnQuit`
+    ///   rule can revert to it instead of falling through.
+    /// - `lastAppliedPresetID`: whatever this engine itself last applied (rule or fallback),
+    ///   used only to avoid redundantly reapplying the fallback.
     static func decide(
         rules: [PresetAutoSwitchRule],
         signals: Signals,
         fallbackPresetID: String?,
         activeRuleID: UUID?,
-        presetBeforeActiveRule: String?,
+        hasCapturedBefore: Bool,
         lastAppliedPresetID: String?
     ) -> Decision {
         let matched = resolve(rules: rules, signals: signals)
@@ -63,20 +73,26 @@ enum PresetAutoSwitchEngine {
            let activeRuleID,
            let activeRule = rules.first(where: { $0.id == activeRuleID }),
            activeRule.restorePreviousOnQuit,
-           let presetBeforeActiveRule {
-            return Decision(action: .restorePrevious(presetID: presetBeforeActiveRule), activeRuleID: nil, presetBeforeActiveRule: nil)
+           hasCapturedBefore {
+            return Decision(action: .restorePrevious, activeRuleID: nil, hasCapturedBefore: false, shouldCaptureBeforeApplying: false)
         }
 
         if let matched {
             guard matched.id != activeRuleID else {
                 // Same rule still in charge: no change.
-                return Decision(action: .none, activeRuleID: activeRuleID, presetBeforeActiveRule: presetBeforeActiveRule)
+                return Decision(action: .none, activeRuleID: activeRuleID, hasCapturedBefore: hasCapturedBefore,
+                                shouldCaptureBeforeApplying: false)
             }
-            // Only capture "what was active before" the first time a rule engages; a direct
-            // rule-to-rule switch (A quits while B is already running) keeps the original
-            // pre-automation preset as the thing to restore, not rule A's preset.
-            let before = activeRuleID == nil ? lastAppliedPresetID : presetBeforeActiveRule
-            return Decision(action: .apply(presetID: matched.presetID), activeRuleID: matched.id, presetBeforeActiveRule: before)
+            // Capture "what was active before" the first time any rule engages, unconditionally
+            // (not only for rules with `restorePreviousOnQuit`, since a later rule-to-rule chain
+            // might still need it); a direct rule-to-rule switch (A quits while B is already
+            // running) keeps the original pre-automation snapshot, not A's.
+            let isFirstEngagement = activeRuleID == nil
+            return Decision(
+                action: .apply(presetID: matched.presetID), activeRuleID: matched.id,
+                hasCapturedBefore: isFirstEngagement ? true : hasCapturedBefore,
+                shouldCaptureBeforeApplying: isFirstEngagement
+            )
         }
 
         // No rule matches: fall back, but only actually apply when the fallback isn't already
@@ -84,10 +100,11 @@ enum PresetAutoSwitchEngine {
         // "no rule" and "sitting on the fallback" are both `activeRuleID == nil`).
         if let fallbackPresetID {
             guard fallbackPresetID != lastAppliedPresetID || activeRuleID != nil else {
-                return Decision(action: .none, activeRuleID: nil, presetBeforeActiveRule: nil)
+                return Decision(action: .none, activeRuleID: nil, hasCapturedBefore: false, shouldCaptureBeforeApplying: false)
             }
-            return Decision(action: .apply(presetID: fallbackPresetID), activeRuleID: nil, presetBeforeActiveRule: nil)
+            return Decision(action: .apply(presetID: fallbackPresetID), activeRuleID: nil, hasCapturedBefore: false,
+                            shouldCaptureBeforeApplying: false)
         }
-        return Decision(action: .none, activeRuleID: nil, presetBeforeActiveRule: nil)
+        return Decision(action: .none, activeRuleID: nil, hasCapturedBefore: false, shouldCaptureBeforeApplying: false)
     }
 }
