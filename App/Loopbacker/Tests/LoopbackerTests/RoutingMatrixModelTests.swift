@@ -37,7 +37,7 @@ struct RoutingMatrixModelTests {
         let column = model.columns[0]
 
         #expect(!model.isConnected(row: row, column: column))
-        #expect(model.action(row: row, column: column) == .connect(sourceId: micA.id, sourceChannelId: 1, outputChannelId: 1))
+        #expect(model.action(row: row, column: column) == .connect(sourceId: micA.id, sourceChannelId: 1, target: .virtualMic, outputChannelId: 1))
     }
 
     @Test("A connected cell reports connected and a disconnect action")
@@ -49,7 +49,21 @@ struct RoutingMatrixModelTests {
         let column = model.columns[0]
 
         #expect(model.isConnected(row: row, column: column))
-        #expect(model.action(row: row, column: column) == .disconnect(sourceId: micA.id, sourceChannelId: 1, outputChannelId: 1))
+        #expect(model.action(row: row, column: column) == .disconnect(sourceId: micA.id, sourceChannelId: 1, target: .virtualMic, outputChannelId: 1))
+    }
+
+    @Test("A Stream Mix route never shows on the virtual mic matrix, and vice versa")
+    func targetsAreIsolated() {
+        let micA = mic("MOTU M2", channels: 2)
+        let streamRoute = AudioRoute(sourceId: micA.id, sourceChannelId: 1, targetId: .streamMix, outputChannelId: 1)
+        let micModel = RoutingMatrixModel(sources: [micA], outputChannels: outputs(2), routes: [streamRoute])
+        let streamModel = RoutingMatrixModel(sources: [micA], outputChannels: outputs(2), routes: [streamRoute],
+                                             target: .streamMix)
+
+        #expect(!micModel.isConnected(row: micModel.rows[0], column: micModel.columns[0]))
+        #expect(streamModel.isConnected(row: streamModel.rows[0], column: streamModel.columns[0]))
+        #expect(streamModel.action(row: streamModel.rows[0], column: streamModel.columns[0])
+            == .disconnect(sourceId: micA.id, sourceChannelId: 1, target: .streamMix, outputChannelId: 1))
     }
 
     @Test("Multichannel source: connecting one channel never affects its sibling channels")

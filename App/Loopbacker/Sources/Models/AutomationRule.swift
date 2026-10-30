@@ -107,11 +107,7 @@ class AutomationRulesState: ObservableObject {
 
     // MARK: - Persistence
 
-    private static let configURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("automation.json")
-    }()
+    private static let configURL: URL = AppDataDirectory.url.appendingPathComponent("automation.json")
 
     private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.automation.save", qos: .utility)
 

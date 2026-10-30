@@ -57,10 +57,15 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
+      # The const-values flags feed scripts/extract-app-intents.sh (Shortcuts metadata); the
+      # native build system doesn't emit them on its own.
       - name: Build Swift app
         run: |
           cd App/Loopbacker
-          swift build -c release
+          swift build -c release \
+            -Xswiftc -emit-const-values-path -Xswiftc "$RUNNER_TEMP/Loopbacker.swiftconstvalues" \
+            -Xswiftc -Xfrontend -Xswiftc -const-gather-protocols-file \
+            -Xswiftc -Xfrontend -Xswiftc "$GITHUB_WORKSPACE/scripts/app-intents-const-protocols.json"
 
       # ── Package .app bundle ──────────────────────────────────────
       - name: Create .app bundle
@@ -77,12 +82,18 @@ jobs:
           cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/RNNoise-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/Airwindows-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/YSFX-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/WDL-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/CWebRTCAEC/LICENSE-webrtc-audio-processing.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/CWebRTCAEC/LICENSE-abseil.txt Loopbacker.app/Contents/Resources/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
           cp -R App/Loopbacker/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework \
             Loopbacker.app/Contents/Frameworks/
           xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
             --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
             --output-partial-info-plist "$RUNNER_TEMP/assets-partial.plist" >/dev/null
+          LB_CONST_VALUES="$RUNNER_TEMP/Loopbacker.swiftconstvalues" scripts/extract-app-intents.sh Loopbacker.app
 
       # ── Code Signing ─────────────────────────────────────────────
       - name: Import signing certificate
@@ -120,13 +131,14 @@ jobs:
       - name: Code sign (Developer ID)
         if: steps.secrets.outputs.has_cert == 'true'
         run: |
-          codesign --force --options runtime \
+          codesign --force --options runtime --timestamp \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app/Contents/Resources/Loopbacker.driver
 
           scripts/sign-sparkle.sh Loopbacker.app "$SIGNING_IDENTITY" --hardened
 
-          codesign --force --options runtime \
+          codesign --force --options runtime --timestamp \
+            --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app
 
@@ -137,7 +149,9 @@ jobs:
           codesign --force --sign - \
             Loopbacker.app/Contents/Resources/Loopbacker.driver
           scripts/sign-sparkle.sh Loopbacker.app -
-          codesign --force --sign - \
+          codesign --force --options runtime \
+            --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
+            --sign - \
             Loopbacker.app
 
       # ── Notarization ─────────────────────────────────────────────

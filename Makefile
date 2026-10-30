@@ -45,6 +45,11 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/RNNoise-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/Airwindows-LICENSE.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/YSFX-LICENSE.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/WDL-LICENSE.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/CWebRTCAEC/LICENSE-webrtc-audio-processing.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/CWebRTCAEC/LICENSE-abseil.txt $(APP_CONTENTS)/Resources/
 	xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile $(APP_CONTENTS)/Resources \
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
@@ -52,8 +57,11 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	rm -rf $(APP_CONTENTS)/Frameworks/Sparkle.framework
 	cp -R App/Loopbacker/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework \
 		$(APP_CONTENTS)/Frameworks/
+	scripts/extract-app-intents.sh $(BUILD_DIR)/$(APP_BUNDLE)
 	scripts/sign-sparkle.sh $(BUILD_DIR)/$(APP_BUNDLE) "$(SIGN_IDENTITY)"
-	codesign --force --deep --sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
+	codesign --force --options runtime --sign "$(SIGN_IDENTITY)" $(APP_CONTENTS)/Resources/Loopbacker.driver
+	codesign --force --options runtime --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
+		--sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	codesign --verify --deep --strict $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."
 

@@ -23,7 +23,7 @@ struct RoutingSyncHotplugTests {
     func clampsOntoMonoFallback() {
         let routes = [AudioRoute(sourceId: source.id, sourceChannelId: 2, outputChannelId: 1)]
         let mix = RoutingDesiredState.mixRoutes(
-            for: source, routes: routes, devices: [device(uid: "fallback-uid", inputChannelCount: 1)]
+            for: source, target: .virtualMic, routes: routes, devices: [device(uid: "fallback-uid", inputChannelCount: 1)]
         )
         #expect(mix.map(\.srcCh) == [1])
         #expect(mix.map(\.dstCh) == [1])
@@ -36,7 +36,7 @@ struct RoutingSyncHotplugTests {
             AudioRoute(sourceId: source.id, sourceChannelId: 2, outputChannelId: 2),
         ]
         let mix = RoutingDesiredState.mixRoutes(
-            for: source, routes: routes, devices: [device(uid: "fallback-uid", inputChannelCount: 2)]
+            for: source, target: .virtualMic, routes: routes, devices: [device(uid: "fallback-uid", inputChannelCount: 2)]
         )
         #expect(mix.map(\.srcCh).sorted() == [1, 2])
         #expect(mix.map(\.dstCh).sorted() == [1, 2])

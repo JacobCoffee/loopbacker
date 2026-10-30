@@ -59,7 +59,7 @@ struct SceneDiffTests {
         let diff = SceneDiff.diff(from: old, to: new)
 
         #expect(diff.routesToStart.map(\.key) == ["new-uid"])
-        #expect(diff.routesToStop == ["old-uid"])
+        #expect(diff.routesToStop.map(\.source) == ["old-uid"])
         #expect(diff.routesToRetarget.isEmpty)
     }
 
@@ -108,18 +108,41 @@ struct SceneDiffTests {
         disabledMic.isEnabled = false
         let newDisabled = RoutingDesiredState.compute(from: config(sources: [disabledMic], routes: routes))
         let diffDisable = SceneDiff.diff(from: old, to: newDisabled)
-        #expect(diffDisable.routesToStop == ["mic-1"])
+        #expect(diffDisable.routesToStop.map(\.source) == ["mic-1"])
         #expect(diffDisable.routesToStart.isEmpty)
 
         var mutedMic = mic
         mutedMic.isMuted = true
         let newMuted = RoutingDesiredState.compute(from: config(sources: [mutedMic], routes: routes))
         let diffMute = SceneDiff.diff(from: old, to: newMuted)
-        #expect(diffMute.routesToStop == ["mic-1"])
+        #expect(diffMute.routesToStop.map(\.source) == ["mic-1"])
 
         // Re-enabling from the muted state should start it again.
         let diffReenable = SceneDiff.diff(from: newMuted, to: old)
         #expect(diffReenable.routesToStart.map(\.key) == ["mic-1"])
+    }
+
+    @Test("Virtual mic and Stream Mix routes from one source diff independently")
+    func routeTargetsDiffIndependently() {
+        let mic = source()
+        let toMic = AudioRoute(sourceId: mic.id, sourceChannelId: 1, targetId: .virtualMic, outputChannelId: 1)
+        let toStream = AudioRoute(sourceId: mic.id, sourceChannelId: 1, targetId: .streamMix, outputChannelId: 2)
+        let micOnly = RoutingDesiredState.compute(from: config(sources: [mic], routes: [toMic]))
+        let both = RoutingDesiredState.compute(from: config(sources: [mic], routes: [toMic, toStream]))
+        let streamOnly = RoutingDesiredState.compute(from: config(sources: [mic], routes: [toStream]))
+
+        // Adding Stream Mix starts only that route; the mic route and its mix are untouched.
+        let added = SceneDiff.diff(from: micOnly, to: both)
+        #expect(added.routesToStart.map(\.id) == [RoutingDesiredState.RouteID(source: "mic-1", target: .streamMix)])
+        #expect(added.routesToStart.first?.mix == [RoutingDesiredState.MixEntry(sourceChannel: 1, outputChannel: 2)])
+        #expect(added.routesToStop.isEmpty && added.routesToRetarget.isEmpty)
+
+        // Moving the only route from the mic to Stream Mix stops one target and starts the other
+        // instead of retargeting the mic route with Stream Mix's channels.
+        let moved = SceneDiff.diff(from: micOnly, to: streamOnly)
+        #expect(moved.routesToStop == [RoutingDesiredState.RouteID(source: "mic-1", target: .virtualMic)])
+        #expect(moved.routesToStart.map(\.id) == [RoutingDesiredState.RouteID(source: "mic-1", target: .streamMix)])
+        #expect(moved.routesToRetarget.isEmpty)
     }
 
     @Test("An output destination added, removed, and retargeted produces the matching diff")

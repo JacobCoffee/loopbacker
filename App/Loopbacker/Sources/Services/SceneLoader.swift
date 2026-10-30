@@ -53,27 +53,30 @@ final class SceneLoader: ObservableObject {
 
     private func apply(_ diff: SceneDiff) {
         for route in diff.routesToStart {
+            let targetUID = route.target.deviceUID
             if route.isAppCapture {
-                audioRouter.startAppCapture(bundleID: route.bundleID, appCaptureService: appCaptureService)
+                audioRouter.startAppCapture(bundleID: route.bundleID, targetDeviceUID: targetUID,
+                                            appCaptureService: appCaptureService)
             } else {
-                audioRouter.startRouting(sourceDeviceUID: route.deviceUID)
+                audioRouter.startRouting(sourceDeviceUID: route.deviceUID, targetDeviceUID: targetUID)
             }
             audioRouter.setChannelMix(
-                sourceDeviceUID: route.key,
+                sourceDeviceUID: route.key, targetDeviceUID: targetUID,
                 routes: route.mix.map { (srcCh: $0.sourceChannel, dstCh: $0.outputChannel) }
             )
         }
         for retarget in diff.routesToRetarget {
             audioRouter.setChannelMix(
-                sourceDeviceUID: retarget.key,
+                sourceDeviceUID: retarget.key, targetDeviceUID: retarget.target.deviceUID,
                 routes: retarget.mix.map { (srcCh: $0.sourceChannel, dstCh: $0.outputChannel) }
             )
         }
-        for key in diff.routesToStop {
-            if key.hasPrefix("app:") {
-                audioRouter.stopAppCapture(bundleID: String(key.dropFirst("app:".count)), appCaptureService: appCaptureService)
+        for id in diff.routesToStop {
+            if id.source.hasPrefix("app:") {
+                audioRouter.stopAppCapture(bundleID: String(id.source.dropFirst("app:".count)),
+                                           targetDeviceUID: id.target.deviceUID, appCaptureService: appCaptureService)
             } else {
-                audioRouter.stopRouting(sourceDeviceUID: key)
+                audioRouter.stopRouting(sourceDeviceUID: id.source, targetDeviceUID: id.target.deviceUID)
             }
         }
         for monitor in diff.monitorsToStart {

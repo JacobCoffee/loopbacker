@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Third-party AUv2 effects load in-process (AUHostNode) under the hardened runtime,
+	     which otherwise refuses to dlopen code not signed with the same team ID. This is a
+	     deliberate trust-model decision (LB-HOST-001, kept over out-of-process hosting for its
+	     measured render-path allocation cost; see AUHostNode.swift's and AUCatalog.swift's
+	     doc comments): any installed aufx/aumf component runs with Loopbacker's own
+	     entitlements once instantiated by AUHostNode.load, which only happens when the user
+	     picks a plugin or a persisted chain loads one, never during the effect browser's
+	     catalog scan, which only reads AVAudioUnitComponent metadata. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<!-- Mic capture under the hardened runtime. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- REAPER JSFX effects JIT-compile their EEL2 scripts. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+</dict>
+</plist>

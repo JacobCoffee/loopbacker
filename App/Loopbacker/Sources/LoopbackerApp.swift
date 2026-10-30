@@ -10,6 +10,17 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardState: SoundboardState
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
+    @StateObject private var fxEngine: FXEngine
+    // Persists a hosted plugin editor's state on close independent of whether EffectsView is
+    // in the view hierarchy (UX slice, [ReviewUX] LB-PLUGIN-STATE-001-equivalent finding).
+    @StateObject private var hostedPluginStateCapture: HostedPluginStateCapture
+    // Mute/push-to-talk state (Control slice); the global hotkey and muted overlay are wired
+    // from `init()` so they work even if the main window never opens.
+    @StateObject private var micControl: MicControl
+    // App-based effects preset auto-switch (Control slice, #20): rules + the live NSWorkspace
+    // watcher, both needed for the whole app's lifetime like `routingSync` below.
+    @StateObject private var presetAutoSwitchState: PresetAutoSwitchState
+    @StateObject private var presetAutoSwitcher: PresetAutoSwitcher
     @StateObject private var appUpdater: AppUpdater
     @StateObject private var automationRulesState: AutomationRulesState
     // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
@@ -27,6 +38,9 @@ struct LoopbackerApp: App {
         let audioDeviceManager = AudioDeviceManager()
         let audioRouter = AudioRouter()
         let appCaptureService = AppCaptureService()
+        let systemAudioTap = SystemAudioTap()
+        let micControl = MicControl()
+        let presetAutoSwitchState = PresetAutoSwitchState.load()
         let automationRulesState = AutomationRulesState.load()
         let sceneLoader = SceneLoader(
             routingState: routingState, audioRouter: audioRouter,
@@ -39,6 +53,16 @@ struct LoopbackerApp: App {
         _soundboardState = StateObject(wrappedValue: SoundboardState.load())
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
+        let fxEngine = FXEngine(audioRouter: audioRouter)
+        _fxEngine = StateObject(wrappedValue: fxEngine)
+        _hostedPluginStateCapture = StateObject(wrappedValue: HostedPluginStateCapture(
+            fxEngine: fxEngine, routingState: routingState
+        ))
+        _micControl = StateObject(wrappedValue: micControl)
+        _presetAutoSwitchState = StateObject(wrappedValue: presetAutoSwitchState)
+        _presetAutoSwitcher = StateObject(wrappedValue: PresetAutoSwitcher(
+            rulesState: presetAutoSwitchState, routingState: routingState
+        ))
         _appUpdater = StateObject(wrappedValue: AppUpdater.shared)
         _automationRulesState = StateObject(wrappedValue: automationRulesState)
         _sceneLoader = StateObject(wrappedValue: sceneLoader)
@@ -46,8 +70,12 @@ struct LoopbackerApp: App {
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
             audioRouter: audioRouter,
-            appCaptureService: appCaptureService
+            appCaptureService: appCaptureService,
+            systemAudioTap: systemAudioTap
         ))
+        ControlCenter.shared.configure(micControl: micControl, routingState: routingState, audioRouter: audioRouter)
+        micControl.refreshHotkeyRegistration()
+        MutedOverlayController.shared.start(micControl: micControl)
         _automationRulesEngine = StateObject(wrappedValue: AutomationRulesEngine(
             rulesState: automationRulesState,
             sceneLoader: sceneLoader,
@@ -72,6 +100,12 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardState)
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
+                .environmentObject(fxEngine)
+                .environmentObject(hostedPluginStateCapture)
+                .environmentObject(routingSync.systemAudioTap)
+                .environmentObject(micControl)
+                .environmentObject(presetAutoSwitchState)
+                .environmentObject(presetAutoSwitcher)
                 .environmentObject(appUpdater)
                 .environmentObject(automationRulesState)
                 .environmentObject(automationRulesEngine)
@@ -96,12 +130,22 @@ struct LoopbackerApp: App {
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
                 .environmentObject(appCaptureService)
+                .environmentObject(fxEngine)
+                .environmentObject(routingSync.systemAudioTap)
+                .environmentObject(micControl)
                 .environmentObject(appUpdater)
                 .environment(audioRouter.meters)
         } label: {
-            Image(systemName: "waveform.path")
+            Image(systemName: micControl.isMuted ? "mic.slash" : "waveform.path")
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsRootView()
+                .environmentObject(micControl)
+                .environmentObject(presetAutoSwitchState)
+                .environmentObject(presetAutoSwitcher)
+        }
     }
 }
 
@@ -196,8 +240,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// `loopbacker://` URL scheme commands (mute, preset, scene, effects — see
+    /// `LoopbackerURLCommand`). Delivered here at the `NSApplication` level, not via SwiftUI's
+    /// `.onOpenURL`, so it works even when the main window is closed: Loopbacker is a menu-bar
+    /// app whose window often isn't open.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        URLCommandRouter.handle(urls)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+
+    /// LB-HOST-002: a clean termination proves no hosted node crashed this session, even one
+    /// still loaded and live right up to quit (its `QuarantineWitnessNode` may not `deinit`
+    /// before the process actually exits).
+    func applicationWillTerminate(_ notification: Notification) {
+        HostedPluginQuarantine.shared.clearSessionSentinels()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

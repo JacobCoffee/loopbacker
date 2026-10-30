@@ -46,31 +46,55 @@ struct RoutingMatrixView: View {
 
     @FocusState private var focusedCell: CellCoordinate?
     @Environment(\.colorSchemeContrast) private var contrast
+    /// Which virtual device's channels are the columns. Only selectable while Stream Mix is
+    /// shown; otherwise the matrix always edits the virtual mic.
+    @State private var selectedTarget: RouteTarget = .virtualMic
+
+    private var target: RouteTarget {
+        routingState.streamMixEnabled ? selectedTarget : .virtualMic
+    }
 
     private var model: RoutingMatrixModel {
-        RoutingMatrixModel(sources: routingState.sources, outputChannels: routingState.outputChannels, routes: routingState.routes)
+        RoutingMatrixModel(
+            sources: routingState.sources,
+            outputChannels: target == .virtualMic ? routingState.outputChannels : routingState.streamOutputChannels,
+            routes: routingState.routes,
+            target: target
+        )
     }
 
     var body: some View {
         let model = self.model
-        Group {
-            if model.rows.isEmpty {
-                EmptyStateView(
-                    title: "No Sources",
-                    message: "Add a source from the toolbar to route it here",
-                    symbol: "grid"
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.columns.isEmpty {
-                EmptyStateView(
-                    title: "No Output Channels",
-                    message: "The virtual mic has no channels to route to",
-                    symbol: "grid"
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                matrix(model)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            if routingState.streamMixEnabled {
+                Picker("Target", selection: $selectedTarget) {
+                    Text("Virtual Mic").tag(RouteTarget.virtualMic)
+                    Text("Stream Mix").tag(RouteTarget.streamMix)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+            }
+            Group {
+                if model.rows.isEmpty {
+                    EmptyStateView(
+                        title: "No Sources",
+                        message: "Add a source from the toolbar to route it here",
+                        symbol: "grid"
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.columns.isEmpty {
+                    EmptyStateView(
+                        title: "No Output Channels",
+                        message: target == .virtualMic
+                            ? "The virtual mic has no channels to route to"
+                            : "Stream Mix has no channels to route to",
+                        symbol: "grid"
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    matrix(model)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
             }
         }
         .padding(Metrics.canvasMargin)
@@ -180,12 +204,13 @@ struct RoutingMatrixView: View {
     /// sync exactly like cable-drawn ones.
     private func apply(_ action: RoutingMatrixModel.CellAction) {
         switch action {
-        case .connect(let sourceId, let sourceChannelId, let outputChannelId):
-            routingState.addRoute(sourceId: sourceId, sourceChannelId: sourceChannelId, outputChannelId: outputChannelId)
-        case .disconnect(let sourceId, let sourceChannelId, let outputChannelId):
+        case .connect(let sourceId, let sourceChannelId, let target, let outputChannelId):
+            routingState.addRoute(sourceId: sourceId, sourceChannelId: sourceChannelId, targetId: target,
+                                  outputChannelId: outputChannelId)
+        case .disconnect(let sourceId, let sourceChannelId, let target, let outputChannelId):
             routingState.removeRouteBetween(
                 from: .source(sourceId: sourceId, channelId: sourceChannelId),
-                to: .output(channelId: outputChannelId)
+                to: .output(target: target, channelId: outputChannelId)
             )
         }
     }

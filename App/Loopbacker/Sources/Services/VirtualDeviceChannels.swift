@@ -7,8 +7,11 @@ import Foundation
 enum VirtualDeviceChannels {
     /// `kLoopbackerDevicePropertyChannelCount` in Driver/src/LoopbackerTypes.h.
     static let selector: AudioObjectPropertySelector = 0x6C62_6368 // 'lbch'
-    /// The virtual mic every source routes into.
+    /// The virtual mic every source routes into by default.
     static let micUID = "LoopbackerDevice_UID"
+    /// The second virtual mic ("Stream Mix"), hidden until the user enables it in the routing
+    /// canvas. Same channel-count property, same driver-side mic/speaker terminal types.
+    static let streamUID = "LoopbackerDevice_UID_Stream"
     static let supportedCounts: [Int] = Array(stride(from: 2, through: 16, by: 2))
     static let maxCount = 16
 

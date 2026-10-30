@@ -19,8 +19,8 @@ struct ChannelStripView: View {
     enum StripSide {
         /// Connector port on the right; meter reads the source's route key (`AudioSource.deviceUID`).
         case source(meterKey: String)
-        /// Connector port on the left; meter reads the virtual mic's post-mix level.
-        case output
+        /// Connector port on the left; meter reads the given target device's post-mix level.
+        case output(target: RouteTarget)
     }
 
     private var isSourceSide: Bool {
@@ -32,8 +32,8 @@ struct ChannelStripView: View {
         switch connectorEnd {
         case .source(let sid, let ch):
             return routingState.routes.contains { $0.sourceId == sid && $0.sourceChannelId == ch }
-        case .output(let ch):
-            return routingState.routes.contains { $0.outputChannelId == ch }
+        case .output(let target, let ch):
+            return routingState.routes.contains { $0.targetId == target && $0.outputChannelId == ch }
         }
     }
 
@@ -132,7 +132,7 @@ struct ChannelStripView: View {
     private func currentLevel() -> Float {
         switch side {
         case .source(let key): return meters.level(source: key, channel: channel.id)
-        case .output: return meters.output(channel: channel.id)
+        case .output(let target): return meters.output(target: target.deviceUID, channel: channel.id)
         }
     }
 
@@ -143,13 +143,18 @@ struct ChannelStripView: View {
         let label: String
     }
 
-    /// Every opposite-side port this connector could reach: output channels for a source port,
-    /// or every source's channels for an output port.
+    /// Every opposite-side port this connector could reach: output channels (virtual mic, plus
+    /// Stream Mix while it's shown) for a source port, or every source's channels for an output
+    /// port.
     private var oppositeEnds: [ConnectorTarget] {
         switch connectorEnd {
         case .source:
-            return routingState.outputChannels.map {
-                ConnectorTarget(end: .output(channelId: $0.id), label: "Channel \($0.label)")
+            let micEnds = routingState.outputChannels.map {
+                ConnectorTarget(end: .output(target: .virtualMic, channelId: $0.id), label: "Channel \($0.label)")
+            }
+            guard routingState.streamMixEnabled else { return micEnds }
+            return micEnds + routingState.streamOutputChannels.map {
+                ConnectorTarget(end: .output(target: .streamMix, channelId: $0.id), label: "Stream Mix channel \($0.label)")
             }
         case .output:
             return routingState.sources.flatMap { source in
@@ -182,10 +187,10 @@ struct ChannelStripView: View {
 
     private func connect(to target: ConnectorEnd) {
         switch (connectorEnd, target) {
-        case (.source(let sid, let sch), .output(let och)):
-            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och) }
-        case (.output(let och), .source(let sid, let sch)):
-            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och) }
+        case (.source(let sid, let sch), .output(let target, let och)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och) }
+        case (.output(let target, let och), .source(let sid, let sch)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och) }
         default:
             break
         }
@@ -225,7 +230,7 @@ private struct ChannelLevelMeter: View {
             guard isLive else { return 0 }
             switch side {
             case .source(let key): return meters.level(source: key, channel: channel)
-            case .output: return meters.output(channel: channel)
+            case .output(let target): return meters.output(target: target.deviceUID, channel: channel)
             }
         }
     }

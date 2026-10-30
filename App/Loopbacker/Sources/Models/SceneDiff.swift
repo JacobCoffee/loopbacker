@@ -5,17 +5,27 @@ import Foundation
 /// value type so scene loading can diff two configs without touching the engine, and so the
 /// diff logic is unit-testable without a live router.
 struct RoutingDesiredState: Equatable {
-    /// One audio route that should be running, keyed the same way `AudioRouter` keys its
-    /// internal `activeRoutes` dictionary (`deviceUID` for a device source, `"app:<bundleID>"`
-    /// for an app capture source).
+    /// Identifies one running route the way `AudioRouter` keys its `activeRoutes`: a source key
+    /// (`deviceUID` for a device source, `"app:<bundleID>"` for an app capture) plus the virtual
+    /// device it feeds. One source can feed the virtual mic and Stream Mix independently.
+    struct RouteID: Hashable {
+        let source: String
+        let target: RouteTarget
+    }
+
+    /// One audio route that should be running.
     struct ActiveRoute: Equatable {
+        /// Source key, as passed to `AudioRouter.setChannelMix(sourceDeviceUID:)`.
         let key: String
+        let target: RouteTarget
         let isAppCapture: Bool
         let bundleID: String
         let deviceUID: String
         /// Source-channel -> output-channel pairs, in canonical order so equality isn't
         /// sensitive to the order routes were added in.
         let mix: [MixEntry]
+
+        var id: RouteID { RouteID(source: key, target: target) }
     }
 
     struct MixEntry: Equatable, Hashable {
@@ -23,15 +33,15 @@ struct RoutingDesiredState: Equatable {
         let outputChannel: Int
     }
 
-    /// Active routes keyed by `ActiveRoute.key`.
-    var routes: [String: ActiveRoute] = [:]
+    /// Active routes keyed by source and target.
+    var routes: [RouteID: ActiveRoute] = [:]
     /// Device source UID -> monitor output device UID, for every enabled, unmuted device
     /// source with a monitor configured.
     var monitors: [String: String] = [:]
     /// Output destinations that should be routing, keyed by `virtualDeviceUID`.
     var outputs: [String: OutputDestination] = [:]
-    /// Virtual device UID -> channel count the driver should expose (the mic plus every output
-    /// destination device).
+    /// Virtual device UID -> channel count the driver should expose (the mic, Stream Mix, and
+    /// every output destination device).
     var deviceChannelCounts: [String: Int] = [:]
 
     /// Clamps a route's source channel to a device's real channel count, so a route built for
@@ -46,20 +56,20 @@ struct RoutingDesiredState: Equatable {
     }
 
     /// The channel mix matrix `RoutingSync.syncAudioRouting` should push for one source's
-    /// routes, right now -- `devices` must be the just-emitted inventory from the
+    /// routes into `target`, right now -- `devices` must be the just-emitted inventory from the
     /// `$systemDevices` sink (or any other freshly known inventory), never a re-read of
     /// `AudioDeviceManager.systemDevices`: `@Published` sends on `willSet`, so inside that sink
     /// the stored property is still the OLD inventory and wouldn't contain a device that only
     /// just connected, silently skipping the clamp in `clampedChannel` for it.
     static func mixRoutes(
-        for source: AudioSource, routes: [AudioRoute], devices: [SystemAudioDevice]
+        for source: AudioSource, target: RouteTarget, routes: [AudioRoute], devices: [SystemAudioDevice]
     ) -> [(srcCh: Int, dstCh: Int)] {
         let inputDeviceChannelCounts = Dictionary(
             devices.map { ($0.uid, $0.inputChannelCount) }, uniquingKeysWith: { a, _ in a }
         )
         let deviceChannelCount = source.isAppCapture ? nil : inputDeviceChannelCounts[source.deviceUID]
         return routes
-            .filter { $0.sourceId == source.id }
+            .filter { $0.sourceId == source.id && $0.targetId == target }
             .map { (srcCh: clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount), dstCh: $0.outputChannelId) }
     }
 
@@ -71,27 +81,33 @@ struct RoutingDesiredState: Equatable {
         var state = RoutingDesiredState()
 
         for source in config.sources {
-            let sourceRoutes = config.routes.filter { $0.sourceId == source.id }
-            let shouldRoute = source.isEnabled && !source.isMuted && !sourceRoutes.isEmpty
+            let eligible = source.isEnabled && !source.isMuted
                 && (source.isAppCapture ? !source.appBundleID.isEmpty : !source.deviceUID.isEmpty)
-            guard shouldRoute else { continue }
+            guard eligible else { continue }
 
             let key = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
             let deviceChannelCount = source.isAppCapture ? nil : inputDeviceChannelCounts[source.deviceUID]
-            let mix = sourceRoutes
-                .map {
-                    MixEntry(
-                        sourceChannel: clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount),
-                        outputChannel: $0.outputChannelId
-                    )
-                }
-                .sorted { ($0.sourceChannel, $0.outputChannel) < ($1.sourceChannel, $1.outputChannel) }
-            state.routes[key] = ActiveRoute(
-                key: key, isAppCapture: source.isAppCapture, bundleID: source.appBundleID,
-                deviceUID: source.deviceUID, mix: mix
-            )
+            var routedAnywhere = false
+            for target in RouteTarget.allCases {
+                let targetRoutes = config.routes.filter { $0.sourceId == source.id && $0.targetId == target }
+                guard !targetRoutes.isEmpty else { continue }
+                routedAnywhere = true
+                let mix = targetRoutes
+                    .map {
+                        MixEntry(
+                            sourceChannel: clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount),
+                            outputChannel: $0.outputChannelId
+                        )
+                    }
+                    .sorted { ($0.sourceChannel, $0.outputChannel) < ($1.sourceChannel, $1.outputChannel) }
+                let route = ActiveRoute(
+                    key: key, target: target, isAppCapture: source.isAppCapture, bundleID: source.appBundleID,
+                    deviceUID: source.deviceUID, mix: mix
+                )
+                state.routes[route.id] = route
+            }
 
-            if !source.isAppCapture && !source.monitorOutputUID.isEmpty {
+            if routedAnywhere && !source.isAppCapture && !source.monitorOutputUID.isEmpty {
                 state.monitors[source.deviceUID] = source.monitorOutputUID
             }
         }
@@ -103,6 +119,8 @@ struct RoutingDesiredState: Equatable {
 
         state.deviceChannelCounts[VirtualDeviceChannels.micUID] =
             VirtualDeviceChannels.deviceCount(forChannels: config.outputChannels.count)
+        state.deviceChannelCounts[VirtualDeviceChannels.streamUID] =
+            VirtualDeviceChannels.deviceCount(forChannels: config.streamOutputChannels.count)
 
         return state
     }
@@ -114,11 +132,12 @@ struct RoutingDesiredState: Equatable {
 struct SceneDiff: Equatable {
     struct Retarget: Equatable {
         let key: String
+        let target: RouteTarget
         let mix: [RoutingDesiredState.MixEntry]
     }
 
     var routesToStart: [RoutingDesiredState.ActiveRoute] = []
-    var routesToStop: [String] = []
+    var routesToStop: [RoutingDesiredState.RouteID] = []
     var routesToRetarget: [Retarget] = []
     var monitorsToStart: [(sourceDeviceUID: String, outputDeviceUID: String)] = []
     var monitorsToStop: [String] = []
@@ -145,17 +164,17 @@ struct SceneDiff: Equatable {
     static func diff(from old: RoutingDesiredState, to new: RoutingDesiredState) -> SceneDiff {
         var result = SceneDiff()
 
-        for (key, route) in new.routes {
-            guard let existing = old.routes[key] else {
+        for (id, route) in new.routes {
+            guard let existing = old.routes[id] else {
                 result.routesToStart.append(route)
                 continue
             }
             if existing.mix != route.mix {
-                result.routesToRetarget.append(Retarget(key: key, mix: route.mix))
+                result.routesToRetarget.append(Retarget(key: id.source, target: id.target, mix: route.mix))
             }
         }
-        for key in old.routes.keys where new.routes[key] == nil {
-            result.routesToStop.append(key)
+        for id in old.routes.keys where new.routes[id] == nil {
+            result.routesToStop.append(id)
         }
 
         for (deviceUID, outputUID) in new.monitors where old.monitors[deviceUID] != outputUID {

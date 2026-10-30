@@ -157,11 +157,7 @@ struct SoundboardItem: Identifiable, Codable, Equatable {
 class SoundboardState: ObservableObject {
     @Published var items: [SoundboardItem] = []
 
-    nonisolated private static let configURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-        return dir.appendingPathComponent("soundboard.json")
-    }()
+    nonisolated private static let configURL: URL = AppDataDirectory.url.appendingPathComponent("soundboard.json")
 
     private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.soundboard.save", qos: .utility)
 
@@ -194,9 +190,7 @@ class SoundboardState: ObservableObject {
     }
 
     private static let soundsDirectoryURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("sounds", isDirectory: true)
+        let dir = AppDataDirectory.url.appendingPathComponent("sounds", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()

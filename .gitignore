@@ -36,3 +36,6 @@ DerivedData/
 .vscode/
 *.swp
 *~
+
+# Vendored abseil keeps headers in internal/ directories; never let a global ignore drop them.
+!App/Loopbacker/CWebRTCAEC/**/internal/

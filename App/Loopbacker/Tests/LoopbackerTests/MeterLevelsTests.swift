@@ -7,10 +7,24 @@ struct MeterLevelsTests {
     @Test("Output meters fall as well as rise")
     func outputsFollowLevel() {
         let meters = MeterLevels()
-        meters.updateOutputs([1: 0.8, 2: 0.5])
-        meters.updateOutputs([1: 0.2, 2: 0])
-        #expect(abs(meters.output(channel: 1) - 0.2) < 1 / 256)
-        #expect(meters.output(channel: 2) == 0)
+        meters.updateOutputs(target: "mic", [1: 0.8, 2: 0.5])
+        meters.updateOutputs(target: "mic", [1: 0.2, 2: 0])
+        #expect(abs(meters.output(target: "mic", channel: 1) - 0.2) < 1 / 256)
+        #expect(meters.output(target: "mic", channel: 2) == 0)
+    }
+
+    @Test("Two targets' output meters never bleed into each other")
+    func outputsAreIsolatedPerTarget() {
+        let meters = MeterLevels()
+        meters.updateOutputs(target: "mic", [1: 0.9])
+        meters.updateOutputs(target: "stream", [1: 0.1])
+        #expect(abs(meters.output(target: "mic", channel: 1) - 0.9) < 1 / 256)
+        #expect(abs(meters.output(target: "stream", channel: 1) - 0.1) < 1 / 256)
+
+        meters.clearOutputs(target: "mic")
+        #expect(meters.output(target: "mic", channel: 1) == 0)
+        // Clearing one target leaves the other's levels intact.
+        #expect(abs(meters.output(target: "stream", channel: 1) - 0.1) < 1 / 256)
     }
 
     @Test("A source's peak is its loudest channel and falls with it")

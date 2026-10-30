@@ -2,17 +2,44 @@ import Foundation
 import SwiftUI
 import Combine
 
+/// Which Loopbacker virtual mic a route feeds. Routes saved before Stream Mix existed decode
+/// as `.virtualMic`.
+enum RouteTarget: String, Codable, Hashable, CaseIterable, Sendable {
+    case virtualMic
+    case streamMix
+
+    var deviceUID: String {
+        switch self {
+        case .virtualMic: return VirtualDeviceChannels.micUID
+        case .streamMix: return VirtualDeviceChannels.streamUID
+        }
+    }
+}
+
 struct AudioRoute: Identifiable, Equatable, Codable {
     let id: UUID
     var sourceId: UUID
     var sourceChannelId: Int
+    var targetId: RouteTarget
     var outputChannelId: Int
 
-    init(id: UUID = UUID(), sourceId: UUID, sourceChannelId: Int, outputChannelId: Int) {
+    init(id: UUID = UUID(), sourceId: UUID, sourceChannelId: Int, targetId: RouteTarget = .virtualMic,
+         outputChannelId: Int) {
         self.id = id
         self.sourceId = sourceId
         self.sourceChannelId = sourceChannelId
+        self.targetId = targetId
         self.outputChannelId = outputChannelId
+    }
+
+    // Backward-compatible decoding: routes saved before Stream Mix existed have no `targetId`.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        sourceId = try container.decode(UUID.self, forKey: .sourceId)
+        sourceChannelId = try container.decode(Int.self, forKey: .sourceChannelId)
+        outputChannelId = try container.decode(Int.self, forKey: .outputChannelId)
+        targetId = (try? container.decode(RouteTarget.self, forKey: .targetId)) ?? .virtualMic
     }
 }
 
@@ -20,7 +47,7 @@ struct AudioRoute: Identifiable, Equatable, Codable {
 
 enum ConnectorEnd: Equatable, Hashable {
     case source(sourceId: UUID, channelId: Int)
-    case output(channelId: Int)
+    case output(target: RouteTarget, channelId: Int)
 
     func hash(into hasher: inout Hasher) {
         switch self {
@@ -28,8 +55,9 @@ enum ConnectorEnd: Equatable, Hashable {
             hasher.combine(0)
             hasher.combine(sid)
             hasher.combine(ch)
-        case .output(let ch):
+        case .output(let target, let ch):
             hasher.combine(1)
+            hasher.combine(target)
             hasher.combine(ch)
         }
     }
@@ -40,16 +68,21 @@ enum ConnectorEnd: Equatable, Hashable {
 struct RoutingConfig: Codable {
     var sources: [AudioSource]
     var outputChannels: [AudioChannel]
+    var streamOutputChannels: [AudioChannel]
+    var streamMixEnabled: Bool
     var routes: [AudioRoute]
     var outputDestinations: [OutputDestination]
     var effectsPreset: EffectsPreset
     var noiseSuppression: NoiseSuppressionSettings
 
-    init(sources: [AudioSource], outputChannels: [AudioChannel], routes: [AudioRoute],
+    init(sources: [AudioSource], outputChannels: [AudioChannel], streamOutputChannels: [AudioChannel] = [],
+         streamMixEnabled: Bool = false, routes: [AudioRoute],
          outputDestinations: [OutputDestination] = [], effectsPreset: EffectsPreset = EffectsPreset(),
          noiseSuppression: NoiseSuppressionSettings = NoiseSuppressionSettings()) {
         self.sources = sources
         self.outputChannels = outputChannels
+        self.streamOutputChannels = streamOutputChannels
+        self.streamMixEnabled = streamMixEnabled
         self.routes = routes
         self.outputDestinations = outputDestinations
         self.effectsPreset = effectsPreset
@@ -61,6 +94,8 @@ struct RoutingConfig: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sources = try container.decode([AudioSource].self, forKey: .sources)
         outputChannels = try container.decode([AudioChannel].self, forKey: .outputChannels)
+        streamOutputChannels = (try? container.decode([AudioChannel].self, forKey: .streamOutputChannels)) ?? []
+        streamMixEnabled = (try? container.decode(Bool.self, forKey: .streamMixEnabled)) ?? false
         routes = try container.decode([AudioRoute].self, forKey: .routes)
         outputDestinations = (try? container.decode([OutputDestination].self, forKey: .outputDestinations)) ?? []
         effectsPreset = (try? container.decode(EffectsPreset.self, forKey: .effectsPreset)) ?? EffectsPreset()
@@ -74,6 +109,12 @@ struct RoutingConfig: Codable {
 class RoutingState: ObservableObject {
     @Published var sources: [AudioSource]
     @Published var outputChannels: [AudioChannel]
+    /// Stream Mix's own channel pairs, independent of the virtual mic's. Empty until the user
+    /// first enables Stream Mix (`setStreamMixEnabled(true)`), which seeds a default pair.
+    @Published var streamOutputChannels: [AudioChannel]
+    /// Whether the Stream Mix column is shown in the routing canvas. Off by default so existing
+    /// users see no change; routes into Stream Mix are kept (just hidden) while this is false.
+    @Published var streamMixEnabled: Bool
     @Published var routes: [AudioRoute]
     @Published var outputDestinations: [OutputDestination]
     @Published var effectsPreset: EffectsPreset
@@ -100,6 +141,8 @@ class RoutingState: ObservableObject {
     init(
         sources: [AudioSource] = [],
         outputChannels: [AudioChannel] = [],
+        streamOutputChannels: [AudioChannel] = [],
+        streamMixEnabled: Bool = false,
         routes: [AudioRoute] = [],
         outputDestinations: [OutputDestination] = [],
         effectsPreset: EffectsPreset = EffectsPreset(),
@@ -108,6 +151,8 @@ class RoutingState: ObservableObject {
     ) {
         self.sources = sources
         self.outputChannels = outputChannels
+        self.streamOutputChannels = streamOutputChannels
+        self.streamMixEnabled = streamMixEnabled
         self.routes = routes
         self.outputDestinations = outputDestinations
         self.effectsPreset = effectsPreset
@@ -117,14 +162,16 @@ class RoutingState: ObservableObject {
 
     // MARK: - Route management
 
-    func addRoute(sourceId: UUID, sourceChannelId: Int, outputChannelId: Int) {
+    func addRoute(sourceId: UUID, sourceChannelId: Int, targetId: RouteTarget = .virtualMic, outputChannelId: Int) {
         let exists = routes.contains {
             $0.sourceId == sourceId &&
             $0.sourceChannelId == sourceChannelId &&
+            $0.targetId == targetId &&
             $0.outputChannelId == outputChannelId
         }
         guard !exists else { return }
-        let route = AudioRoute(sourceId: sourceId, sourceChannelId: sourceChannelId, outputChannelId: outputChannelId)
+        let route = AudioRoute(sourceId: sourceId, sourceChannelId: sourceChannelId, targetId: targetId,
+                               outputChannelId: outputChannelId)
         routes.append(route)
         save()
     }
@@ -138,8 +185,8 @@ class RoutingState: ObservableObject {
         switch connector {
         case .source(let sid, let ch):
             routes.removeAll { $0.sourceId == sid && $0.sourceChannelId == ch }
-        case .output(let ch):
-            routes.removeAll { $0.outputChannelId == ch }
+        case .output(let target, let ch):
+            routes.removeAll { $0.targetId == target && $0.outputChannelId == ch }
         }
         save()
     }
@@ -152,8 +199,8 @@ class RoutingState: ObservableObject {
         default: return nil
         }
         guard case .source(let sid, let sch) = src,
-              case .output(let och) = out else { return nil }
-        return routes.first { $0.sourceId == sid && $0.sourceChannelId == sch && $0.outputChannelId == och }
+              case .output(let target, let och) = out else { return nil }
+        return routes.first { $0.sourceId == sid && $0.sourceChannelId == sch && $0.targetId == target && $0.outputChannelId == och }
     }
 
     func removeRouteBetween(from a: ConnectorEnd, to b: ConnectorEnd) {
@@ -201,7 +248,7 @@ class RoutingState: ObservableObject {
 
     func removeOutputChannel(_ channelId: Int) {
         outputChannels.removeAll { $0.id == channelId }
-        routes.removeAll { $0.outputChannelId == channelId }
+        routes.removeAll { $0.targetId == .virtualMic && $0.outputChannelId == channelId }
         save()
     }
 
@@ -221,7 +268,50 @@ class RoutingState: ObservableObject {
         let target = max(2, (outputChannels.count - 1) / 2 * 2)
         let doomed = outputChannels.sorted { $0.id < $1.id }.dropFirst(target).map(\.id)
         outputChannels.removeAll { doomed.contains($0.id) }
-        routes.removeAll { doomed.contains($0.outputChannelId) }
+        routes.removeAll { $0.targetId == .virtualMic && doomed.contains($0.outputChannelId) }
+        save()
+    }
+
+    // MARK: - Stream Mix channel management (same model as the virtual mic, separate channel space)
+
+    /// Shows the Stream Mix column, seeding a default stereo pair the first time it's enabled.
+    /// Disabling keeps its channels and routes (just hidden) so re-enabling restores them.
+    func setStreamMixEnabled(_ enabled: Bool) {
+        streamMixEnabled = enabled
+        if enabled && streamOutputChannels.isEmpty {
+            streamOutputChannels = [AudioChannel(id: 1, label: "1 (L)"), AudioChannel(id: 2, label: "2 (R)")]
+        }
+        save()
+    }
+
+    func addStreamOutputChannel() {
+        let nextId = (streamOutputChannels.map(\.id).max() ?? 0) + 1
+        let label = nextId % 2 == 1 ? "\(nextId) (L)" : "\(nextId) (R)"
+        streamOutputChannels.append(AudioChannel(id: nextId, label: label))
+        save()
+    }
+
+    func removeStreamOutputChannel(_ channelId: Int) {
+        streamOutputChannels.removeAll { $0.id == channelId }
+        routes.removeAll { $0.targetId == .streamMix && $0.outputChannelId == channelId }
+        save()
+    }
+
+    /// Channels the Stream Mix device should expose: its channels rounded up to a pair.
+    var streamMicChannelCount: Int {
+        VirtualDeviceChannels.deviceCount(forChannels: streamOutputChannels.count)
+    }
+
+    func addStreamOutputChannelPair() {
+        let target = min(VirtualDeviceChannels.maxCount, (streamOutputChannels.count / 2 + 1) * 2)
+        while streamOutputChannels.count < target { addStreamOutputChannel() }
+    }
+
+    func removeLastStreamOutputChannelPair() {
+        let target = max(2, (streamOutputChannels.count - 1) / 2 * 2)
+        let doomed = streamOutputChannels.sorted { $0.id < $1.id }.dropFirst(target).map(\.id)
+        streamOutputChannels.removeAll { doomed.contains($0.id) }
+        routes.removeAll { $0.targetId == .streamMix && doomed.contains($0.outputChannelId) }
         save()
     }
 
@@ -274,10 +364,10 @@ class RoutingState: ObservableObject {
 
         // Must be source -> output or output -> source
         switch (pending, connector) {
-        case (.source(let sid, let sch), .output(let och)):
-            addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och)
-        case (.output(let och), .source(let sid, let sch)):
-            addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och)
+        case (.source(let sid, let sch), .output(let target, let och)):
+            addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och)
+        case (.output(let target, let och), .source(let sid, let sch)):
+            addRoute(sourceId: sid, sourceChannelId: sch, targetId: target, outputChannelId: och)
         default:
             break // same side, ignore
         }
@@ -296,10 +386,7 @@ class RoutingState: ObservableObject {
 
     // MARK: - Persistence
 
-    static let defaultConfigDirectoryURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Loopbacker", isDirectory: true)
-    }()
+    static var defaultConfigDirectoryURL: URL { AppDataDirectory.url }
 
     private var configFileURL: URL {
         persistenceDirectory.appendingPathComponent("config.json")
@@ -315,6 +402,8 @@ class RoutingState: ObservableObject {
         RoutingConfig(
             sources: sources,
             outputChannels: outputChannels,
+            streamOutputChannels: streamOutputChannels,
+            streamMixEnabled: streamMixEnabled,
             routes: routes,
             outputDestinations: outputDestinations,
             effectsPreset: effectsPreset,
@@ -350,6 +439,8 @@ class RoutingState: ObservableObject {
             return RoutingState(
                 sources: config.sources,
                 outputChannels: config.outputChannels,
+                streamOutputChannels: config.streamOutputChannels,
+                streamMixEnabled: config.streamMixEnabled,
                 routes: config.routes,
                 outputDestinations: config.outputDestinations,
                 effectsPreset: config.effectsPreset,
@@ -393,6 +484,8 @@ class RoutingState: ObservableObject {
         isReplacingConfig = true
         sources = config.sources
         outputChannels = config.outputChannels
+        streamOutputChannels = config.streamOutputChannels
+        streamMixEnabled = config.streamMixEnabled
         routes = config.routes
         outputDestinations = config.outputDestinations
         effectsPreset = config.effectsPreset
@@ -426,12 +519,8 @@ class RoutingState: ObservableObject {
 // MARK: - Preset Manager
 
 struct PresetManager {
-    private static let presetsDirectoryURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("presets", isDirectory: true)
-    }()
+    private static let presetsDirectoryURL: URL =
+        AppDataDirectory.url.appendingPathComponent("presets", isDirectory: true)
 
     /// Save a named preset from the given data.
     static func save(name: String, data: Data) {

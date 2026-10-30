@@ -36,7 +36,9 @@ jobs:
           cd App/Loopbacker
           swift build -c release
 
+      # Release: the factory-preset matrix runs 51 voice-chain passes and is skipped in
+      # unoptimized builds. Swift's bounds and overflow checks stay on at -O.
       - name: Test Swift app
         run: |
           cd App/Loopbacker
-          swift test
+          swift test -c release

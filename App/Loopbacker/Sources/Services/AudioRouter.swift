@@ -18,7 +18,54 @@ private final class NoiseModelLoadState<Model: AnyObject & Sendable>: @unchecked
     var loadFailed = false
 }
 
-/// Routes audio from real input devices to the Loopbacker virtual output device,
+/// Identifies one running input/app-capture route: a source (device UID, or `"app:<bundle>"`)
+/// feeding one target virtual mic (`RouteTarget.deviceUID`). A source can run two routes at
+/// once — one to the virtual mic, one to Stream Mix — sharing voice processing (FX chain,
+/// noise suppressor) by `captureDeviceUID` (see `attachFXChain`/`applyNoiseSuppression`), each
+/// with its own `RouteContext` and mix matrix per the routing-target contract.
+private struct RouteKey: Hashable {
+    let source: String
+    let target: String
+}
+
+/// Identifies a set of voice routes that may safely share one echo canceller, noise
+/// suppressor, or FX chain instance: the same capture device, the same sample rate, and the
+/// same "voice pair" mix -- the gains feeding output channels 1-2, the only channels those
+/// stages ever read or write (see `AudioRouter.RouteContext.voicePairMixSignature`). Two
+/// routes on one capture device with different per-route mixes (e.g. input 1 patched into
+/// Virtual Mic's channels 1-2, input 2 patched into Stream Mix's channels 1-2) land in
+/// different groups and get separate instances, instead of one silently processing (or
+/// caching) the wrong route's signal for the other. Internal (not `private`/`fileprivate`) so
+/// its signature math is independently unit-testable without needing a real `RouteContext` or
+/// CoreAudio device.
+struct ProcessingGroupKey: Hashable, Comparable {
+    let captureDeviceUID: String
+    let sampleRate: Float64
+    let voicePairSignature: [UInt32]
+
+    /// The gains (as bit patterns, for exact equality) that a row-major `dst * inputChannels +
+    /// src` mix matrix (like `RouteContext.mixMatrix`) sends into output channels 1 and 2.
+    static func voicePairSignature(matrix: UnsafePointer<Float>, inputChannels: Int, outputChannels: Int) -> [UInt32] {
+        guard inputChannels > 0, outputChannels > 0 else { return [] }
+        let rows = min(2, outputChannels)
+        var signature = [UInt32](repeating: 0, count: rows * inputChannels)
+        for r in 0..<rows {
+            let row = matrix + r * inputChannels
+            for s in 0..<inputChannels { signature[r * inputChannels + s] = row[s].bitPattern }
+        }
+        return signature
+    }
+
+    /// Stable, deterministic ordering for `.sorted().first` (`AudioRouter.firstVoiceFXChain`'s
+    /// UI-facing "first active voice device" pick) -- not otherwise meaningful.
+    static func < (lhs: ProcessingGroupKey, rhs: ProcessingGroupKey) -> Bool {
+        if lhs.captureDeviceUID != rhs.captureDeviceUID { return lhs.captureDeviceUID < rhs.captureDeviceUID }
+        if lhs.sampleRate != rhs.sampleRate { return lhs.sampleRate < rhs.sampleRate }
+        return lhs.voicePairSignature.lexicographicallyPrecedes(rhs.voicePairSignature)
+    }
+}
+
+/// Routes audio from real input devices to the Loopbacker virtual output device(s),
 /// providing real-time meter levels back to the UI.
 class AudioRouter: ObservableObject, @unchecked Sendable {
     // MARK: - Published state
@@ -42,11 +89,35 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// opted out, or route stopped). Queue only.
     private let dpdfnetState = NoiseModelLoadState<NoiseSuppressionModel>()
     private let fastEnhancerState = NoiseModelLoadState<FastEnhancerModel>()
+    /// Echo cancellation's own global toggle lives on `noiseSuppression.echoCancellation`
+    /// (shared with noise suppression's push), so only the per-source opt-out and the far-end
+    /// reference need their own state here; read and written only on `queue`.
+    private var echoExcludedDevices: Set<String> = []
+    /// `SystemAudioTap.ring`, injected once by `RoutingSync` via `setEchoReference`. Exists as
+    /// soon as the tap object does (independent of whether the tap is running), so routes can
+    /// attach an `EchoCanceller` the moment echo cancellation turns on even if the tap itself
+    /// hasn't started producing real reference data yet.
+    private var echoReference: DriftCompensatedRing?
+    /// Echo cancellers currently attached to any voice route, mirrored for cross-thread reads
+    /// (`echoCancellationERLE()`, the live "echo removed" indicator), the same snapshot/lock
+    /// shape as `fxChainsByDevice`/`fxChainsSnapshot`.
+    private let echoCancellersLock = NSLock()
+    private var echoCancellersSnapshot: [EchoCanceller] = []
+    /// Queue only. Whether `installDefaultOutputChangeListenerIfNeeded` has already installed
+    /// its listener, so a default-output change recomputes attached cancellers' stream delay.
+    private var echoDefaultOutputListenerInstalled = false
 
     // MARK: - Internal state
 
-    private var activeRoutes: [String: RouteContext] = [:]
+    /// Keyed by (source, target) so one source can feed both the virtual mic and Stream Mix.
+    private var activeRoutes: [RouteKey: RouteContext] = [:]
     private var activeOutputRoutes: [String: RouteContext] = [:]
+    /// Voice chains keyed by processing group (capture device + sample rate + voice-pair mix
+    /// signature; see `ProcessingGroupKey`), mirrored into `fxChainsSnapshot` for cross-thread
+    /// reads (`FXEngine`). Queue only.
+    private var fxChainsByDevice: [ProcessingGroupKey: FXChain] = [:]
+    private let fxChainsLock = NSLock()
+    private var fxChainsSnapshot: [ProcessingGroupKey: FXChain] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
     private var meterTimer: Timer?
     /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
@@ -61,10 +132,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// for very wide interfaces).
     static let maxRouteChannels: UInt32 = 64
 
-    /// Per-source channel mix saved from the UI. Applied when the route is (re)started,
-    /// and pushed live to the running route via `mixMatrix` if it's already active.
-    /// Key = sourceDeviceUID (or "app:<bundle>" for app captures).
-    private var pendingMixMatrices: [String: [(srcCh: Int, dstCh: Int)]] = [:]
+    /// Per-source, per-target channel mix saved from the UI. Applied when the route is
+    /// (re)started, and pushed live to the running route via `mixMatrix` if it's already active.
+    private var pendingMixMatrices: [RouteKey: [(srcCh: Int, dstCh: Int)]] = [:]
 
     /// Holds the CoreAudio resources for a single source -> destination route.
     ///
@@ -74,8 +144,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// the compiler's checking.
     ///
     /// Signal path per block: capture `inputChannels` into `renderBuffer` → source meter →
-    /// mix matrix into `mixBuffer` (`outputChannels` wide) → noise suppression (voice routes,
-    /// channels 1–2) → effects (channels 1–2) → output meter → ring → playback.
+    /// mix matrix into `mixBuffer` (`outputChannels` wide) → echo cancellation (voice routes,
+    /// channels 1–2, against `SystemAudioTap`'s reference) → noise suppression (voice routes,
+    /// channels 1–2) → voice `FXChain` (voice routes) or `AppAudioProcessor` (app-capture
+    /// routes) → output meter → ring → playback.
     fileprivate final class RouteContext: @unchecked Sendable {
         var inputUnit: AudioComponentInstance?
         var outputUnit: AudioComponentInstance?
@@ -102,24 +174,45 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         private(set) var mixBuffer: UnsafeMutablePointer<Float>
         private(set) var blockFrames: UInt32 = 1024
 
-        // Audio effects chain (broadcast voice processing)
-        var effectsChain: AudioEffectsChain?
+        /// Voice-chain processor (mic → virtual mic / mic → Stream Mix / mic → monitor), shared
+        /// with every other voice route on the same capture device via `fxSlot`, published
+        /// unretained exactly like `noiseSlot`. `fxOwner` holds the strong reference.
+        let fxSlot = Atomic<Unmanaged<FXChain>?>(nil)
+        /// Queue only.
+        private(set) var fxOwner: FXChain?
+        /// App-capture routes only (game/music/browser): ducking + leveling. Never set on
+        /// voice-input or output routes.
+        let appAudioProcessor: AppAudioProcessor?
+        /// Voice routes only: the mix just before noise suppression (after echo cancellation,
+        /// which runs first), snapshotted each block for the chain's recorder.
+        private(set) var preNSBuffer: UnsafeMutablePointer<Float>?
 
-        /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these get
-        /// noise suppression: app captures carry music/game audio, and output routes replay the
-        /// already-processed virtual device.
+        /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these run
+        /// noise suppression and the voice `FXChain`: app captures carry music/game audio, and
+        /// output routes replay the already-processed virtual device.
         let isVoiceInput: Bool
+        /// App-capture routes (game/music/browser → a virtual mic). Gets `appAudioProcessor`
+        /// instead of the voice chain.
+        let isAppCapture: Bool
         /// Mic → monitor output (you hearing yourself). Queue only.
         var isMonitor = false
         /// The suppressor the audio thread runs, published unretained so `queue` can swap it
         /// without racing a release on the audio thread. `noiseOwner` holds the strong reference.
-        /// Shared with the other voice route on the same capture device (virtual mic + monitor),
-        /// which runs the same mix.
+        /// Shared with every other voice route on the same capture device (virtual mic, Stream
+        /// Mix, monitor), which all run the same dry mix.
         let noiseSlot = Atomic<Unmanaged<NoiseSuppressor>?>(nil)
         /// Queue only.
         private(set) var noiseOwner: NoiseSuppressor?
         /// Queue only: fading out ahead of `detachNoiseSuppressor`.
         var noiseDetaching = false
+        /// The canceller the audio thread runs, published unretained exactly like `noiseSlot`.
+        /// `echoOwner` holds the strong reference. Shared with the other voice route on the
+        /// same capture device, runs before noise suppression.
+        let echoSlot = Atomic<Unmanaged<EchoCanceller>?>(nil)
+        /// Queue only.
+        private(set) var echoOwner: EchoCanceller?
+        /// Queue only: fading out ahead of `detachEchoCanceller`.
+        var echoDetaching = false
 
         // Meter levels -- C buffers written on the RT thread, read and decayed on main.
         // Source levels are per captured channel; output levels are per playback channel.
@@ -131,9 +224,30 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// at worst produce one block with a half-applied matrix, which is inaudible.
         let mixMatrix: UnsafeMutablePointer<Float>
 
+        /// This route's own mute/push-to-talk ramp cursor (see `MicGate.RouteState`'s doc
+        /// comment for why it can't be the gate's single shared `currentGain`).
+        let micGateState = MicGate.RouteState()
+
+        /// Incremented by the IO thread at the very end of every `processCapturedBlock`, after
+        /// it's done touching `echoSlot`/`noiseSlot`/`fxSlot`. CoreAudio never calls one
+        /// device's IO proc reentrantly, so one full increment after a slot is cleared proves
+        /// any callback that raced the clear (loaded the old unretained pointer just before
+        /// it) has finished using it -- `fadeOutNoiseSuppressor`/`fadeOutEchoCanceller` poll
+        /// this instead of freeing a detached instance after a fixed deadline a stalled
+        /// callback could still be running past.
+        let ioGeneration = Atomic<UInt64>(0)
+
+        /// Queue only. The `ProcessingGroupKey` this context's `FXChain` was published into
+        /// `fxChainsByDevice` under, captured at attach time since `mixMatrix` (and so the
+        /// live key `processingGroupKey` would compute) can change afterwards via
+        /// `setChannelMix` without the FX chain being reattached (see `setChannelMix`'s doc
+        /// comment on that gap). `detachFXChain` uses this instead of recomputing, so it always
+        /// cleans up the dictionary entry this context actually occupies.
+        var fxGroupKey: ProcessingGroupKey?
+
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
-             sampleRate: Float64, isVoiceInput: Bool = false) {
+             sampleRate: Float64, isVoiceInput: Bool = false, isAppCapture: Bool = false) {
             self.captureDeviceUID = captureDeviceUID
             self.captureDeviceID = captureDeviceID
             self.playbackDeviceID = playbackDeviceID
@@ -142,6 +256,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.outputChannels = outputChannels
             self.sampleRate = sampleRate
             self.isVoiceInput = isVoiceInput
+            self.isAppCapture = isAppCapture
+            appAudioProcessor = isAppCapture ? AppAudioProcessor(sampleRate: Float(sampleRate)) : nil
 
             meterLevelsPtr = .allocate(capacity: Int(inputChannels))
             meterLevelsPtr.initialize(repeating: 0.0, count: Int(inputChannels))
@@ -159,8 +275,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             renderBuffer.initialize(repeating: 0.0, count: Int(blockFrames * inputChannels))
             mixBuffer = .allocate(capacity: Int(blockFrames * outputChannels))
             mixBuffer.initialize(repeating: 0.0, count: Int(blockFrames * outputChannels))
+            if isVoiceInput {
+                let n = Int(blockFrames * outputChannels)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
+                buf.initialize(repeating: 0.0, count: n)
+                preNSBuffer = buf
+            }
 
-            effectsChain = AudioEffectsChain(sampleRate: Float(sampleRate))
             setIdentityMix()
         }
 
@@ -170,6 +291,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             meterLevelsPtr.deallocate()
             outMeterLevelsPtr.deallocate()
             mixMatrix.deallocate()
+            preNSBuffer?.deallocate()
+        }
+
+        /// Queue only.
+        func attachFXChain(_ chain: FXChain) {
+            fxOwner = chain
+            fxSlot.store(.passUnretained(chain), ordering: .releasing)
+        }
+
+        /// Queue only. Unpublishes the chain and hands back the strong reference.
+        func detachFXChain() -> FXChain? {
+            fxSlot.store(nil, ordering: .releasing)
+            defer { fxOwner = nil }
+            return fxOwner
         }
 
         /// Queue only.
@@ -186,6 +321,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return noiseOwner
         }
 
+        /// Queue only.
+        func attachEchoCanceller(_ canceller: EchoCanceller) {
+            echoOwner = canceller
+            echoSlot.store(.passUnretained(canceller), ordering: .releasing)
+        }
+
+        /// Queue only. Unpublishes the canceller and hands back the strong reference: an audio
+        /// callback may still be inside it, so the caller must keep it alive a while longer.
+        func detachEchoCanceller() -> EchoCanceller? {
+            echoSlot.store(nil, ordering: .releasing)
+            defer { echoOwner = nil }
+            return echoOwner
+        }
+
         /// Grow the block buffers. Only call before the route's callbacks are running.
         func reserveBlockFrames(_ frames: UInt32) {
             guard frames > blockFrames else { return }
@@ -196,6 +345,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             renderBuffer.initialize(repeating: 0.0, count: Int(frames * inputChannels))
             mixBuffer = .allocate(capacity: Int(frames * outputChannels))
             mixBuffer.initialize(repeating: 0.0, count: Int(frames * outputChannels))
+            if isVoiceInput {
+                preNSBuffer?.deallocate()
+                let n = Int(frames * outputChannels)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
+                buf.initialize(repeating: 0.0, count: n)
+                preNSBuffer = buf
+            }
         }
 
         /// Passthrough: source channel N feeds output channel N for every shared index.
@@ -207,19 +363,60 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             }
         }
 
+        /// The gains (as bit patterns, for exact comparison) feeding output channels 1 and 2
+        /// from each input channel -- the only channels echo cancellation, noise suppression,
+        /// and the voice `FXChain` ever read or write. Two routes on the same capture device
+        /// with different values here (e.g. one patched input 1 into channels 1-2, the other
+        /// input 2) must not share any of those stages: sharing would run them on the wrong
+        /// source signal, or skip them for a route whose actual input they never saw. Queue
+        /// only (reads `mixMatrix`, which is only written on `queue`).
+        var voicePairMixSignature: [UInt32] {
+            ProcessingGroupKey.voicePairSignature(matrix: mixMatrix, inputChannels: Int(inputChannels),
+                                                  outputChannels: Int(outputChannels))
+        }
+
+        /// Queue only. This context's current sharing group for echo cancellation, noise
+        /// suppression, and the voice FX chain (see `AudioRouter.sameProcessingGroup`).
+        var processingGroupKey: ProcessingGroupKey {
+            ProcessingGroupKey(captureDeviceUID: captureDeviceUID, sampleRate: sampleRate,
+                               voicePairSignature: voicePairMixSignature)
+        }
+
         /// Run one captured block (already in `renderBuffer`) through the route and enqueue it.
         /// - Parameter sampleTime: the block's HAL input sample time, when the callback has one.
         func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
+            if let canceller = echoSlot.load(ordering: .acquiring) {
+                canceller._withUnsafeGuaranteedRef {
+                    $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
+                }
+            }
+            if let preNSBuffer {
+                memcpy(preNSBuffer, mixBuffer, Int(frames * outputChannels) * MemoryLayout<Float>.size)
+            }
             if let suppressor = noiseSlot.load(ordering: .acquiring) {
                 suppressor._withUnsafeGuaranteedRef {
                     $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
                 }
             }
-            effectsChain?.process(mixBuffer, frames: frames, channels: outputChannels)
+            if isVoiceInput, let chain = fxSlot.load(ordering: .acquiring) {
+                chain._withUnsafeGuaranteedRef {
+                    $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels),
+                              sampleTime: sampleTime, rawPreNS: preNSBuffer)
+                }
+            } else if let appAudioProcessor {
+                appAudioProcessor.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
+            }
+            // Mute/push-to-talk gate (Control slice): only the route that actually feeds the
+            // virtual mic, right after the FX chain -- never the monitor route (you hearing
+            // yourself should stay live even while the outgoing mic is muted).
+            if isVoiceInput, !isMonitor {
+                MicGate.shared.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), state: micGateState)
+            }
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
+            ioGeneration.add(1, ordering: .releasing)
         }
 
         func readFromRing(_ data: UnsafeMutablePointer<Float>, frames: UInt32) {
@@ -283,8 +480,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
         queue.async { [self] in
             let keys = Array(self.activeRoutes.keys)
-            for uid in keys {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             let outputKeys = Array(self.activeOutputRoutes.keys)
             for uid in outputKeys {
@@ -299,58 +496,61 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     func restartAllRoutes() {
         queue.async { [weak self] in
             guard let self else { return }
-            let uids = Array(self.activeRoutes.keys)
+            let pairs = self.activeRoutes.keys.map { (source: $0.source, target: $0.target) }
             let outputUIDs = Array(self.activeOutputRoutes.keys)
-            for uid in uids {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in self.activeRoutes.keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             for uid in outputUIDs {
                 self.stopOutputRoutingInternal(virtualDeviceUID: uid)
             }
             // Retry with bounded attempts instead of a fixed 0.5s delay.
             // The audio system may take a variable amount of time to settle after wake.
-            self.retryRoutingAfterWake(sourceUIDs: uids, attempt: 0, maxAttempts: 5)
+            self.retryRoutingAfterWake(pairs: pairs, attempt: 0, maxAttempts: 5)
         }
     }
 
     /// Retry starting routes after wake with bounded attempts at increasing intervals.
-    private func retryRoutingAfterWake(sourceUIDs: [String], attempt: Int, maxAttempts: Int) {
+    private func retryRoutingAfterWake(pairs: [(source: String, target: String)], attempt: Int, maxAttempts: Int) {
         // USB devices like MOTU M2 need more time to re-enumerate after wake
         let delay = Double(attempt + 1) * 0.5
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            var failedUIDs: [String] = []
-            for uid in sourceUIDs {
+            var failedPairs: [(source: String, target: String)] = []
+            for pair in pairs {
                 // Check if the device is available before trying to start
-                if self.findDeviceByUID(uid) != nil {
-                    self.startRouting(sourceDeviceUID: uid)
+                if self.findDeviceByUID(pair.source) != nil {
+                    self.startRouting(sourceDeviceUID: pair.source, targetDeviceUID: pair.target)
                 } else {
-                    failedUIDs.append(uid)
+                    failedPairs.append(pair)
                 }
             }
-            // Retry remaining UIDs if we haven't exhausted attempts
-            if !failedUIDs.isEmpty && attempt + 1 < maxAttempts {
-                logger.info("Wake retry \(attempt + 1)/\(maxAttempts): \(failedUIDs.count) device(s) not yet available")
-                self.retryRoutingAfterWake(sourceUIDs: failedUIDs, attempt: attempt + 1, maxAttempts: maxAttempts)
-            } else if !failedUIDs.isEmpty {
-                logger.warning("Wake retry exhausted: \(failedUIDs.count) device(s) still unavailable")
+            // Retry remaining pairs if we haven't exhausted attempts
+            if !failedPairs.isEmpty && attempt + 1 < maxAttempts {
+                logger.info("Wake retry \(attempt + 1)/\(maxAttempts): \(failedPairs.count) route(s) not yet available")
+                self.retryRoutingAfterWake(pairs: failedPairs, attempt: attempt + 1, maxAttempts: maxAttempts)
+            } else if !failedPairs.isEmpty {
+                logger.warning("Wake retry exhausted: \(failedPairs.count) route(s) still unavailable")
             }
         }
     }
 
     // MARK: - Public API (input routing)
 
-    /// Start routing audio from the given source device to the Loopbacker virtual device.
-    func startRouting(sourceDeviceUID: String) {
+    /// Start routing audio from the given source device to a Loopbacker virtual device.
+    /// `targetDeviceUID` defaults to the virtual mic; pass `VirtualDeviceChannels.streamUID`
+    /// for Stream Mix. The two targets run independent `RouteContext`s sharing voice
+    /// processing (see `attachFXChain`/`applyNoiseSuppression`).
+    func startRouting(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID) {
         queue.async { [weak self] in
-            self?.startRoutingInternal(sourceDeviceUID: sourceDeviceUID)
+            self?.startRoutingInternal(sourceDeviceUID: sourceDeviceUID, targetDeviceUID: targetDeviceUID)
         }
     }
 
-    /// Stop routing for a specific source device.
-    func stopRouting(sourceDeviceUID: String) {
+    /// Stop routing for a specific source device → target pair.
+    func stopRouting(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID) {
         queue.async { [weak self] in
-            self?.stopRoutingInternal(sourceDeviceUID: sourceDeviceUID)
+            self?.stopRoutingInternal(sourceKey: sourceDeviceUID, targetDeviceUID: targetDeviceUID)
         }
     }
 
@@ -359,8 +559,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             let keys = Array(self.activeRoutes.keys)
-            for uid in keys {
-                self.stopRoutingInternal(sourceDeviceUID: uid)
+            for key in keys {
+                self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
             }
             let outputKeys = Array(self.activeOutputRoutes.keys)
             for uid in outputKeys {
@@ -400,12 +600,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                                   inputChannels: inputChannels, outputChannels: 2, sampleRate: rate,
                                   isVoiceInput: true)
             ctx.isMonitor = true
-            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
-            self.applyNoiseSuppression(to: ctx)
-            // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
-            if let pending = self.pendingMixMatrices[sourceDeviceUID] {
+            // Monitor hears the same channel mix as the virtual mic route (e.g. mono mic
+            // fanned to L+R); the virtual mic is the monitor's reference target. Applied
+            // *before* attaching NS/AEC/FX below: those decide which processing group (see
+            // `ProcessingGroupKey`) this context joins from its mix, so attaching against the
+            // still-identity mix here would sibling-match (or dict-key) on the wrong signature.
+            if let pending = self.pendingMixMatrices[RouteKey(source: sourceDeviceUID, target: VirtualDeviceChannels.micUID)] {
                 self.applyMixToContext(ctx, routes: pending)
             }
+            self.attachFXChain(to: ctx)
+            self.applyNoiseSuppression(to: ctx)
+            self.applyEchoCancellation(to: ctx)
+            self.refreshEchoCancellersSnapshot()
             guard self.setupInputUnit(ctx) else { return }
             guard self.setupOutputUnit(ctx) else { self.teardownUnit(&ctx.inputUnit); return }
             if let u = ctx.inputUnit { AudioOutputUnitStart(u) }
@@ -423,10 +629,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Public API (virtual device channel count)
 
-    /// Resize a Loopbacker virtual device to `count` channels. Routes that play into or
-    /// capture from the device stop, the driver reconfigures it, and the same routes restart
-    /// at the new width. `completion` receives the count the device reports afterwards
-    /// (nil when its driver predates the channel-count property).
+    /// Resize a Loopbacker virtual device (the virtual mic, Stream Mix, or an output
+    /// destination) to `count` channels. Every route whose target is this device stops, the
+    /// driver reconfigures it, and the same routes restart at the new width. `completion`
+    /// receives the count the device reports afterwards (nil when its driver predates the
+    /// channel-count property).
     func setVirtualDeviceChannels(_ count: Int, deviceUID: String, appCaptureService: AppCaptureService,
                                   completion: @escaping @MainActor @Sendable (Int?) -> Void) {
         queue.async { [weak self] in
@@ -437,15 +644,15 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            let inputKeys = deviceUID == VirtualDeviceChannels.micUID ? Array(self.activeRoutes.keys) : []
+            let affectedKeys = self.activeRoutes.filter { $0.value.playbackDeviceUID == deviceUID }.map(\.key)
             let outputRoute = self.activeOutputRoutes[deviceUID].map {
                 (physicalUID: $0.playbackDeviceUID, monitorChannel: $0.monitorChannel)
             }
-            for key in inputKeys {
-                if key.hasPrefix("app:") {
-                    self.stopAppCaptureInternal(bundleID: String(key.dropFirst(4)))
+            for key in affectedKeys {
+                if key.source.hasPrefix("app:") {
+                    self.stopAppCaptureInternal(bundleID: String(key.source.dropFirst(4)), targetDeviceUID: key.target)
                 } else {
-                    self.stopRoutingInternal(sourceDeviceUID: key)
+                    self.stopRoutingInternal(sourceKey: key.source, targetDeviceUID: key.target)
                 }
             }
             if outputRoute != nil {
@@ -458,12 +665,13 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 logger.error("Driver rejected \(count) channels for \(deviceUID)")
             }
 
-            for key in inputKeys {
-                if key.hasPrefix("app:") {
+            for key in affectedKeys {
+                if key.source.hasPrefix("app:") {
                     // SCStream keeps running; startCapture swaps it onto the new context.
-                    self.startAppCapture(bundleID: String(key.dropFirst(4)), appCaptureService: appCaptureService)
+                    self.startAppCapture(bundleID: String(key.source.dropFirst(4)), targetDeviceUID: key.target,
+                                        appCaptureService: appCaptureService)
                 } else {
-                    self.startRoutingInternal(sourceDeviceUID: key)
+                    self.startRoutingInternal(sourceDeviceUID: key.source, targetDeviceUID: key.target)
                 }
             }
             if let outputRoute {
@@ -491,16 +699,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Public API (app audio capture)
 
-    /// Start routing audio from a running application (via ScreenCaptureKit) to the Loopbacker virtual device.
-    func startAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
-        let key = "app:\(bundleID)"
+    /// Start routing audio from a running application (via ScreenCaptureKit) to a Loopbacker
+    /// virtual device. `targetDeviceUID` defaults to the virtual mic; pass
+    /// `VirtualDeviceChannels.streamUID` to also (or instead) feed Stream Mix.
+    func startAppCapture(bundleID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                         appCaptureService: AppCaptureService) {
+        let sourceKey = "app:\(bundleID)"
+        let routeKey = RouteKey(source: sourceKey, target: targetDeviceUID)
         queue.async { [weak self] in
             guard let self else { return }
-            guard self.activeRoutes[key] == nil else { return }
+            guard self.activeRoutes[routeKey] == nil else { return }
 
-            // Find the Loopbacker virtual device for output
-            guard let playbackDeviceID = self.findDeviceByUID("LoopbackerDevice_UID") else {
-                logger.error("Loopbacker virtual device not found for app capture")
+            // Find the target Loopbacker virtual device for output
+            guard let playbackDeviceID = self.findDeviceByUID(targetDeviceUID) else {
+                logger.error("Loopbacker virtual device not found for app capture: \(targetDeviceUID)")
                 return
             }
 
@@ -509,21 +721,28 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             let captureChannels: UInt32 = 2
             let micChannels = self.routableChannelCount(playbackDeviceID, scope: kAudioObjectPropertyScopeOutput)
             guard micChannels > 0 else {
-                logger.error("Loopbacker virtual device reports no output channels")
+                logger.error("Loopbacker virtual device reports no output channels: \(targetDeviceUID)")
                 return
             }
 
             // Create a RouteContext with no input AUHAL — SCStream replaces it
             let ctx = RouteContext(
-                captureDeviceUID: key,
+                captureDeviceUID: sourceKey,
                 captureDeviceID: 0,
                 playbackDeviceID: playbackDeviceID,
-                playbackDeviceUID: "LoopbackerDevice_UID",
+                playbackDeviceUID: targetDeviceUID,
                 inputChannels: captureChannels,
                 outputChannels: micChannels,
-                sampleRate: sampleRate
+                sampleRate: sampleRate,
+                isAppCapture: true
             )
-            ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
+            ctx.appAudioProcessor?.updateConfig(AppAudioProcessor.Config(
+                duckingEnabled: self.currentEffectsPreset.appAudio.duckingEnabled,
+                duckAmountDB: self.currentEffectsPreset.appAudio.duckAmountDB,
+                duckAttackMs: self.currentEffectsPreset.appAudio.duckAttackMs,
+                duckReleaseMs: self.currentEffectsPreset.appAudio.duckReleaseMs,
+                levelerEnabled: self.currentEffectsPreset.appAudio.levelerEnabled,
+                levelerTarget: self.currentEffectsPreset.appAudio.levelerTarget))
 
             // App capture needs a much larger ring than device routing: SCStream delivers
             // bursty chunks on its own schedule. 16384 frames (~340 ms) of capacity with a
@@ -548,8 +767,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                     return
                 }
             }
-            self.activeRoutes[key] = ctx
-            if let pending = self.pendingMixMatrices[key] {
+            self.activeRoutes[routeKey] = ctx
+            if let pending = self.pendingMixMatrices[routeKey] {
                 self.applyMixToContext(ctx, routes: pending)
             }
 
@@ -571,6 +790,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 do {
                     try await appCaptureService.startCapture(
                         bundleID: bundleID,
+                        target: targetDeviceUID,
                         ringBufferWriter: ringWriter,
                         sampleRate: sampleRate,
                         channelCount: captureChannels
@@ -578,28 +798,29 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 } catch {
                     logger.error("Failed to start app capture for \(bundleID): \(error.localizedDescription)")
                     self.queue.async {
-                        self.stopAppCaptureInternal(bundleID: bundleID)
+                        self.stopAppCaptureInternal(bundleID: bundleID, targetDeviceUID: targetDeviceUID)
                     }
                 }
             }
 
-            logger.info("Started app capture routing for \(bundleID)")
+            logger.info("Started app capture routing for \(bundleID) -> \(targetDeviceUID)")
         }
     }
 
-    /// Stop app audio capture routing for a specific bundle.
-    func stopAppCapture(bundleID: String, appCaptureService: AppCaptureService) {
+    /// Stop app audio capture routing for a specific bundle → target pair.
+    func stopAppCapture(bundleID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                        appCaptureService: AppCaptureService) {
         queue.async { [weak self] in
-            self?.stopAppCaptureInternal(bundleID: bundleID)
+            self?.stopAppCaptureInternal(bundleID: bundleID, targetDeviceUID: targetDeviceUID)
         }
         Task { @MainActor in
-            await appCaptureService.stopCapture(bundleID: bundleID)
+            await appCaptureService.stopCapture(bundleID: bundleID, target: targetDeviceUID)
         }
     }
 
-    private func stopAppCaptureInternal(bundleID: String) {
-        let key = "app:\(bundleID)"
-        guard let ctx = activeRoutes.removeValue(forKey: key) else { return }
+    private func stopAppCaptureInternal(bundleID: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: "app:\(bundleID)", target: targetDeviceUID)
+        guard let ctx = activeRoutes.removeValue(forKey: routeKey) else { return }
 
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
@@ -609,25 +830,48 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         teardownUnit(&ctx.outputUnit)
         if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
-        logger.info("Stopped app capture routing for \(bundleID)")
+        logger.info("Stopped app capture routing for \(bundleID) -> \(targetDeviceUID)")
     }
 
     // MARK: - Channel routing
 
-    /// Push the per-source channel mix from the UI's route graph into the audio engine.
-    /// `routes` is a list of (sourceChannel, outputChannel) 1-indexed pairs for a single source.
-    /// An empty list falls back to identity passthrough (src1→out1, src2→out2).
-    /// Applied immediately if the route is active, and cached so it's re-applied on restart.
-    func setChannelMix(sourceDeviceUID: String, routes: [(srcCh: Int, dstCh: Int)]) {
+    /// Push the per-source, per-target channel mix from the UI's route graph into the audio
+    /// engine. `routes` is a list of (sourceChannel, outputChannel) 1-indexed pairs for a
+    /// single source → target pair. An empty list falls back to identity passthrough
+    /// (src1→out1, src2→out2). Applied immediately if the route is active, and cached so it's
+    /// re-applied on restart.
+    ///
+    /// A live mix edit can move an already-running voice route into a different processing
+    /// group (see `ProcessingGroupKey`): `applyNoiseSuppression`/`applyEchoCancellation`
+    /// re-evaluate afterwards, which safely detaches-and-reattaches via their existing
+    /// crossfade-then-quiesce path if the route's new mix no longer matches whatever it was
+    /// sharing. The voice `FXChain` does *not* get the same live reconciliation: unlike
+    /// NS/AEC, swapping which `FXChain` instance a running route is attached to has no
+    /// crossfade-safe path at this layer (that would need support from `FXChain` itself, e.g.
+    /// an IO-acknowledged handoff) -- a running route keeps its originally-attached chain
+    /// until it's next stopped and restarted. In practice this only matters for the rare case
+    /// of editing per-channel routing on an already-active, already-differently-mixed sibling
+    /// route; a fresh route (the common case) always attaches with its final mix already
+    /// applied (see `startRoutingInternal`/`startMonitoring`).
+    func setChannelMix(sourceDeviceUID: String, targetDeviceUID: String = VirtualDeviceChannels.micUID,
+                       routes: [(srcCh: Int, dstCh: Int)]) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.pendingMixMatrices[sourceDeviceUID] = routes
-            if let ctx = self.activeRoutes[sourceDeviceUID] {
+            let key = RouteKey(source: sourceDeviceUID, target: targetDeviceUID)
+            self.pendingMixMatrices[key] = routes
+            if let ctx = self.activeRoutes[key] {
                 self.applyMixToContext(ctx, routes: routes)
+                self.applyNoiseSuppression(to: ctx)
+                self.applyEchoCancellation(to: ctx)
             }
-            if let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
+            // The monitor route always mirrors the virtual mic's mix (see `startMonitoring`).
+            if targetDeviceUID == VirtualDeviceChannels.micUID,
+               let monitor = self.activeOutputRoutes["monitor:\(sourceDeviceUID)"] {
                 self.applyMixToContext(monitor, routes: routes)
+                self.applyNoiseSuppression(to: monitor)
+                self.applyEchoCancellation(to: monitor)
             }
+            self.refreshEchoCancellersSnapshot()
         }
     }
 
@@ -650,17 +894,98 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Effects
 
-    /// Update the effects preset on all active route contexts.
+    /// Push the preset's voice-chain nodes to every running voice chain (each decides for
+    /// itself whether it's a param-only update or a structural rebuild) and its app-audio
+    /// settings to every running app-capture route.
     func updateEffectsPreset(_ preset: EffectsPreset) {
         queue.async { [weak self] in
             guard let self else { return }
-            for (_, ctx) in self.activeRoutes {
-                ctx.effectsChain?.updatePreset(preset)
+            let nodes = preset.nodes
+            for chain in self.fxChainsByDevice.values {
+                chain.setMasterEnabled(preset.isEnabled)
+                chain.setDetectVoiceWhileOff(preset.appAudio.duckingEnabled)
+                Task { await chain.updateConfigs(nodes) }
             }
-            for (_, ctx) in self.activeOutputRoutes {
-                ctx.effectsChain?.updatePreset(preset)
-            }
+            let appConfig = AppAudioProcessor.Config(
+                duckingEnabled: preset.appAudio.duckingEnabled, duckAmountDB: preset.appAudio.duckAmountDB,
+                duckAttackMs: preset.appAudio.duckAttackMs, duckReleaseMs: preset.appAudio.duckReleaseMs,
+                levelerEnabled: preset.appAudio.levelerEnabled, levelerTarget: preset.appAudio.levelerTarget)
+            for ctx in self.activeRoutes.values { ctx.appAudioProcessor?.updateConfig(appConfig) }
         }
+    }
+
+    // MARK: - Voice FX chain
+
+    /// Must run on `queue`. Whether `a` and `b` may safely share one noise suppressor, echo
+    /// canceller, or FX chain instance -- see `ProcessingGroupKey`'s doc comment for why this
+    /// is more than just "same capture device".
+    private func sameProcessingGroup(_ a: RouteContext, _ b: RouteContext) -> Bool {
+        a.processingGroupKey == b.processingGroupKey
+    }
+
+    /// Must run on `queue`. Attaches `ctx` to the voice chain for its processing group,
+    /// sharing the existing instance with any other voice route in the same group (same
+    /// capture device, sample rate, and voice-pair mix -- see `ProcessingGroupKey`), or
+    /// creating one. No-op for non-voice routes.
+    private func attachFXChain(to ctx: RouteContext) {
+        guard ctx.isVoiceInput else { return }
+        let key = ctx.processingGroupKey
+        if let sibling = voiceContexts.first(where: { $0 !== ctx && sameProcessingGroup($0, ctx) }),
+           let shared = sibling.fxOwner {
+            ctx.attachFXChain(shared)
+            ctx.fxGroupKey = key
+            // ChainFix: setMasterEnabled(currentEffectsPreset.isEnabled) call site.
+            return
+        }
+        let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
+        chain.setMasterEnabled(currentEffectsPreset.isEnabled)
+        chain.setDetectVoiceWhileOff(currentEffectsPreset.appAudio.duckingEnabled)
+        ctx.attachFXChain(chain)
+        ctx.fxGroupKey = key
+        fxChainsByDevice[key] = chain
+        fxChainsLock.lock()
+        fxChainsSnapshot[key] = chain
+        fxChainsLock.unlock()
+        let nodes = currentEffectsPreset.nodes
+        Task { await chain.updateConfigs(nodes) }
+        // ChainFix: setMasterEnabled(currentEffectsPreset.isEnabled) call site.
+    }
+
+    /// Must run on `queue`, after removing `ctx` from `activeRoutes`/`activeOutputRoutes`, so
+    /// `voiceContexts` no longer includes it. Frees the group's chain once no voice route in
+    /// that exact group uses it anymore. Uses `ctx.fxGroupKey` (captured at attach time)
+    /// rather than `ctx.processingGroupKey` (computed from the live, possibly since-mutated
+    /// `mixMatrix`): see `RouteContext.fxGroupKey`'s doc comment.
+    private func detachFXChain(from ctx: RouteContext) {
+        guard ctx.isVoiceInput else { return }
+        _ = ctx.detachFXChain()
+        guard let key = ctx.fxGroupKey else { return }
+        ctx.fxGroupKey = nil
+        guard !voiceContexts.contains(where: { $0.fxGroupKey == key }) else { return }
+        if let chain = fxChainsByDevice.removeValue(forKey: key) {
+            // The last voice route in this group is gone and its audio unit(s) are already
+            // stopped (callers stop them before calling this): the IO proc is provably halted,
+            // so it's safe to free whatever graphs this chain still owns now rather than wait.
+            chain.ioStopped()
+        }
+        fxChainsLock.lock()
+        fxChainsSnapshot.removeValue(forKey: key)
+        fxChainsLock.unlock()
+    }
+
+    /// Any thread. The voice chain on the first active voice device (stable key order), for
+    /// `FXEngine`'s UI-facing queries.
+    func firstVoiceFXChain() -> FXChain? {
+        fxChainsLock.lock()
+        defer { fxChainsLock.unlock() }
+        return fxChainsSnapshot.keys.sorted().first.flatMap { fxChainsSnapshot[$0] }
+    }
+
+    /// Any thread. Every running voice chain (one per capture device).
+    func allVoiceFXChains() -> [FXChain] {
+        fxChainsLock.lock()
+        defer { fxChainsLock.unlock() }
+        return Array(fxChainsSnapshot.values)
     }
 
     // MARK: - Noise suppression
@@ -669,7 +994,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// - Parameters:
     ///   - excludedDeviceUIDs: capture devices whose source opted out.
     ///   - dryMonitorDeviceUIDs: capture devices whose monitor route skips suppression (no
-    ///     added delay when hearing yourself); their virtual mic route is still suppressed.
+    ///     added delay when hearing yourself); their virtual mic and Stream Mix routes are
+    ///     still suppressed.
     func updateNoiseSuppression(_ settings: NoiseSuppressionSettings, excludedDeviceUIDs: Set<String>,
                                 dryMonitorDeviceUIDs: Set<String>) {
         queue.async { [weak self] in
@@ -692,9 +1018,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     }
 
     /// Must run on `queue`. Gives `ctx` a suppressor running the selected engine, or takes it
-    /// away. Voice routes on the same capture device share one suppressor. Suppressors nobody
-    /// wants (off, opted out, or the other engine) fade out and are freed, and with them a
-    /// model-backed engine's model once nothing uses it.
+    /// away. Voice routes in the same processing group (see `ProcessingGroupKey`) share one
+    /// suppressor. Suppressors nobody wants (off, opted out, the other engine, or whose group
+    /// has diverged -- e.g. a live `setChannelMix` edit moved `ctx` out of the group it was
+    /// sharing with) fade out and are freed, and with them a model-backed engine's model once
+    /// nothing uses it.
     private func applyNoiseSuppression(to ctx: RouteContext) {
         guard ctx.isVoiceInput, !ctx.noiseDetaching else { return }
         let settings = noiseSuppression
@@ -702,7 +1030,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             && !(ctx.isMonitor && dryMonitorDevices.contains(ctx.captureDeviceUID))
 
         if let current = ctx.noiseOwner {
-            if wanted && current.engine == settings.engine {
+            let groupMismatch = voiceContexts.contains { $0 !== ctx && $0.noiseOwner === current && !sameProcessingGroup($0, ctx) }
+            if wanted && current.engine == settings.engine && !groupMismatch {
                 current.setMaxReduction(dB: settings.maxReductionDB)
                 current.setEnabled(true)
             } else {
@@ -713,8 +1042,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         guard wanted else { return }
 
         let sibling = voiceContexts.first {
-            $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID && $0.sampleRate == ctx.sampleRate
-                && !$0.noiseDetaching && $0.noiseOwner?.engine == settings.engine
+            $0 !== ctx && sameProcessingGroup($0, ctx) && !$0.noiseDetaching && $0.noiseOwner?.engine == settings.engine
         }
         if let shared = sibling?.noiseOwner {
             ctx.attachNoiseSuppressor(shared)
@@ -729,6 +1057,27 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         logger.info("Noise suppression (\(settings.engine.rawValue, privacy: .public)) started on \(ctx.captureDeviceUID)")
     }
 
+    /// Must run on `queue`. Frees `instance` once `ctx`'s own IO thread has completed a full
+    /// block since the slot it came from was cleared -- an acquisition-safe acknowledgement
+    /// (see `RouteContext.ioGeneration`'s doc comment) instead of a fixed deadline a stalled
+    /// callback could still be running past. A route that has been stopped (no longer in
+    /// `voiceContexts`) can't be inside a callback: `stopRoutingInternal` removes it and calls
+    /// `AudioOutputUnitStop` in the same `queue` turn, so it's freed at once. While the device
+    /// is stalled (e.g. asleep) the poll backs off to 1 s rather than spinning.
+    private func releaseOnceQuiescent<T: AnyObject & Sendable>(_ instance: T?, generationAtDetach: UInt64,
+                                                              ctx: RouteContext, attempt: Int = 0) {
+        guard instance != nil else { return }
+        let advanced = ctx.ioGeneration.load(ordering: .acquiring) != generationAtDetach
+        guard !advanced, voiceContexts.contains(where: { $0 === ctx }) else {
+            withExtendedLifetime(instance) {}
+            return
+        }
+        let delay = min(1.0, 0.005 * pow(2, Double(min(attempt, 8))))
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.releaseOnceQuiescent(instance, generationAtDetach: generationAtDetach, ctx: ctx, attempt: attempt + 1)
+        }
+    }
+
     /// Must run on `queue`. Crossfades `ctx`'s suppressor to dry (10 ms), then detaches it and
     /// re-applies the settings, which may attach the other engine. Waiting out the fade keeps
     /// an engine switch click-free: old wet → dry → new wet.
@@ -738,14 +1087,204 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.noiseOwner === current && !$0.noiseDetaching }
         if !sharedWithKeeper { current.setEnabled(false) }
         queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
             let old = ctx.detachNoiseSuppressor()
             ctx.noiseDetaching = false
-            // An audio callback that loaded the slot just before it was cleared may still be
-            // running `old`; one IO cycle is a few ms, so half a second is ample.
-            self?.queue.asyncAfter(deadline: .now() + 0.5) { withExtendedLifetime(old) {} }
-            guard let self, self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.releaseOnceQuiescent(old, generationAtDetach: ctx.ioGeneration.load(ordering: .acquiring), ctx: ctx)
+            guard self.voiceContexts.contains(where: { $0 === ctx }) else { return }
             self.applyNoiseSuppression(to: ctx)
         }
+    }
+
+    // MARK: - Echo cancellation
+
+    /// Any thread. Gives the audio engine the far-end reference ring for echo cancellation
+    /// (`SystemAudioTap.ring`, owned by `RoutingSync`), or clears it (e.g. the tap object is
+    /// being torn down). Existing routes that want echo cancellation re-apply immediately;
+    /// routes with no reference yet attach once this lands.
+    func setEchoReference(_ ring: DriftCompensatedRing?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.echoReference = ring
+            self.installDefaultOutputChangeListenerIfNeeded()
+            self.applyEchoCancellationToAllRoutes()
+        }
+    }
+
+    /// Queue only. The default output device changing (built-in speakers -> USB interface, or
+    /// to/from one of Loopbacker's own virtual devices) can change the HAL latency AEC3's delay
+    /// estimate was built from, same as it changes which device `SystemAudioTap` taps. Installed
+    /// once, the first time there's a reference to echo-cancel against; never removed, since
+    /// `AudioRouter` lives for the app's lifetime same as `SystemAudioTap`.
+    private func installDefaultOutputChangeListenerIfNeeded() {
+        guard !echoDefaultOutputListenerInstalled else { return }
+        echoDefaultOutputListenerInstalled = true
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                  mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue) { [weak self] _, _ in
+            self?.refreshEchoStreamDelays()
+        }
+    }
+
+    /// Must run on `queue`. Recomputes and re-pushes every attached echo canceller's AEC3 delay
+    /// estimate (see `estimateStreamDelayMs`); AEC3 keeps adapting through the gap, same as it
+    /// does for an initial estimate that's merely in the right ballpark.
+    private func refreshEchoStreamDelays() {
+        for ctx in voiceContexts {
+            guard let canceller = ctx.echoOwner else { continue }
+            canceller.setStreamDelay(ms: estimateStreamDelayMs(for: ctx))
+        }
+    }
+
+    /// Apply echo cancellation's per-source opt-outs to every voice-input route. The global
+    /// on/off toggle is read from `noiseSuppression.echoCancellation`, already landed by
+    /// `updateNoiseSuppression` (`RoutingSync` pushes both from the same settings object, in
+    /// order, over the serial `queue`).
+    func updateEchoCancellation(excludedDeviceUIDs: Set<String>) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.echoExcludedDevices = excludedDeviceUIDs
+            self.applyEchoCancellationToAllRoutes()
+        }
+    }
+
+    /// Any thread. A representative attached canceller's smoothed ERLE (dB), for
+    /// `EchoCancellationSection`'s live "echo removed" indicator, or nil if none is attached.
+    func echoCancellationERLE() -> Float? {
+        echoCancellersLock.lock()
+        defer { echoCancellersLock.unlock() }
+        return echoCancellersSnapshot.first?.erleDB
+    }
+
+    /// Must run on `queue`.
+    private func applyEchoCancellationToAllRoutes() {
+        for ctx in voiceContexts { applyEchoCancellation(to: ctx) }
+        refreshEchoCancellersSnapshot()
+    }
+
+    /// Must run on `queue`. Gives `ctx` an echo canceller reading the shared far-end reference
+    /// ring, or takes it away. Voice routes in the same processing group (see
+    /// `ProcessingGroupKey`) share one canceller, the same sharing shape `applyNoiseSuppression`
+    /// uses for `NoiseSuppressor`.
+    private func applyEchoCancellation(to ctx: RouteContext) {
+        guard ctx.isVoiceInput, !ctx.echoDetaching else { return }
+        let wanted = noiseSuppression.echoCancellation && echoReference != nil
+            && !echoExcludedDevices.contains(ctx.captureDeviceUID)
+
+        if let current = ctx.echoOwner {
+            let groupMismatch = voiceContexts.contains { $0 !== ctx && $0.echoOwner === current && !sameProcessingGroup($0, ctx) }
+            if wanted && !groupMismatch {
+                current.setEnabled(true)
+            } else {
+                fadeOutEchoCanceller(of: ctx)
+            }
+            return
+        }
+        guard wanted, let reference = echoReference else { return }
+
+        let sibling = voiceContexts.first {
+            $0 !== ctx && sameProcessingGroup($0, ctx) && !$0.echoDetaching
+        }
+        if let shared = sibling?.echoOwner {
+            ctx.attachEchoCanceller(shared)
+            shared.setEnabled(true)
+            return
+        }
+        guard let canceller = EchoCanceller.make(reference: reference) else { return }
+        canceller.setStreamDelay(ms: estimateStreamDelayMs(for: ctx))
+        canceller.setEnabled(true)
+        ctx.attachEchoCanceller(canceller)
+        logger.info("Echo cancellation started on \(ctx.captureDeviceUID)")
+    }
+
+    /// Must run on `queue`. Crossfades `ctx`'s canceller to dry (10 ms, inside
+    /// `EchoCanceller.process`), then detaches it -- the same two-phase shape
+    /// `fadeOutNoiseSuppressor` uses, including the generation-based quiescent release.
+    private func fadeOutEchoCanceller(of ctx: RouteContext) {
+        guard let current = ctx.echoOwner else { return }
+        ctx.echoDetaching = true
+        let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.echoOwner === current && !$0.echoDetaching }
+        if !sharedWithKeeper { current.setEnabled(false) }
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            let old = ctx.detachEchoCanceller()
+            ctx.echoDetaching = false
+            self.releaseOnceQuiescent(old, generationAtDetach: ctx.ioGeneration.load(ordering: .acquiring), ctx: ctx)
+            guard self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.applyEchoCancellation(to: ctx)
+            self.refreshEchoCancellersSnapshot()
+        }
+    }
+
+    /// Must run on `queue`. Mirrors `fxChainsSnapshot`'s publish-for-cross-thread-reads pattern.
+    private func refreshEchoCancellersSnapshot() {
+        let owners = voiceContexts.compactMap(\.echoOwner)
+        echoCancellersLock.lock()
+        echoCancellersSnapshot = owners
+        echoCancellersLock.unlock()
+    }
+
+    /// Must run on `queue`. Starting point for AEC3's delay estimator (see
+    /// `webrtc_aec3_shim.h`): the tap's own ring latency (system audio → reference ring) plus
+    /// the default output device's rendering latency (reference → speaker) plus `ctx`'s
+    /// capture device's latency (mic → this callback), from HAL `kAudioDevicePropertyLatency`/
+    /// `SafetyOffset`/stream latency and buffer size, plus a margin for inter-device scheduling
+    /// jitter. AEC3 only needs this in the right ballpark -- it refines the rest on its own.
+    private func estimateStreamDelayMs(for ctx: RouteContext) -> Int32 {
+        let outputLatencyFrames = defaultOutputDeviceID()
+            .map { Self.haLatencyFrames($0, scope: kAudioObjectPropertyScopeOutput) } ?? 0
+        let inputLatencyFrames = Self.haLatencyFrames(ctx.captureDeviceID, scope: kAudioObjectPropertyScopeInput)
+        let tapRingMs = Double(SystemAudioTap.referenceTargetFillFrames) / 48_000 * 1000
+        let outputMs = Double(outputLatencyFrames) / 48_000 * 1000
+        let inputMs = Double(inputLatencyFrames) / ctx.sampleRate * 1000
+        let schedulingMarginMs = 10.0
+        return Int32((tapRingMs + outputMs + inputMs + schedulingMarginMs).rounded())
+    }
+
+    private func defaultOutputDeviceID() -> AudioObjectID? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
+        return status == noErr && deviceID != kAudioObjectUnknown ? deviceID : nil
+    }
+
+    /// Sum of HAL round-trip latency contributors for `deviceID` in `scope`: device buffering
+    /// latency, safety offset, the first stream's own latency, and the current buffer size --
+    /// everything CoreAudio reports between a sample leaving/entering the render callback and
+    /// it actually reaching the speaker/mic.
+    private static func haLatencyFrames(_ deviceID: AudioObjectID, scope: AudioObjectPropertyScope) -> UInt32 {
+        func property(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                      _ propScope: AudioObjectPropertyScope = scope) -> UInt32 {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: propScope,
+                                                      mElement: kAudioObjectPropertyElementMain)
+            guard AudioObjectHasProperty(objectID, &address) else { return 0 }
+            var value: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value) == noErr ? value : 0
+        }
+
+        var total = property(deviceID, kAudioDevicePropertyLatency)
+            + property(deviceID, kAudioDevicePropertySafetyOffset)
+            + property(deviceID, kAudioDevicePropertyBufferFrameSize)
+
+        var streamsAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: scope,
+                                                         mElement: kAudioObjectPropertyElementMain)
+        var streamsSize: UInt32 = 0
+        if AudioObjectGetPropertyDataSize(deviceID, &streamsAddress, 0, nil, &streamsSize) == noErr,
+           streamsSize >= UInt32(MemoryLayout<AudioObjectID>.size) {
+            let count = Int(streamsSize) / MemoryLayout<AudioObjectID>.size
+            var streamIDs = [AudioObjectID](repeating: 0, count: count)
+            var fullSize = streamsSize
+            if AudioObjectGetPropertyData(deviceID, &streamsAddress, 0, nil, &fullSize, &streamIDs) == noErr,
+               let firstStream = streamIDs.first {
+                total += property(firstStream, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal)
+            }
+        }
+        return total
     }
 
     /// Must run on `queue`. Nil while a model-backed engine's model is still loading: the load
@@ -809,6 +1348,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// allocation); when it agrees with `wasSilentMeters` this tick skips draining and building
     /// the per-route dictionaries. Loudness is cached separately (see below) and only re-read
     /// when `MicLoudnessBus` reports something actually changed.
+    ///
+    /// Output levels are tracked per target device (virtual mic, Stream Mix): two routes
+    /// feeding different targets never bleed into each other's post-mix meters even though
+    /// their channel numbering overlaps (see `MeterLevels.updateOutputs(target:_:)`).
     private func updatePublishedMeters() {
         // Cached flag, not a window walk: closing the main window only hides it (SwiftUI keeps
         // its view graph alive), so without this every tick would still drain/publish meters and
@@ -833,16 +1376,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         var newSourceLevels: [String: [Int: Float]] = [:]
-        var newOutputLevels: [Int: Float] = [:]
+        var newOutputLevelsByTarget: [String: [Int: Float]] = [:]
         var sawNonZero = false
 
         if !skipPeakMeters {
-            for (uid, ctx) in activeRoutes {
-                newSourceLevels[uid] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
-                // Output meter takes post-mix levels (max across sources).
+            for (key, ctx) in activeRoutes {
+                newSourceLevels[key.source] = Self.drainLevels(ctx.meterLevelsPtr, count: ctx.inputChannels, sawNonZero: &sawNonZero)
+                // Output meter takes post-mix levels (max across every route feeding this target).
+                var targetLevels = newOutputLevelsByTarget[ctx.playbackDeviceUID] ?? [:]
                 for (ch, level) in Self.drainLevels(ctx.outMeterLevelsPtr, count: ctx.outputChannels, sawNonZero: &sawNonZero) {
-                    newOutputLevels[ch] = max(newOutputLevels[ch] ?? 0.0, level)
+                    targetLevels[ch] = max(targetLevels[ch] ?? 0.0, level)
                 }
+                newOutputLevelsByTarget[ctx.playbackDeviceUID] = targetLevels
             }
 
             // Output routes report the virtual device channels they capture.
@@ -852,8 +1397,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
 
         let sourceLevels = newSourceLevels
-        let outputLevels = newOutputLevels
-        let routesEmpty = activeRoutes.isEmpty
+        let outputLevelsByTarget = newOutputLevelsByTarget
+        let activeTargets = Set(activeRoutes.values.map(\.playbackDeviceUID))
         // The virtual mic's loudness is combined across every feed by `MicLoudnessBus` itself
         // (summed per IO cycle on the shared device thread), so there's nothing to group here.
         // `integratedLUFS()` scans a fixed-size histogram (a few hundred microseconds) -- cheap,
@@ -882,13 +1427,15 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 for (key, channels) in sourceLevels {
                     meters.updateSource(key, channels: channels)
                 }
-                // Every active route shares the same virtual output device, so its channel set
-                // never changes while any route is running — only clear it on the empty
-                // transition so a stale post-mix peak doesn't linger once nothing writes it.
-                if routesEmpty {
-                    meters.clearOutputs()
-                } else {
-                    meters.updateOutputs(outputLevels)
+                // Every target's channel set never changes while any route still feeds it —
+                // clear only on that target's empty transition so a stale post-mix peak doesn't
+                // linger.
+                for target in [VirtualDeviceChannels.micUID, VirtualDeviceChannels.streamUID] {
+                    if activeTargets.contains(target) {
+                        meters.updateOutputs(target: target, outputLevelsByTarget[target] ?? [:])
+                    } else {
+                        meters.clearOutputs(target: target)
+                    }
                 }
             }
 
@@ -941,9 +1488,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     // MARK: - Internal routing (input -> loopbacker)
 
-    private func startRoutingInternal(sourceDeviceUID: String) {
-        // Already routing this source
-        guard activeRoutes[sourceDeviceUID] == nil else { return }
+    private func startRoutingInternal(sourceDeviceUID: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: sourceDeviceUID, target: targetDeviceUID)
+        // Already routing this source -> target pair
+        guard activeRoutes[routeKey] == nil else { return }
 
         // Find the source device ID
         guard let captureDeviceID = findDeviceByUID(sourceDeviceUID) else {
@@ -951,9 +1499,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return
         }
 
-        // Find the Loopbacker virtual device
-        guard let playbackDeviceID = findDeviceByUID("LoopbackerDevice_UID") else {
-            logger.error("Loopbacker virtual device not found")
+        // Find the target Loopbacker virtual device
+        guard let playbackDeviceID = findDeviceByUID(targetDeviceUID) else {
+            logger.error("Loopbacker virtual device not found: \(targetDeviceUID)")
             return
         }
 
@@ -965,25 +1513,34 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
         let micChannels = routableChannelCount(playbackDeviceID, scope: kAudioObjectPropertyScopeOutput)
         guard micChannels > 0 else {
-            logger.error("Loopbacker virtual device reports no output channels")
+            logger.error("Loopbacker virtual device reports no output channels: \(targetDeviceUID)")
             return
         }
 
-        // Get sample rate from the Loopbacker device
+        // Get sample rate from the target device
         let sampleRate = getDeviceSampleRate(playbackDeviceID)
 
         let ctx = RouteContext(
             captureDeviceUID: sourceDeviceUID,
             captureDeviceID: captureDeviceID,
             playbackDeviceID: playbackDeviceID,
-            playbackDeviceUID: "LoopbackerDevice_UID",
+            playbackDeviceUID: targetDeviceUID,
             inputChannels: inputChannels,
             outputChannels: micChannels,
             sampleRate: sampleRate,
             isVoiceInput: true
         )
-        ctx.effectsChain?.updatePreset(currentEffectsPreset)
+        // Restore any previously-configured channel mix for this source -> target pair
+        // *before* attaching NS/AEC/FX below: those decide which processing group (see
+        // `ProcessingGroupKey`) this context joins from its mix, so attaching against the
+        // still-identity mix would sibling-match (or dict-key) on the wrong signature.
+        if let pending = pendingMixMatrices[routeKey] {
+            applyMixToContext(ctx, routes: pending)
+        }
+        attachFXChain(to: ctx)
         applyNoiseSuppression(to: ctx)
+        applyEchoCancellation(to: ctx)
+        refreshEchoCancellersSnapshot()
 
         // Create input AUHAL (captures from source device)
         guard setupInputUnit(ctx) else {
@@ -991,7 +1548,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return
         }
 
-        // Create output AUHAL (sends to Loopbacker device)
+        // Create output AUHAL (sends to the target Loopbacker device)
         guard setupOutputUnit(ctx) else {
             logger.error("Failed to set up output unit")
             teardownUnit(&ctx.inputUnit)
@@ -1020,16 +1577,12 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Restore any previously-configured channel mix for this source so it survives
-        // restarts (wake, sample rate change) without the UI having to reapply it.
-        if let pending = pendingMixMatrices[sourceDeviceUID] {
-            applyMixToContext(ctx, routes: pending)
-        }
+        activeRoutes[routeKey] = ctx
 
-        activeRoutes[sourceDeviceUID] = ctx
-
-        // Listen for sample rate changes on the capture device only — auto-restart
-        // the route when the hardware rate changes (e.g., after sleep).
+        // Listen for sample rate changes on the capture device only — auto-restart every
+        // route on this device when the hardware rate changes (e.g., after sleep). Idempotent:
+        // a second route on the same device (e.g. Stream Mix alongside the virtual mic)
+        // re-installs the same mapping rather than displacing it.
         // NOTE: Do NOT listen on the playback (Loopbacker) device. Apps like Chrome/Meet
         // can force rate changes on the virtual device, which would cause a restart loop
         // (stop → 0.3s gap → restart → rate changes again) producing crackling and
@@ -1037,14 +1590,18 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         // Wake-related rate changes are already handled by restartAllRoutes().
         installSampleRateListener(deviceID: captureDeviceID, sourceDeviceUID: sourceDeviceUID)
 
-        logger.info(" Started routing: \(sourceDeviceUID)")
+        logger.info(" Started routing: \(sourceDeviceUID) -> \(targetDeviceUID)")
     }
 
-    private func stopRoutingInternal(sourceDeviceUID: String) {
-        guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
+    private func stopRoutingInternal(sourceKey: String, targetDeviceUID: String) {
+        let routeKey = RouteKey(source: sourceKey, target: targetDeviceUID)
+        guard let ctx = activeRoutes.removeValue(forKey: routeKey) else { return }
 
-        // Remove sample rate listener for the capture device
-        removeSampleRateListener(deviceID: ctx.captureDeviceID)
+        // Remove the sample rate listener only once no other route still captures this
+        // device (e.g. the virtual mic route may still be running after Stream Mix stops).
+        if !activeRoutes.values.contains(where: { $0.captureDeviceID == ctx.captureDeviceID }) {
+            removeSampleRateListener(deviceID: ctx.captureDeviceID)
+        }
 
         // Stop callbacks first, then dispose, then release the retained references.
         // Each setupInputUnit/setupOutputUnit call did a passRetained on ctx.
@@ -1054,6 +1611,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain: the capture device's IO
+        // callbacks that might still be inside `FXChain.process` have been stopped.
+        detachFXChain(from: ctx)
+        refreshEchoCancellersSnapshot()
+
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
@@ -1063,7 +1625,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if hadInput { Unmanaged.passUnretained(ctx).release() }
         if hadOutput { Unmanaged.passUnretained(ctx).release() }
 
-        logger.info(" Stopped routing: \(sourceDeviceUID)")
+        logger.info(" Stopped routing: \(sourceKey) -> \(targetDeviceUID)")
     }
 
     // MARK: - Internal output routing (virtual device -> physical output)
@@ -1104,7 +1666,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             sampleRate: sampleRate
         )
         ctx.monitorChannel = monitorChannel
-        ctx.effectsChain?.updatePreset(currentEffectsPreset)
         // Speakers get the selected pair; a pair past the device's width falls back to 1–2.
         if monitorChannel >= 1 && monitorChannel + 1 <= Int(deviceChannels) {
             applyMixToContext(ctx, routes: [(srcCh: monitorChannel, dstCh: 1), (srcCh: monitorChannel + 1, dstCh: 2)])
@@ -1158,6 +1719,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain (see stopRoutingInternal).
+        detachFXChain(from: ctx)
+        refreshEchoCancellersSnapshot()
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
@@ -1575,8 +2139,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     private var sampleRateListeners: [AudioObjectID: String] = [:]  // deviceID -> sourceDeviceUID
 
     private func installSampleRateListener(deviceID: AudioObjectID, sourceDeviceUID: String) {
-        // Remove existing listener if any
-        removeSampleRateListener(deviceID: deviceID)
+        // Already installed for this device (e.g. a second target route on the same capture
+        // device, like Stream Mix alongside the virtual mic): nothing to do.
+        guard sampleRateListeners[deviceID] == nil else { return }
 
         sampleRateListeners[deviceID] = sourceDeviceUID
 
@@ -1606,16 +2171,27 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Called from the C listener callback when any monitored device changes sample rate.
     fileprivate func handleSampleRateChange(deviceID: AudioObjectID) {
         // Find which source UID this device corresponds to
-        guard let sourceUID = sampleRateListeners[deviceID] else { return }
+        guard sampleRateListeners[deviceID] != nil else { return }
         let newRate = getDeviceSampleRate(deviceID)
-        logger.info("Sample rate changed on device \(deviceID) to \(newRate)Hz — restarting route for \(sourceUID)")
+        logger.info("Sample rate changed on device \(deviceID) to \(newRate)Hz — restarting its routes")
 
         queue.async { [weak self] in
             guard let self else { return }
-            self.stopRoutingInternal(sourceDeviceUID: sourceUID)
+            // Restart every route (virtual mic, Stream Mix) that captures this device, not
+            // just the one whose UID happened to install the listener.
+            let pairs = self.activeRoutes.keys
+                .filter { self.activeRoutes[$0]?.captureDeviceID == deviceID }
+                .map { (source: $0.source, target: $0.target) }
+            guard !pairs.isEmpty else { return }
+            for pair in pairs {
+                self.stopRoutingInternal(sourceKey: pair.source, targetDeviceUID: pair.target)
+            }
             // Small delay to let the device settle at the new rate
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.startRouting(sourceDeviceUID: sourceUID)
+                guard let self else { return }
+                for pair in pairs {
+                    self.startRouting(sourceDeviceUID: pair.source, targetDeviceUID: pair.target)
+                }
             }
         }
     }

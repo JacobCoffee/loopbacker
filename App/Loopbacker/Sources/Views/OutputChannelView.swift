@@ -1,16 +1,25 @@
 import SwiftUI
 
+/// One virtual mic's channel column: Virtual Mic or (when enabled) Stream Mix. Both targets
+/// share the same add/remove-pair channel model, just against their own channel array and
+/// device UID.
 struct OutputChannelView: View {
+    let target: RouteTarget
+
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
 
-    /// Channels the installed driver actually exposes on the virtual mic (nil until enumerated).
+    private var channels: [AudioChannel] {
+        target == .virtualMic ? routingState.outputChannels : routingState.streamOutputChannels
+    }
+
+    /// Channels the installed driver actually exposes on this target (nil until enumerated).
     private var deviceChannels: Int? {
-        audioDeviceManager.systemDevices.first { $0.uid == VirtualDeviceChannels.micUID }?.outputChannelCount
+        audioDeviceManager.systemDevices.first { $0.uid == target.deviceUID }?.outputChannelCount
     }
 
     private var hasActiveRoutes: Bool {
-        !routingState.routes.isEmpty
+        routingState.routes.contains { $0.targetId == target }
     }
 
     var body: some View {
@@ -20,17 +29,17 @@ struct OutputChannelView: View {
             Divider().opacity(0.5)
 
             VStack(spacing: 4) {
-                ForEach(routingState.outputChannels) { channel in
+                ForEach(channels) { channel in
                     ChannelStripView(
                         channel: channel,
-                        side: .output,
+                        side: .output(target: target),
                         isSourceEnabled: true,
-                        connectorEnd: .output(channelId: channel.id)
+                        connectorEnd: .output(target: target, channelId: channel.id)
                     )
                     .contextMenu {
                         Button(role: .destructive) {
                             withAnimation(.easeInOut(duration: 0.2)) {
-                                routingState.removeOutputChannel(channel.id)
+                                removeChannel(channel.id)
                             }
                         } label: {
                             Label("Remove Channel \(channel.label)", systemImage: "trash")
@@ -41,8 +50,8 @@ struct OutputChannelView: View {
             .padding(.horizontal, Metrics.panelPadding)
             .padding(.vertical, 10)
 
-            if let deviceChannels, deviceChannels < routingState.outputChannels.count {
-                Label("The installed driver provides \(deviceChannels) channels. Reinstall the driver to use channels \(deviceChannels + 1)\u{2013}\(routingState.outputChannels.count).",
+            if let deviceChannels, deviceChannels < channels.count {
+                Label("The installed driver provides \(deviceChannels) channels. Reinstall the driver to use channels \(deviceChannels + 1)\u{2013}\(channels.count).",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -73,7 +82,7 @@ struct OutputChannelView: View {
                 Text(outputTitle)
                     .font(.headline)
                     .lineLimit(1)
-                Text("Virtual mic input for Discord, Zoom, etc.")
+                Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -82,9 +91,9 @@ struct OutputChannelView: View {
 
             Spacer(minLength: 8)
 
-            if routingState.outputChannels.count > 2 {
+            if channels.count > 2 {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) { routingState.removeLastOutputChannelPair() }
+                    withAnimation(.easeInOut(duration: 0.2)) { removeLastPair() }
                 } label: {
                     Image(systemName: "minus.circle")
                 }
@@ -96,23 +105,29 @@ struct OutputChannelView: View {
             }
 
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) { routingState.addOutputChannelPair() }
+                withAnimation(.easeInOut(duration: 0.2)) { addPair() }
             } label: {
                 Image(systemName: "plus.circle")
             }
             .buttonStyle(.borderless)
             .font(.title3)
             .foregroundStyle(.secondary)
-            .disabled(routingState.outputChannels.count >= VirtualDeviceChannels.maxCount)
-            .help("Add a channel pair to the virtual mic (up to \(VirtualDeviceChannels.maxCount) channels)")
+            .disabled(channels.count >= VirtualDeviceChannels.maxCount)
+            .help("Add a channel pair to this virtual mic (up to \(VirtualDeviceChannels.maxCount) channels)")
             .accessibilityLabel("Add channel pair")
         }
         .padding(.horizontal, Metrics.panelPadding)
         .padding(.vertical, 10)
     }
 
+    private var subtitle: String {
+        switch target {
+        case .virtualMic: return "Virtual mic input for Discord, Zoom, etc."
+        case .streamMix: return "Second virtual mic input, e.g. for OBS or a separate stream mix."
+        }
+    }
+
     private var outputTitle: String {
-        let channels = routingState.outputChannels
         if channels.count == 2 {
             return "Channels 1 & 2"
         } else if channels.count == 1 {
@@ -128,7 +143,7 @@ struct OutputChannelView: View {
         HStack(spacing: 6) {
             Image(systemName: "cable.connector")
                 .font(.caption2)
-            let routeCount = routingState.routes.count
+            let routeCount = routingState.routes.filter { $0.targetId == target }.count
             Text("\(routeCount) route\(routeCount == 1 ? "" : "s") active")
                 .font(.caption)
         }
@@ -141,5 +156,28 @@ struct OutputChannelView: View {
             bottomTrailingRadius: Metrics.panelRadius,
             topTrailingRadius: 0
         ))
+    }
+
+    // MARK: - Target-dispatched channel mutations
+
+    private func removeChannel(_ channelId: Int) {
+        switch target {
+        case .virtualMic: routingState.removeOutputChannel(channelId)
+        case .streamMix: routingState.removeStreamOutputChannel(channelId)
+        }
+    }
+
+    private func addPair() {
+        switch target {
+        case .virtualMic: routingState.addOutputChannelPair()
+        case .streamMix: routingState.addStreamOutputChannelPair()
+        }
+    }
+
+    private func removeLastPair() {
+        switch target {
+        case .virtualMic: routingState.removeLastOutputChannelPair()
+        case .streamMix: routingState.removeLastStreamOutputChannelPair()
+        }
     }
 }

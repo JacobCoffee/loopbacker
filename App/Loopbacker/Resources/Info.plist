@@ -14,6 +14,17 @@
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.jacobcoffee.loopbacker</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.jacobcoffee.loopbacker</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>loopbacker</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -21,9 +32,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>4.6.1</string>
+	<string>4.7.0</string>
 	<key>CFBundleVersion</key>
-	<string>19</string>
+	<string>20</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.music</string>
 	<key>LSMinimumSystemVersion</key>
@@ -44,6 +55,8 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Jacob Coffee. All rights reserved.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Loopbacker needs System Audio Recording permission to cancel echo from your speakers, so other apps' audio doesn't leak back into your microphone.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Loopbacker needs microphone access to route audio between devices.</string>
 	<key>NSScreenCaptureUsageDescription</key>

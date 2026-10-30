@@ -22,17 +22,25 @@ struct NoiseSuppressionSettings: Codable, Equatable {
     /// How far noise may be pulled down. Easing off (e.g. -12 dB) keeps some room tone;
     /// -60 dB is effectively full removal.
     var maxReductionDB: Float = -60
+    /// Acoustic echo cancellation (AEC3) on voice routes: removes the sound Loopbacker plays
+    /// to real speakers (monitor output, and anything else it renders) from the mic before it
+    /// reaches the virtual mic/monitor, so other call participants don't hear themselves back.
+    /// Needs the System Audio Recording permission (`SystemAudioTap`). Off by default: it's a
+    /// new feature, and the permission prompt shouldn't appear unasked.
+    var echoCancellation = false
 
     static let reductionRange: ClosedRange<Float> = -60 ... -6
 
-    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .fastenhancer, maxReductionDB: Float = -60) {
+    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .fastenhancer, maxReductionDB: Float = -60,
+         echoCancellation: Bool = false) {
         self.isEnabled = isEnabled
         self.engine = engine
         self.maxReductionDB = maxReductionDB
+        self.echoCancellation = echoCancellation
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isEnabled, engine, maxReductionDB
+        case isEnabled, engine, maxReductionDB, echoCancellation
     }
 
     init(from decoder: Decoder) throws {
@@ -41,5 +49,7 @@ struct NoiseSuppressionSettings: Codable, Equatable {
         // Configs from before 4.4 have no engine key; DPDFNet was the only engine then.
         engine = (try? container.decode(NoiseSuppressionEngine.self, forKey: .engine)) ?? .dpdfnet
         maxReductionDB = (try? container.decode(Float.self, forKey: .maxReductionDB)) ?? -60
+        // Configs from before echo cancellation shipped have no key; default off.
+        echoCancellation = (try? container.decode(Bool.self, forKey: .echoCancellation)) ?? false
     }
 }

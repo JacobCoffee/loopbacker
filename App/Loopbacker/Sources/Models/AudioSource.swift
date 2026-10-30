@@ -44,6 +44,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
     /// The monitor (hearing yourself) is denoised too. Off, it skips suppression and its delay;
     /// the virtual mic stays denoised.
     var denoiseMonitor: Bool
+    /// Echo cancellation for this device's voice routes, when it's switched on globally.
+    /// Mirrors `noiseSuppression`'s per-source opt-out. App captures are never run through it.
+    var echoCancellation: Bool
     /// Ordered device preferences for this source (most-preferred first). When the currently
     /// bound device disappears, the source rebinds to the next present entry; when a
     /// higher-preference device reappears, it switches back. Empty means "no opinion" — falls
@@ -65,6 +68,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         appBundleID: String = "",
         noiseSuppression: Bool = true,
         denoiseMonitor: Bool = true,
+        echoCancellation: Bool = true,
         fallbackDevices: [DeviceFallbackEntry] = []
     ) {
         self.id = id
@@ -81,6 +85,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.appBundleID = appBundleID
         self.noiseSuppression = noiseSuppression
         self.denoiseMonitor = denoiseMonitor
+        self.echoCancellation = echoCancellation
         self.fallbackDevices = fallbackDevices
     }
 
@@ -102,6 +107,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
         case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression, denoiseMonitor
+        case echoCancellation
         case fallbackDevices
     }
 
@@ -121,6 +127,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         appBundleID = (try? container.decode(String.self, forKey: .appBundleID)) ?? ""
         noiseSuppression = (try? container.decode(Bool.self, forKey: .noiseSuppression)) ?? true
         denoiseMonitor = (try? container.decode(Bool.self, forKey: .denoiseMonitor)) ?? true
+        echoCancellation = (try? container.decode(Bool.self, forKey: .echoCancellation)) ?? true
         fallbackDevices = (try? container.decode([DeviceFallbackEntry].self, forKey: .fallbackDevices)) ?? []
     }
 
