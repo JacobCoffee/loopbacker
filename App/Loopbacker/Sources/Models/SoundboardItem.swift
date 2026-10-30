@@ -51,7 +51,7 @@ struct SoundboardItem: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var name: String
     var emoji: String = ""
-    var fileBookmark: Data  // security-scoped bookmark for sandbox persistence
+    var fileBookmark: Data  // plain bookmark to the copy in Application Support/Loopbacker/sounds
     var volume: Float = 1.0
     var sortIndex: Int = 0
 
@@ -74,11 +74,14 @@ struct SoundboardItem: Identifiable, Codable, Equatable {
     var loudnessGainOffsetDB: Float? = nil
 
     /// Resolve the bookmark back to a URL. Returns nil if the file moved/deleted.
+    ///
+    /// The app isn't sandboxed, so bookmarks are plain (not security-scoped): resolving the saved
+    /// ones with `.withSecurityScope` fails with "isn't in the correct format".
     func resolveURL() -> URL? {
         var isStale = false
         guard let url = try? URL(
             resolvingBookmarkData: fileBookmark,
-            options: .withSecurityScope,
+            options: .withoutUI,
             relativeTo: nil,
             bookmarkDataIsStale: &isStale
         ) else { return nil }
@@ -87,7 +90,7 @@ struct SoundboardItem: Identifiable, Codable, Equatable {
 
     /// Create from a file URL (generates bookmark data)
     static func from(url: URL, name: String? = nil, sortIndex: Int = 0) -> SoundboardItem? {
-        guard let bookmark = try? url.bookmarkData(options: .withSecurityScope) else { return nil }
+        guard let bookmark = try? url.bookmarkData() else { return nil }
         let displayName = name ?? url.deletingPathExtension().lastPathComponent
         return SoundboardItem(
             name: displayName,
@@ -273,8 +276,6 @@ private actor SoundboardLoudnessMeasurer {
     /// for playback duplicating it to both channels (summed in BS.1770's weighted energy, ~3 LU
     /// louder than the same content measured as mono) instead of under-correcting for it.
     func integratedLoudness(url: URL) -> Float? {
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         guard let decoded = SoundboardPlayer.DecodedBuffer.decode(fileAt: url) else { return nil }
         defer { decoded.samples.deallocate() }
         return LoudnessMeter.integratedLoudness(

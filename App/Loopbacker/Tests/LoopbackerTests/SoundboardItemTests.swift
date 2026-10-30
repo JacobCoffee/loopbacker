@@ -64,6 +64,19 @@ struct SoundboardItemTests {
         #expect(decoded == item)
     }
 
+    @Test("A saved plain bookmark resolves back to its file")
+    func resolvesPlainBookmark() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pad-\(UUID().uuidString).wav")
+        try Data([0]).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // Boards saved by earlier versions hold plain bookmarks; resolving them as
+        // security-scoped fails, which left every pad unplayable.
+        let item = SoundboardItem(name: "Pad", fileBookmark: try url.bookmarkData())
+        #expect(item.resolveURL()?.resolvingSymlinksInPath().path == url.resolvingSymlinksInPath().path)
+    }
+
     @Test("Two clips mastered 10 dB apart get gain offsets that bring them to matching loudness")
     func loudnessMatchingClosesA10dBGap() {
         let sampleRate = 48000.0

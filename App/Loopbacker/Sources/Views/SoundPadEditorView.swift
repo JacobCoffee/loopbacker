@@ -185,8 +185,6 @@ enum SoundboardWaveform {
 
     static func load(url: URL, bucketCount: Int) async -> Result? {
         await Task.detached(priority: .utility) {
-            let accessing = url.startAccessingSecurityScopedResource()
-            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
             guard let file = try? AVAudioFile(forReading: url) else { return nil }
             let format = file.processingFormat
             let frameCount = AVAudioFrameCount(file.length)

@@ -406,8 +406,6 @@ private actor SoundboardEngine {
 
         // Resolve URL from bookmark
         guard let url = item.resolveURL() else { return nil }
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
         guard let decoded = DecodedBuffer.decode(fileAt: url) else {
             sbLogger.error("Failed to decode audio file")
@@ -468,8 +466,7 @@ extension SoundboardPlayer.DecodedBuffer {
     /// file measured on its native single channel reads ~3 LU quieter than the same content
     /// duplicated to stereo on playback, since BS.1770 sums weighted channel energy).
     ///
-    /// Not real-time safe (allocates, reads a whole file); the caller is responsible for
-    /// security-scoped resource access.
+    /// Not real-time safe (allocates, reads a whole file).
     static func decode(fileAt url: URL) -> SoundboardPlayer.DecodedBuffer? {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
 
