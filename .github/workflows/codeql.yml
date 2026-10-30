@@ -60,8 +60,8 @@ jobs:
               - App/Loopbacker/CRNNoise
               - App/Loopbacker/CWebRTCAEC
               - App/Loopbacker/CYSFX
+
       # Fewer parallel compiles than the default, to keep the Rosetta-traced build light.
-      # Two jobs keeps the Rosetta-traced build inside the runner's 7 GB.
       - name: Build Swift app
         if: matrix.language == 'swift'
         working-directory: App/Loopbacker
