@@ -54,7 +54,7 @@ struct EffectsPreset: Codable, Equatable {
         case version, isEnabled, nodes, appAudio
         // v1 (flat, no `nodes` key)
         case gateEnabled, gateThresholdDB, gateAttackMs, gateReleaseMs, gateReductionDB
-        case eqBands
+        case eqEnabled, eqBands
         case compressorEnabled, compressorThresholdDB, compressorRatio, compressorAttackMs, compressorReleaseMs, compressorMakeupDB
         case deEsserEnabled, deEsserFrequencyHz, deEsserReductionDB
         case chorusEnabled, chorusRate, chorusDepth, chorusMix
@@ -87,7 +87,7 @@ struct EffectsPreset: Codable, Equatable {
             gateEnabled: dec(.gateEnabled, true), gateMode: 0,
             gateThresholdDB: dec(.gateThresholdDB, -36), gateAttackMs: dec(.gateAttackMs, 5),
             gateReleaseMs: dec(.gateReleaseMs, 250), gateReductionDB: dec(.gateReductionDB, -12),
-            eqBands: dec(.eqBands, EQBandConfig.broadcast),
+            eqEnabled: dec(.eqEnabled, true), eqBands: dec(.eqBands, EQBandConfig.broadcast),
             compressorEnabled: dec(.compressorEnabled, true), compressorThresholdDB: dec(.compressorThresholdDB, -18),
             compressorRatio: dec(.compressorRatio, 3), compressorAttackMs: dec(.compressorAttackMs, 15),
             compressorReleaseMs: dec(.compressorReleaseMs, 200), compressorMakeupDB: dec(.compressorMakeupDB, 3),
@@ -120,7 +120,7 @@ struct EffectsPreset: Codable, Equatable {
     private static func v2Nodes(
         gateEnabled: Bool = true, gateMode: Float = 0, gateThresholdDB: Float = -36, gateAttackMs: Float = 5,
         gateReleaseMs: Float = 250, gateReductionDB: Float = -12,
-        eqBands: [EQBandConfig] = EQBandConfig.broadcast,
+        eqEnabled: Bool = true, eqBands: [EQBandConfig] = EQBandConfig.broadcast,
         compressorEnabled: Bool = true, compressorThresholdDB: Float = -18, compressorRatio: Float = 3,
         compressorAttackMs: Float = 15, compressorReleaseMs: Float = 200, compressorMakeupDB: Float = 3,
         deEsserEnabled: Bool = true, deEsserFrequencyHz: Float = 6000, deEsserReductionDB: Float = -6,
@@ -136,7 +136,7 @@ struct EffectsPreset: Codable, Equatable {
                 "attack": gateAttackMs, "hold": 0, "release": gateReleaseMs, "range": gateReductionDB,
                 "keyHighPass": 80,
             ]),
-            FXNodeConfig(kind: .eq, enabled: true, params: ["outputGain": 0], eqBands: eqBands),
+            FXNodeConfig(kind: .eq, enabled: eqEnabled, params: ["outputGain": 0], eqBands: eqBands),
             FXNodeConfig(kind: .compressor, enabled: compressorEnabled, params: [
                 "threshold": compressorThresholdDB, "ratio": compressorRatio, "knee": 0,
                 "attack": compressorAttackMs, "release": compressorReleaseMs, "detector": 0,
@@ -223,9 +223,51 @@ struct EffectsPresetManager {
         return try? encoder.encode(preset)
     }
 
-    /// Import preset from file data
-    static func importData(_ data: Data) -> EffectsPreset? {
-        try? JSONDecoder().decode(EffectsPreset.self, from: data)
+    /// Limits rejecting untrusted import files before they reach the hosted-plugin loaders:
+    /// a crafted preset otherwise costs a full parse/decode (or worse, a hosted node load) for
+    /// an arbitrarily large file.
+    static let maxImportFileSize = 4 * 1024 * 1024 // 4 MB
+    static let maxImportNodeCount = 64
+    static let maxImportPluginStateSize = 2 * 1024 * 1024 // 2 MB per node
+
+    enum ImportError: Error, LocalizedError {
+        case tooLarge(bytes: Int)
+        case tooManyNodes(count: Int)
+        case pluginStateTooLarge(nodeIndex: Int, bytes: Int)
+        case invalidData
+
+        var errorDescription: String? {
+            switch self {
+            case .tooLarge(let bytes):
+                return "Preset file is \(bytes / 1024) KB; the maximum is "
+                    + "\(EffectsPresetManager.maxImportFileSize / 1024) KB."
+            case .tooManyNodes(let count):
+                return "Preset has \(count) stages; the maximum is \(EffectsPresetManager.maxImportNodeCount)."
+            case .pluginStateTooLarge(let nodeIndex, let bytes):
+                return "Stage \(nodeIndex + 1)'s plugin state is \(bytes / (1024 * 1024)) MB; the maximum is "
+                    + "\(EffectsPresetManager.maxImportPluginStateSize / (1024 * 1024)) MB."
+            case .invalidData:
+                return "That file isn't a valid Loopbacker effects preset."
+            }
+        }
+    }
+
+    /// Import preset from file data, rejecting oversized untrusted content before it reaches
+    /// any hosted-plugin loader.
+    static func importData(_ data: Data) -> Result<EffectsPreset, ImportError> {
+        guard data.count <= maxImportFileSize else { return .failure(.tooLarge(bytes: data.count)) }
+        guard let preset = try? JSONDecoder().decode(EffectsPreset.self, from: data) else {
+            return .failure(.invalidData)
+        }
+        guard preset.nodes.count <= maxImportNodeCount else {
+            return .failure(.tooManyNodes(count: preset.nodes.count))
+        }
+        for (index, node) in preset.nodes.enumerated() {
+            if let stateSize = node.pluginState?.count, stateSize > maxImportPluginStateSize {
+                return .failure(.pluginStateTooLarge(nodeIndex: index, bytes: stateSize))
+            }
+        }
+        return .success(preset)
     }
 
     private static func sanitizedFileName(_ name: String) -> String {

@@ -67,6 +67,23 @@ struct EffectsPresetMigrationTests {
         #expect(eq.eqBands?[1].gainDB == -1.5)
     }
 
+    @Test("A bypassed v1 EQ (eqEnabled: false) stays bypassed after migration")
+    func eqBypassPreserved() throws {
+        let json = Self.v1PresetJSON.replacingOccurrences(of: "\"eqEnabled\": true", with: "\"eqEnabled\": false")
+        let preset = try JSONDecoder().decode(EffectsPreset.self, from: json.data(using: .utf8)!)
+        let eq = preset.nodes[1]
+        #expect(eq.kind == .eq)
+        #expect(eq.enabled == false)
+    }
+
+    @Test("A v1 export with no eqEnabled key (pre-dates the field) defaults the EQ to enabled")
+    func eqEnabledDefaultsTrueWhenMissing() throws {
+        let json = Self.v1PresetJSON.replacingOccurrences(of: "\"eqEnabled\": true,\n", with: "")
+        let preset = try JSONDecoder().decode(EffectsPreset.self, from: json.data(using: .utf8)!)
+        #expect(preset.nodes[1].kind == .eq)
+        #expect(preset.nodes[1].enabled == true)
+    }
+
     @Test("Compressor migrates with knee 0 and Peak detector (old behaviour)")
     func compressorValues() throws {
         let preset = try JSONDecoder().decode(EffectsPreset.self, from: Self.v1PresetJSON.data(using: .utf8)!)
