@@ -29,6 +29,20 @@ private enum Fixture {
         levels.flatMap { sineStereo(dBFS: $0, seconds: secondsPerBlock, sampleRate: sampleRate) }
     }
 
+    /// `n` bursts of a 1 kHz tone at `dBFS`, `burstSeconds` long, each followed by `gapSeconds`
+    /// of digital silence -- short enough that correct BS.1770 gating (400 ms blocks stepped
+    /// every 100 ms, not raw 100 ms steps) actually matters: a burst shorter than 400 ms only
+    /// ever appears gating blocks that also contain some silence.
+    static func burstsStereo(dBFS: Double, burstSeconds: Double, gapSeconds: Double, count: Int, sampleRate: Double = sampleRate) -> [Float] {
+        let silence = [Float](repeating: 0, count: Int(sampleRate * gapSeconds) * 2)
+        var samples: [Float] = []
+        for _ in 0..<count {
+            samples += sineStereo(dBFS: dBFS, seconds: burstSeconds, sampleRate: sampleRate)
+            samples += silence
+        }
+        return samples
+    }
+
     static func process(_ meter: LoudnessMeter, _ samples: [Float], channels: Int) {
         let frames = samples.count / channels
         samples.withUnsafeBufferPointer { buf in
@@ -60,6 +74,21 @@ struct LoudnessMeterTests {
         // ffmpeg measures -22.6 LUFS on this exact signal.
         #expect(abs(lufs - (-22.6)) < 0.5)
         #expect(lufs > -25) // clearly closer to -20 than a naive average with -30 would be
+    }
+
+    @Test("Integrated gating uses 400 ms blocks (4-step averages), not raw 100 ms steps")
+    func gatingUses400msBlocksNotRawSteps() {
+        // 10 bursts of a -14 dBFS tone, 100 ms each, separated by 400 ms of silence. A 100 ms
+        // step's own raw energy is just the burst (or just silence) depending which 100 ms
+        // window it lands in, but a correct 400 ms gating block straddling a burst's edge
+        // blends burst and silence energy -- gating on raw steps instead of 400 ms block
+        // averages changes which blocks pass the gate and the resulting integrated value.
+        // Cross-checked against `ffmpeg -af ebur128=peak=true` on this exact signal: -20.0 LUFS.
+        let samples = Fixture.burstsStereo(dBFS: -14, burstSeconds: 0.1, gapSeconds: 0.4, count: 10)
+        let lufs = samples.withUnsafeBufferPointer {
+            LoudnessMeter.integratedLoudness(samples: $0.baseAddress!, frames: samples.count / 2, channels: 2, sampleRate: Fixture.sampleRate)
+        }
+        #expect(abs(lufs - (-20.0)) < 0.5)
     }
 
     @Test("Absolute gate excludes near-silence from integrated loudness")

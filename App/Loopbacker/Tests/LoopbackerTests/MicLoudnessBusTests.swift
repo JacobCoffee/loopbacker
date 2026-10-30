@@ -86,4 +86,49 @@ struct MicLoudnessBusTests {
         #expect(combined.isFinite)
         #expect(combined > wideAlone)
     }
+
+    @Test("Once every feed stops, idle detection discards the pending cycle and clears momentary/short-term/true-peak, leaving integrated alone")
+    func idleClearsLiveWindowsButKeepsIntegrated() {
+        let bus = MicLoudnessBus.shared
+        var t: Float64 = 3_000_000
+
+        func block(_ samples: [Float]) -> [Float] { Array(samples[0..<(blockFrames * 2)]) }
+        let feedBlock = block(tone(amplitude: 0.2, blocks: 1, channels: 2))
+        _ = measureMomentary(bus, [(feedBlock, 2)], startingAt: &t)
+        #expect(bus.momentaryLUFS.isFinite)
+        #expect(bus.truePeakDBTP.isFinite)
+        let integratedBefore = bus.integratedLUFS()
+        #expect(integratedBefore.isFinite)
+
+        // Nothing contributes for several ticks: simulate the main thread's 30 Hz idle check
+        // (`AudioRouter.updatePublishedMeters`) after the feed's route/soundboard unit stopped.
+        for _ in 0..<6 { bus.checkForIdleContributors() }
+
+        #expect(bus.momentaryLUFS == -.infinity)
+        #expect(bus.shortTermLUFS == -.infinity)
+        #expect(bus.truePeakDBTP == -.infinity)
+        #expect(bus.integratedLUFS() == integratedBefore) // untouched
+    }
+
+    @Test("resetIntegrated still applies while idle, with no audio thread left to consume it")
+    func resetAppliesWhileIdle() {
+        let bus = MicLoudnessBus.shared
+        var t: Float64 = 4_000_000
+
+        func block(_ samples: [Float]) -> [Float] { Array(samples[0..<(blockFrames * 2)]) }
+        let feedBlock = block(tone(amplitude: 0.2, blocks: 1, channels: 2))
+        _ = measureMomentary(bus, [(feedBlock, 2)], startingAt: &t)
+        #expect(bus.integratedLUFS().isFinite)
+
+        for _ in 0..<6 { bus.checkForIdleContributors() } // go idle
+        bus.resetIntegrated()
+        // Visible immediately: `LoudnessMeter.integratedLUFS()` reports a pending reset the
+        // instant it's requested, before anything physically consumes it.
+        #expect(bus.integratedLUFS() == -.infinity)
+
+        // A later idle tick (no audio thread will ever reach a step boundary to do this) still
+        // consumes and applies the request.
+        bus.checkForIdleContributors()
+        #expect(bus.integratedLUFS() == -.infinity)
+    }
 }

@@ -96,6 +96,31 @@ struct SoundboardItemTests {
         #expect(abs(loudMatchedLUFS - SoundboardItem.loudnessMatchTargetLUFS) < 0.5)
     }
 
+    @Test("A mono file's measured loudness matches stereo-duplicated playback, not its native single channel")
+    func measuresMonoFileAsPlaybackDuplicatesIt() throws {
+        // BS.1770 sums weighted energy across channels: duplicating a mono signal to both
+        // playback channels (as `SoundboardPlayer` always does) measures ~3 LU louder than the
+        // same content on its native single channel. If import-time measurement used the file's
+        // native mono layout instead of the played-back stereo buffer, every mono pad's gain
+        // offset would under-correct by that ~3 LU, leaving it audibly hot once played.
+        let sampleRate = 48000.0
+        let mono = sineMono(dBFS: -20, seconds: 2, sampleRate: sampleRate)
+        let monoOnlyLUFS = mono.withUnsafeBufferPointer {
+            LoudnessMeter.integratedLoudness(samples: $0.baseAddress!, frames: mono.count, channels: 1, sampleRate: sampleRate)
+        }
+
+        let url = try writeMonoWAV(mono, sampleRate: sampleRate)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let decoded = try #require(SoundboardPlayer.DecodedBuffer.decode(fileAt: url))
+        defer { decoded.samples.deallocate() }
+        let playbackLUFS = LoudnessMeter.integratedLoudness(
+            samples: decoded.samples, frames: Int(decoded.frameCount), channels: Int(decoded.channelCount),
+            sampleRate: decoded.sampleRate
+        )
+
+        #expect(abs((playbackLUFS - monoOnlyLUFS) - 3.01) < 0.3)
+    }
+
     // MARK: - Fixtures
 
     private func sineStereo(dBFS: Double, seconds: Double, sampleRate: Double) -> [Float] {
@@ -113,5 +138,39 @@ struct SoundboardItemTests {
     private func applyGain(_ samples: [Float], dB: Float) -> [Float] {
         let linear = pow(10, dB / 20)
         return samples.map { $0 * linear }
+    }
+
+    private func sineMono(dBFS: Double, seconds: Double, sampleRate: Double) -> [Float] {
+        let amplitude = pow(10, dBFS / 20)
+        let frameCount = Int(sampleRate * seconds)
+        return (0..<frameCount).map { n in
+            Float(amplitude * sin(2 * Double.pi * 1000 * Double(n) / sampleRate))
+        }
+    }
+
+    /// Writes a 16-bit PCM mono WAV to a temp file, for tests that need a real file
+    /// `AVAudioFile` can decode (not just raw sample arrays).
+    private func writeMonoWAV(_ samples: [Float], sampleRate: Double) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+        var data = Data()
+        let pcm = samples.map { Int16(max(-1, min(1, $0)) * 32767) }
+        let dataSize = UInt32(pcm.count * 2)
+        func append<T>(_ value: T) { withUnsafeBytes(of: value) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: "RIFF".utf8)
+        append(UInt32(36 + dataSize).littleEndian)
+        data.append(contentsOf: "WAVE".utf8)
+        data.append(contentsOf: "fmt ".utf8)
+        append(UInt32(16).littleEndian)
+        append(UInt16(1).littleEndian) // PCM
+        append(UInt16(1).littleEndian) // mono
+        append(UInt32(sampleRate).littleEndian)
+        append(UInt32(sampleRate * 2).littleEndian) // byte rate
+        append(UInt16(2).littleEndian) // block align
+        append(UInt16(16).littleEndian) // bits per sample
+        data.append(contentsOf: "data".utf8)
+        append(dataSize.littleEndian)
+        for sample in pcm { append(sample.littleEndian) }
+        try data.write(to: url)
+        return url
     }
 }

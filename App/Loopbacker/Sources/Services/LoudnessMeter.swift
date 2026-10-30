@@ -44,6 +44,13 @@ final class LoudnessMeter {
     // the true peak is the max |value| seen across all of them.
 
     private static let truePeakTaps = 12
+    private static let truePeakPhases = 4
+    /// Source coefficients, read only once -- during `init`, to flatten into
+    /// `truePeakCoefficientsFlat` below. Swift's `static let` is lazily (and thread-safely)
+    /// initialized on first touch; if that first touch happened inside `accumulateTruePeak`
+    /// (the IO callback) it would allocate the nested `[[Double]]` on the real-time thread.
+    /// Touching it here in `init` instead (never read again after that) keeps that one-time
+    /// allocation off the audio thread.
     private static let truePeakCoefficients: [[Double]] = [
         [
             0.001708984375, 0.010986328125, -0.0196533203125, 0.033203125,
@@ -66,13 +73,18 @@ final class LoudnessMeter {
             0.033203125, -0.0196533203125, 0.010986328125, 0.001708984375,
         ],
     ]
+    /// Flattened `truePeakPhases * truePeakTaps` coefficients, phase-major (`[phase * taps +
+    /// tap]`), materialized from `truePeakCoefficients` once in `init` (non-real-time). Only
+    /// this flat buffer -- never `truePeakCoefficients` itself -- is read from
+    /// `accumulateTruePeak` (the IO callback), so there's no static-initialization or
+    /// array-of-arrays bridging work on the real-time thread.
+    private var truePeakCoefficientsFlat: UnsafeMutablePointer<Double>
     /// `channelCount * truePeakTaps` circular history, laid out per channel: `history[ch *
     /// truePeakTaps ..< (ch + 1) * truePeakTaps]`. Preallocated in `init`, mutated in place.
     private var truePeakHistory: UnsafeMutablePointer<Double>
     /// Per-channel write position within its 12-slot history (the index holding the most
     /// recently pushed sample).
     private var truePeakWriteIndex: UnsafeMutablePointer<Int>
-
     // MARK: - 100 ms step accumulation (400 ms gating blocks step every 100 ms, 75% overlap)
 
     private let stepFrames: Int
@@ -112,6 +124,16 @@ final class LoudnessMeter {
     private let momentaryPtr: UnsafeMutablePointer<Float>
     private let shortTermPtr: UnsafeMutablePointer<Float>
     private let truePeakPtr: UnsafeMutablePointer<Float>
+    /// Bumped whenever momentary/short-term/true-peak/integrated state actually changes (a new
+    /// 100 ms step, a consumed reset, or `clearLiveWindows`) -- callers that publish readings on
+    /// a timer (`AudioRouter`) compare this against the value they last published instead of
+    /// unconditionally re-reading and republishing every tick.
+    private let changeGenerationPtr: UnsafeMutablePointer<Int>
+    /// Set by `resetIntegrated()` (any thread), consumed only where it's safe to mutate the
+    /// histogram/totals without racing a concurrent writer: a 100 ms step boundary inside
+    /// `process` (this meter's own audio thread), or externally via `consumePendingReset()` once
+    /// a caller has confirmed there's no concurrent writer (see that method).
+    private let resetRequestedPtr: UnsafeMutablePointer<Bool>
 
     init(sampleRate: Double, channelCount: Int) {
         precondition(channelCount >= 1, "LoudnessMeter needs at least one channel")
@@ -124,6 +146,12 @@ final class LoudnessMeter {
         self.channelWeights = Array(repeating: 1.0, count: channelCount)
         (stage1, stage2) = Self.kWeightingCoefficients(sampleRate: sampleRate)
         filterState = Array(repeating: ChannelFilterState(), count: channelCount)
+        truePeakCoefficientsFlat = .allocate(capacity: Self.truePeakPhases * Self.truePeakTaps)
+        for phase in 0..<Self.truePeakPhases {
+            for tap in 0..<Self.truePeakTaps {
+                truePeakCoefficientsFlat[phase * Self.truePeakTaps + tap] = Self.truePeakCoefficients[phase][tap]
+            }
+        }
         truePeakHistory = .allocate(capacity: channelCount * Self.truePeakTaps)
         truePeakHistory.initialize(repeating: 0, count: channelCount * Self.truePeakTaps)
         truePeakWriteIndex = .allocate(capacity: channelCount)
@@ -147,6 +175,10 @@ final class LoudnessMeter {
         shortTermPtr.initialize(to: -.infinity)
         truePeakPtr = .allocate(capacity: 1)
         truePeakPtr.initialize(to: 0)
+        changeGenerationPtr = .allocate(capacity: 1)
+        changeGenerationPtr.initialize(to: 0)
+        resetRequestedPtr = .allocate(capacity: 1)
+        resetRequestedPtr.initialize(to: false)
     }
 
     deinit {
@@ -159,6 +191,9 @@ final class LoudnessMeter {
         truePeakPtr.deallocate()
         truePeakHistory.deallocate()
         truePeakWriteIndex.deallocate()
+        truePeakCoefficientsFlat.deallocate()
+        changeGenerationPtr.deallocate()
+        resetRequestedPtr.deallocate()
     }
 
     /// Derives the two K-weighting biquad stages for a given sample rate from BS.1770-4 Annex 1's
@@ -239,7 +274,8 @@ final class LoudnessMeter {
     /// polyphase FIR phases against it -- 4 points spaced 1/4 sample apart, interpolating the
     /// continuous-time waveform between this sample and its neighbors per BS.1770-4/5 Annex 2.
     /// Tracks the peak across all 4 phases (and so implicitly the original samples too: one
-    /// phase's dominant tap sits near unity gain, close to a pass-through).
+    /// phase's dominant tap sits near unity gain, close to a pass-through). Reads only
+    /// `truePeakCoefficientsFlat` (materialized in `init`), never the static source array.
     @inline(__always)
     private func accumulateTruePeak(_ x: Double, channel: Int) {
         let taps = Self.truePeakTaps
@@ -247,13 +283,13 @@ final class LoudnessMeter {
         let head = truePeakWriteIndex[channel]
         truePeakHistory[base + head] = x
 
-        for phase in 0..<Self.truePeakCoefficients.count {
-            let coeffs = Self.truePeakCoefficients[phase]
+        for phase in 0..<Self.truePeakPhases {
+            let phaseBase = phase * taps
             var acc = 0.0
             var lag = 0
             while lag < taps {
                 let idx = base + (head - lag + taps) % taps
-                acc += coeffs[lag] * truePeakHistory[idx]
+                acc += truePeakCoefficientsFlat[phaseBase + lag] * truePeakHistory[idx]
                 lag += 1
             }
             let a = abs(acc)
@@ -264,6 +300,13 @@ final class LoudnessMeter {
     }
 
     private func finalizeStep() {
+        changeGenerationPtr.pointee &+= 1
+        // A step boundary on this meter's own audio thread is a safe point to mutate the
+        // integrated-loudness histogram/totals -- nothing else writes them concurrently here --
+        // so a pending `resetIntegrated()` request is applied before this step's own data joins
+        // the (now-cleared) accumulation below.
+        consumePendingReset()
+
         var z = 0.0
         for ch in 0..<channelCount {
             z += channelWeights[ch] * (stepSumSquares[ch] / Double(stepSampleCount))
@@ -283,13 +326,21 @@ final class LoudnessMeter {
         shortTermFilled = min(shortTermFilled + 1, Self.shortTermSteps)
         shortTermPtr.pointee = Self.loudness(ofAverageZ: shortTermSum / Double(shortTermFilled))
 
-        let blockLoudness = Self.loudness(ofZ: z)
-        if blockLoudness >= Float(Self.histogramMinLUFS) {
-            sumAbsGatedZ += z
-            countAbsGatedZ += 1
-            let bin = binIndex(for: Double(blockLoudness))
-            histogramCount[bin] += 1
-            histogramSumZ[bin] += z
+        // Integrated-loudness gating (ITU-R BS.1770-4 §3) operates on 400 ms blocks stepped
+        // every 100 ms (75% overlap), not on raw 100 ms steps: each gating block's energy is the
+        // mean of the 4 most recent 100 ms step energies -- `momentarySum / momentarySteps`, the
+        // same window `momentaryLUFS` already tracks -- not this one step's `z` alone. Nothing
+        // is gated until a full 400 ms has accumulated.
+        if momentaryFilled == Self.momentarySteps {
+            let blockZ = momentarySum / Double(Self.momentarySteps)
+            let blockLoudness = Self.loudness(ofZ: blockZ)
+            if blockLoudness >= Float(Self.histogramMinLUFS) {
+                sumAbsGatedZ += blockZ
+                countAbsGatedZ += 1
+                let bin = binIndex(for: Double(blockLoudness))
+                histogramCount[bin] += 1
+                histogramSumZ[bin] += blockZ
+            }
         }
 
         let peakDB = stepPeak > 0 ? 20 * log10(stepPeak) : -Double.infinity
@@ -318,13 +369,21 @@ final class LoudnessMeter {
     /// 4x-oversampled true peak of the most recent 100 ms step, in dBTP.
     var truePeakDBTP: Float { truePeakPtr.pointee }
 
+    /// Bumped on every 100 ms step and every applied reset/clear -- callers that publish on a
+    /// timer compare this against the value they last saw instead of recomputing every tick.
+    var changeGeneration: Int { changeGenerationPtr.pointee }
+
     /// Gated integrated loudness (ITU-R BS.1770-4 §3: absolute gate at -70 LUFS, then a relative
     /// gate at -10 LU below the absolute-gated mean) over everything processed since the last
-    /// `resetIntegrated()`. `-infinity` if nothing has passed the absolute gate yet.
+    /// `resetIntegrated()`. `-infinity` if nothing has passed the absolute gate yet, or if a
+    /// reset was requested but not yet physically applied (a reset must be visible to readers
+    /// the instant it's requested, not only once the audio thread gets around to consuming it --
+    /// see `resetIntegrated`).
     ///
     /// Cheap enough to call every meter tick: it scans the fixed-size histogram (a few hundred
     /// microseconds), not the full block history.
     func integratedLUFS() -> Float {
+        guard !resetRequestedPtr.pointee else { return -.infinity }
         guard countAbsGatedZ > 0 else { return -.infinity }
         let avgZ1 = sumAbsGatedZ / Double(countAbsGatedZ)
         let gamma1 = -0.691 + 10 * log10(avgZ1)
@@ -344,15 +403,62 @@ final class LoudnessMeter {
         return Float(-0.691 + 10 * log10(avgZ2))
     }
 
-    /// Clears integrated-loudness accumulation (absolute-gate totals and the histogram) without
-    /// touching momentary/short-term state. Called from the main thread (a UI button); the
-    /// audio thread may be mid-step, which at worst drops one 100 ms block — the same benign
-    /// race the mix matrix already accepts on a routing change.
+    /// Requests that integrated-loudness accumulation (absolute-gate totals and the histogram)
+    /// be cleared, without touching momentary/short-term state. Safe to call from any thread (a
+    /// UI button): only sets a flag here -- `integratedLUFS()` reports the reset immediately
+    /// (see its doc comment), but the actual histogram/totals mutation is deferred to
+    /// `consumePendingReset()`, which only ever runs somewhere with no concurrent writer, so the
+    /// histogram is never torn by a main-thread clear racing an audio-thread write.
     func resetIntegrated() {
+        resetRequestedPtr.pointee = true
+        changeGenerationPtr.pointee &+= 1
+    }
+
+    /// Applies a pending `resetIntegrated()` request if one is set, returning whether it did.
+    /// Only ever safe to call from a context with no concurrent writer: a 100 ms step boundary
+    /// inside `process` (this meter's own audio thread, via `finalizeStep`), or externally once
+    /// a caller (`MicLoudnessBus`, confirmed idle) knows nothing else is writing this meter
+    /// concurrently.
+    @discardableResult
+    func consumePendingReset() -> Bool {
+        guard resetRequestedPtr.pointee else { return false }
+        resetRequestedPtr.pointee = false
         sumAbsGatedZ = 0
         countAbsGatedZ = 0
         histogramCount.update(repeating: 0, count: Self.histogramBinCount)
         histogramSumZ.update(repeating: 0, count: Self.histogramBinCount)
+        return true
+    }
+
+    /// Clears momentary/short-term/true-peak state (as if freshly constructed) and applies any
+    /// pending reset, but otherwise leaves integrated-loudness accumulation untouched. Called
+    /// when a feed goes idle so the UI doesn't keep showing a stale momentary/short-term/
+    /// true-peak reading -- so "On target" doesn't linger once nothing is playing. Like
+    /// `consumePendingReset()`, only safe to call where there's no concurrent writer.
+    func clearLiveWindows() {
+        consumePendingReset()
+        changeGenerationPtr.pointee &+= 1
+
+        for ch in 0..<channelCount { filterState[ch] = ChannelFilterState() }
+        stepSampleCount = 0
+        for ch in 0..<channelCount { stepSumSquares[ch] = 0 }
+        stepPeak = 0
+
+        momentaryRing.update(repeating: 0, count: Self.momentarySteps)
+        momentaryIndex = 0
+        momentaryFilled = 0
+        momentarySum = 0
+        momentaryPtr.pointee = -.infinity
+
+        shortTermRing.update(repeating: 0, count: Self.shortTermSteps)
+        shortTermIndex = 0
+        shortTermFilled = 0
+        shortTermSum = 0
+        shortTermPtr.pointee = -.infinity
+
+        truePeakHistory.update(repeating: 0, count: channelCount * Self.truePeakTaps)
+        truePeakWriteIndex.update(repeating: 0, count: channelCount)
+        truePeakPtr.pointee = -.infinity
     }
 }
 

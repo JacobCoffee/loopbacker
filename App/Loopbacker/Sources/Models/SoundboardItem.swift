@@ -267,34 +267,19 @@ class SoundboardState: ObservableObject {
 private actor SoundboardLoudnessMeasurer {
     static let shared = SoundboardLoudnessMeasurer()
 
-    /// Offline integrated loudness (ITU-R BS.1770-4) of a file, in LUFS.
+    /// Offline integrated loudness (ITU-R BS.1770-4) of a file, in LUFS -- measured on the exact
+    /// 48 kHz stereo buffer `SoundboardPlayer` plays back (`SoundboardPlayer.DecodedBuffer.decode`),
+    /// not the file's native sample rate/channel layout, so a mono clip's gain offset accounts
+    /// for playback duplicating it to both channels (summed in BS.1770's weighted energy, ~3 LU
+    /// louder than the same content measured as mono) instead of under-correcting for it.
     func integratedLoudness(url: URL) -> Float? {
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-        guard let file = try? AVAudioFile(forReading: url) else { return nil }
-        let format = file.processingFormat
-        let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
-        do {
-            try file.read(into: buffer)
-        } catch {
-            return nil
-        }
-        guard let channelData = buffer.floatChannelData else { return nil }
-        let channels = Int(format.channelCount)
-        let frames = Int(buffer.frameLength)
-        guard channels > 0, frames > 0 else { return nil }
-
-        var interleaved = [Float](repeating: 0, count: frames * channels)
-        for frame in 0..<frames {
-            for ch in 0..<channels {
-                interleaved[frame * channels + ch] = channelData[ch][frame]
-            }
-        }
-        return interleaved.withUnsafeBufferPointer {
-            LoudnessMeter.integratedLoudness(
-                samples: $0.baseAddress!, frames: frames, channels: channels, sampleRate: format.sampleRate
-            )
-        }
+        guard let decoded = SoundboardPlayer.DecodedBuffer.decode(fileAt: url) else { return nil }
+        defer { decoded.samples.deallocate() }
+        return LoudnessMeter.integratedLoudness(
+            samples: decoded.samples, frames: Int(decoded.frameCount), channels: Int(decoded.channelCount),
+            sampleRate: decoded.sampleRate
+        )
     }
 }

@@ -46,7 +46,11 @@ struct SoundboardView: View {
             Text("This removes every sound from the soundboard. This can't be undone.")
         }
         .sheet(item: $editingItem) { item in
-            SoundPadEditorView(item: binding(for: item.id), onClose: { editingItem = nil })
+            SoundPadEditorView(
+                item: binding(for: item.id),
+                onClose: { editingItem = nil },
+                onRemeasure: { soundboardState.measureLoudnessIfNeeded(for: item.id) }
+            )
         }
     }
 

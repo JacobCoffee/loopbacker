@@ -6,6 +6,7 @@ import AVFoundation
 struct SoundPadEditorView: View {
     @Binding var item: SoundboardItem
     let onClose: () -> Void
+    let onRemeasure: () -> Void
 
     @State private var peaks: [Float] = []
     @State private var duration: Double = 0
@@ -151,6 +152,7 @@ struct SoundPadEditorView: View {
             Spacer()
             Button("Re-measure") {
                 item.loudnessGainOffsetDB = nil
+                onRemeasure()
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -236,8 +238,11 @@ struct WaveformTrimView: View {
             ZStack(alignment: .leading) {
                 waveformBars(width: width, height: height)
                 trimmedOverlay(width: width, height: height)
+                fadeOverlay(width: width, height: height)
                 handle(seconds: $trimStart, width: width, color: .loopbacker)
                 handle(seconds: $trimEnd, width: width, color: .loopbacker)
+                fadeHandle(seconds: fadeInHandleBinding, width: width)
+                fadeHandle(seconds: fadeOutHandleBinding, width: width)
             }
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: Metrics.innerRadius))
         }
@@ -283,6 +288,29 @@ struct WaveformTrimView: View {
         .allowsHitTesting(false)
     }
 
+    /// Shades the fade-in/fade-out ramps within the trim window: darkest at the trim edge,
+    /// clear by the time the fade ends.
+    private func fadeOverlay(width: CGFloat, height: CGFloat) -> some View {
+        let fadeInStartX = x(for: trimStart, width: width)
+        let fadeInEndX = x(for: trimStart + fadeInSeconds, width: width)
+        let fadeOutStartX = x(for: trimEnd - fadeOutSeconds, width: width)
+        let fadeOutEndX = x(for: trimEnd, width: width)
+        return ZStack(alignment: .leading) {
+            if fadeInSeconds > 0 {
+                LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: max(0, fadeInEndX - fadeInStartX), height: height)
+                    .offset(x: fadeInStartX)
+            }
+            if fadeOutSeconds > 0 {
+                LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: max(0, fadeOutEndX - fadeOutStartX), height: height)
+                    .offset(x: fadeOutStartX)
+            }
+        }
+        .frame(width: width, height: height)
+        .allowsHitTesting(false)
+    }
+
     private func handle(seconds: Binding<Double>, width: CGFloat, color: Color) -> some View {
         Rectangle()
             .fill(color)
@@ -297,6 +325,58 @@ struct WaveformTrimView: View {
             .accessibilityElement()
             .accessibilityLabel("Trim handle")
             .accessibilityValue(Self.formatSeconds(seconds.wrappedValue))
+    }
+
+    /// A small draggable knob near the top of the waveform marking where a fade ends -- distinct
+    /// from the full-height trim handles below it.
+    private func fadeHandle(seconds: Binding<Double>, width: CGFloat) -> some View {
+        Circle()
+            .fill(Color.orange)
+            .frame(width: 10, height: 10)
+            .offset(x: x(for: seconds.wrappedValue, width: width) - 5, y: -40)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        seconds.wrappedValue = self.seconds(forX: value.location.x, width: width)
+                    }
+            )
+            .accessibilityElement()
+            .accessibilityLabel("Fade handle")
+            .accessibilityValue(Self.formatSeconds(seconds.wrappedValue))
+    }
+
+    /// Position (in seconds from the top of the file) of the fade-in handle: where the fade-in
+    /// ramp ends, `fadeInSeconds` after `trimStart`. Dragging it sets `fadeInSeconds`, clamped to
+    /// the active trim window.
+    private var fadeInHandleBinding: Binding<Double> {
+        Binding(
+            get: { trimStart + fadeInSeconds },
+            set: { fadeInSeconds = Self.fadeInSeconds(forHandleSeconds: $0, trimStart: trimStart, trimEnd: trimEnd) }
+        )
+    }
+
+    /// Position of the fade-out handle: where the fade-out ramp begins, `fadeOutSeconds` before
+    /// `trimEnd`. Dragging it sets `fadeOutSeconds`, clamped to the active trim window.
+    private var fadeOutHandleBinding: Binding<Double> {
+        Binding(
+            get: { trimEnd - fadeOutSeconds },
+            set: { fadeOutSeconds = Self.fadeOutSeconds(forHandleSeconds: $0, trimStart: trimStart, trimEnd: trimEnd) }
+        )
+    }
+
+    /// Converts a fade-in handle's x-mapped seconds position into a `fadeInSeconds` duration,
+    /// clamped so the handle can't be dragged outside `[trimStart, trimEnd]`. `nonisolated`: a
+    /// pure computation that doesn't touch any `@MainActor`-isolated state (unlike `View`
+    /// conformance would otherwise imply), so it's callable from a plain test context.
+    nonisolated static func fadeInSeconds(forHandleSeconds seconds: Double, trimStart: Double, trimEnd: Double) -> Double {
+        max(trimStart, min(trimEnd, seconds)) - trimStart
+    }
+
+    /// Converts a fade-out handle's x-mapped seconds position into a `fadeOutSeconds` duration,
+    /// clamped so the handle can't be dragged outside `[trimStart, trimEnd]`. `nonisolated` for
+    /// the same reason as `fadeInSeconds(forHandleSeconds:...)` above.
+    nonisolated static func fadeOutSeconds(forHandleSeconds seconds: Double, trimStart: Double, trimEnd: Double) -> Double {
+        trimEnd - max(trimStart, min(trimEnd, seconds))
     }
 
     private static func formatSeconds(_ seconds: Double) -> String {

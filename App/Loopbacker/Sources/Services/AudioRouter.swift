@@ -52,6 +52,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// True once a tick finds every RT-written meter buffer silent; lets the next tick skip all
     /// publishing work (see `updatePublishedMeters`) instead of re-checking and re-pushing zeros.
     private var wasSilentMeters = false
+    /// The `MicLoudnessBus.changeGeneration` value last published to `loudness`; lets
+    /// `updatePublishedMeters` skip re-reading and republishing the mic loudness reading on
+    /// ticks where nothing about it has changed (see that method).
+    private var lastPublishedLoudnessGeneration = -1
 
     /// Upper bound on channels a single route captures or plays (keeps the mix matrix small
     /// for very wide interfaces).
@@ -803,13 +807,30 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// once a tick publishes an all-silent snapshot every later tick reads the same zeros until
     /// real audio returns. `isEverythingSilent` is a read-only pass over the raw buffers (no
     /// allocation); when it agrees with `wasSilentMeters` this tick skips draining and building
-    /// the per-route dictionaries. Loudness is still read every tick (see below).
+    /// the per-route dictionaries. Loudness is cached separately (see below) and only re-read
+    /// when `MicLoudnessBus` reports something actually changed.
     private func updatePublishedMeters() {
+        // Cached flag, not a window walk: closing the main window only hides it (SwiftUI keeps
+        // its view graph alive), so without this every tick would still drain/publish meters and
+        // scan the loudness histogram for a window nobody sees.
+        let isVisible = MainActor.assumeIsolated { MeterWindowVisibility.shared.isVisible }
+        guard isVisible else { return }
+
+        // Drives `MicLoudnessBus`'s idle state machine (clearing momentary/short-term/true-peak
+        // once every feed has stopped, consuming a reset request made while idle) regardless of
+        // whether anything below ends up republishing.
+        MicLoudnessBus.shared.checkForIdleContributors()
+        let loudnessGeneration = MicLoudnessBus.shared.changeGeneration
+        let loudnessChanged = loudnessGeneration != lastPublishedLoudnessGeneration
+
         // Only the legacy peak-meter work (source/output dB bars) can be skipped on a silent
-        // tick: `MicLoudnessBus` may still have fresh data from a feed `isEverythingSilent`
-        // doesn't know about (the soundboard's loopback unit isn't an AudioRouter route), so
-        // loudness is always read and published below, independent of this gate.
+        // tick that also has no fresh loudness data -- a loudness change alone (e.g. the
+        // soundboard, which isn't an AudioRouter route, is the only thing playing) still needs
+        // this tick to run far enough to publish it.
         let skipPeakMeters = wasSilentMeters && isEverythingSilent()
+        if skipPeakMeters && !loudnessChanged {
+            return
+        }
 
         var newSourceLevels: [String: [Int: Float]] = [:]
         var newOutputLevels: [Int: Float] = [:]
@@ -834,22 +855,19 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let outputLevels = newOutputLevels
         let routesEmpty = activeRoutes.isEmpty
         // The virtual mic's loudness is combined across every feed by `MicLoudnessBus` itself
-        // (summed per IO cycle on the shared device thread), so there's nothing to group here --
-        // just read its current state. Cheap (a handful of property reads plus a histogram scan
-        // over a few hundred fixed bins), so always done, not gated on route activity.
-        let micLoudness = LoudnessReading(
+        // (summed per IO cycle on the shared device thread), so there's nothing to group here.
+        // `integratedLUFS()` scans a fixed-size histogram (a few hundred microseconds) -- cheap,
+        // but not free enough to redo on every 30 Hz tick regardless of whether anything
+        // changed, so it's only read when `loudnessChanged`.
+        let micLoudness: LoudnessReading? = loudnessChanged ? LoudnessReading(
             momentaryLUFS: MicLoudnessBus.shared.momentaryLUFS,
             shortTermLUFS: MicLoudnessBus.shared.shortTermLUFS,
             integratedLUFS: MicLoudnessBus.shared.integratedLUFS(),
             truePeakDBTP: MicLoudnessBus.shared.truePeakDBTP
-        )
-        MainActor.assumeIsolated {
-            // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
-            // publish re-renders the cables and meters of a window nobody sees. Publish only while
-            // a window that shows meters (main window, menu bar panel) is on screen -- the same
-            // signal `MeterWindowVisibility` exposes for UI that polls a level directly.
-            guard MeterWindowVisibility.compute() else { return }
+        ) : nil
+        if loudnessChanged { lastPublishedLoudnessGeneration = loudnessGeneration }
 
+        MainActor.assumeIsolated {
             if !skipPeakMeters {
                 // Skip later silent ticks only once these zeros are on screen; a hidden window
                 // must still get them when it reappears, or it would keep showing stale levels.
@@ -874,7 +892,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 }
             }
 
-            loudness.update(deviceUID: VirtualDeviceChannels.micUID, micLoudness)
+            if let micLoudness {
+                loudness.update(deviceUID: VirtualDeviceChannels.micUID, micLoudness)
+            }
         }
     }
 

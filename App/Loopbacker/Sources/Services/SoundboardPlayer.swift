@@ -32,8 +32,10 @@ final class SoundboardPlayer: ObservableObject {
 
     // MARK: - Decoded audio buffer
 
-    /// Immutable once decoded; render callbacks only read `samples`.
-    fileprivate struct DecodedBuffer: @unchecked Sendable {
+    /// Immutable once decoded; render callbacks only read `samples`. Internal (not
+    /// `fileprivate`) so `decode(fileAt:)` below can also be used by `SoundboardLoudnessMeasurer`
+    /// (`SoundboardItem.swift`) to measure a file in the exact format it's played back in.
+    struct DecodedBuffer: @unchecked Sendable {
         let samples: UnsafeMutablePointer<Float>  // interleaved stereo float32
         let frameCount: UInt32
         let channelCount: UInt32
@@ -133,6 +135,7 @@ final class SoundboardPlayer: ObservableObject {
             for instanceID in pending { startingInstances.remove(instanceID) }
         }
         let instanceIDs = instancesByItem.removeValue(forKey: id) ?? []
+        pendingChokeGroups.removeValue(forKey: id)
         for instanceID in instanceIDs {
             guard let ctx = activePlaybacks.removeValue(forKey: instanceID) else { continue }
             Self.teardown(ctx)
@@ -143,6 +146,7 @@ final class SoundboardPlayer: ObservableObject {
 
     func stopAll() {
         startingInstances.removeAll()
+        pendingChokeGroups.removeAll()
         for id in Array(instancesByItem.keys) {
             stop(id: id)
         }
@@ -150,20 +154,35 @@ final class SoundboardPlayer: ObservableObject {
 
     // MARK: - Internal playback
 
-    /// Stops any other pad sharing `item`'s choke group, then starts a new instance.
+    // MARK: - Choke groups
+
+    /// Choke group of each item that has at least one instance still starting (in
+    /// `startingInstances`, not yet in `activePlaybacks`) -- so a second trigger in the same
+    /// group can stop one still being decoded/prepared, not just ones already playing. Cleared
+    /// once that item has no instances left at all, starting or active (see `finishInstance` and
+    /// `stop(id:)`); an entry can outlive the specific instance that created it once that
+    /// instance activates, which is harmless since `stopChokeGroup` only needs item ids.
+    private var pendingChokeGroups: [UUID: String] = [:]
+
+    /// Stops any other pad sharing `item`'s choke group -- including ones still being prepared,
+    /// not just already-playing ones -- then starts a new instance.
     private func trigger(item: SoundboardItem) {
         stopChokeGroup(of: item)
         startInstance(item: item)
     }
 
     private func stopChokeGroup(of item: SoundboardItem) {
-        guard let group = item.chokeGroup, !group.isEmpty else { return }
-        let itemsToStop = Set(
-            activePlaybacks.values
-                .filter { $0.chokeGroup == group && $0.itemID != item.id }
-                .map(\.itemID)
+        let activeGroups = Dictionary(
+            uniqueKeysWithValues: activePlaybacks.values.compactMap { ctx in
+                ctx.chokeGroup.map { (ctx.itemID, $0) }
+            }
         )
-        for id in itemsToStop { stop(id: id) }
+        for id in soundboardChokeGroupTargets(
+            triggeredItemID: item.id, triggeredGroup: item.chokeGroup,
+            activeGroups: activeGroups, pendingGroups: pendingChokeGroups
+        ) {
+            stop(id: id)
+        }
     }
 
     private func startInstance(item: SoundboardItem) {
@@ -171,6 +190,9 @@ final class SoundboardPlayer: ObservableObject {
         startingInstances.insert(instanceID)
         instancesByItem[item.id, default: []].insert(instanceID)
         playingIDs.insert(item.id)
+        if let group = item.chokeGroup, !group.isEmpty {
+            pendingChokeGroups[item.id] = group
+        }
 
         let volume = globalVolume
         Task {
@@ -201,6 +223,7 @@ final class SoundboardPlayer: ObservableObject {
         if instancesByItem[itemID]?.isEmpty ?? true {
             instancesByItem.removeValue(forKey: itemID)
             playingIDs.remove(itemID)
+            pendingChokeGroups.removeValue(forKey: itemID)
         }
     }
 
@@ -386,99 +409,11 @@ private actor SoundboardEngine {
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
-        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
-
-        let srcFormat = audioFile.processingFormat
-        let frameCount = UInt32(audioFile.length)
-        guard frameCount > 0 else { return nil }
-
-        // Always decode to 48kHz stereo float32 to match the Loopbacker virtual device
-        let targetSampleRate: Double = 48000.0
-        let channelCount: UInt32 = 2
-        // Estimate output frame count after resampling
-        let resampledFrameCount = UInt32(Double(frameCount) * targetSampleRate / srcFormat.sampleRate) + 256
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: targetSampleRate,
-            channels: AVAudioChannelCount(channelCount),
-            interleaved: true
-        ) else { return nil }
-
-        // Read the entire file into a non-interleaved buffer (AVAudioFile's native output)
-        let readFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: srcFormat.sampleRate,
-            channels: AVAudioChannelCount(srcFormat.channelCount),
-            interleaved: false
-        )!
-        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: frameCount) else { return nil }
-        do {
-            try audioFile.read(into: srcBuffer)
-        } catch {
-            sbLogger.error("Failed to read audio file: \(error)")
+        guard let decoded = DecodedBuffer.decode(fileAt: url) else {
+            sbLogger.error("Failed to decode audio file")
             return nil
         }
-        sbLogger.info("Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz, \(srcFormat.channelCount)ch")
-        print("[Soundboard] Decoded \(srcBuffer.frameLength) frames at \(srcFormat.sampleRate)Hz")
-
-        // Convert to interleaved stereo float32 at 48kHz
-        guard let converter = AVAudioConverter(from: readFormat, to: targetFormat) else {
-            sbLogger.error("Failed to create audio converter")
-            return nil
-        }
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: resampledFrameCount) else { return nil }
-
-        // Use the simple block-based conversion with proper data supply
-        var inputConsumed = false
-        var convError: NSError?
-        converter.convert(to: outBuffer, error: &convError) { _, outStatus in
-            if inputConsumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            inputConsumed = true
-            outStatus.pointee = .haveData
-            return srcBuffer
-        }
-
-        if let err = convError {
-            sbLogger.error("Conversion error: \(err)")
-            return nil
-        }
-
-        let actualFrames = outBuffer.frameLength
-        guard actualFrames > 0 else {
-            sbLogger.error("Conversion produced 0 frames")
-            return nil
-        }
-        sbLogger.info("Converted to \(actualFrames) frames at 48kHz stereo")
-        print("[Soundboard] Converted to \(actualFrames) frames at 48kHz stereo")
-
-        let totalSamples = Int(actualFrames * channelCount)
-        let samples = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
-
-        // Copy to interleaved buffer
-        if let floatData = outBuffer.floatChannelData {
-            if targetFormat.isInterleaved {
-                memcpy(samples, floatData[0], totalSamples * MemoryLayout<Float>.size)
-            } else {
-                // Interleave from separate channel buffers
-                let srcChannels = Int(min(channelCount, UInt32(outBuffer.format.channelCount)))
-                for frame in 0..<Int(actualFrames) {
-                    for ch in 0..<Int(channelCount) {
-                        let srcCh = min(ch, srcChannels - 1)  // mono -> duplicate to both channels
-                        samples[frame * Int(channelCount) + ch] = floatData[srcCh][frame]
-                    }
-                }
-            }
-        }
-
-        let decoded = DecodedBuffer(
-            samples: samples,
-            frameCount: actualFrames,
-            channelCount: channelCount,
-            sampleRate: targetSampleRate
-        )
+        sbLogger.info("Decoded \(decoded.frameCount) frames at \(decoded.sampleRate)Hz, \(decoded.channelCount)ch")
 
         decodedCache[item.fileBookmark] = decoded
         return decoded
@@ -521,6 +456,106 @@ private actor SoundboardEngine {
         }
         return nil
     }
+}
+
+// MARK: - Shared file decode (playback + loudness measurement)
+
+extension SoundboardPlayer.DecodedBuffer {
+    /// Decodes `url` to 48 kHz interleaved stereo float32, mono duplicated to both channels --
+    /// the exact format every unit in this file plays back. Reused by
+    /// `SoundboardLoudnessMeasurer` (`SoundboardItem.swift`) so a pad's measured loudness always
+    /// matches what's actually heard, not the file's on-disk sample rate/channel layout (a mono
+    /// file measured on its native single channel reads ~3 LU quieter than the same content
+    /// duplicated to stereo on playback, since BS.1770 sums weighted channel energy).
+    ///
+    /// Not real-time safe (allocates, reads a whole file); the caller is responsible for
+    /// security-scoped resource access.
+    static func decode(fileAt url: URL) -> SoundboardPlayer.DecodedBuffer? {
+        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
+
+        let srcFormat = audioFile.processingFormat
+        let frameCount = UInt32(audioFile.length)
+        guard frameCount > 0 else { return nil }
+
+        let targetSampleRate: Double = 48000.0
+        let channelCount: UInt32 = 2
+        let resampledFrameCount = UInt32(Double(frameCount) * targetSampleRate / srcFormat.sampleRate) + 256
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: targetSampleRate,
+            channels: AVAudioChannelCount(channelCount),
+            interleaved: true
+        ) else { return nil }
+
+        let readFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: srcFormat.sampleRate,
+            channels: AVAudioChannelCount(srcFormat.channelCount),
+            interleaved: false
+        )!
+        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: frameCount) else { return nil }
+        do {
+            try audioFile.read(into: srcBuffer)
+        } catch {
+            return nil
+        }
+
+        guard let converter = AVAudioConverter(from: readFormat, to: targetFormat) else { return nil }
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: resampledFrameCount) else { return nil }
+
+        var inputConsumed = false
+        var convError: NSError?
+        converter.convert(to: outBuffer, error: &convError) { _, outStatus in
+            if inputConsumed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return srcBuffer
+        }
+        guard convError == nil else { return nil }
+
+        let actualFrames = outBuffer.frameLength
+        guard actualFrames > 0 else { return nil }
+
+        let totalSamples = Int(actualFrames * channelCount)
+        let samples = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
+        if let floatData = outBuffer.floatChannelData {
+            if targetFormat.isInterleaved {
+                memcpy(samples, floatData[0], totalSamples * MemoryLayout<Float>.size)
+            } else {
+                // Interleave from separate channel buffers
+                let srcChannels = Int(min(channelCount, UInt32(outBuffer.format.channelCount)))
+                for frame in 0..<Int(actualFrames) {
+                    for ch in 0..<Int(channelCount) {
+                        let srcCh = min(ch, srcChannels - 1)  // mono -> duplicate to both channels
+                        samples[frame * Int(channelCount) + ch] = floatData[srcCh][frame]
+                    }
+                }
+            }
+        }
+
+        return SoundboardPlayer.DecodedBuffer(
+            samples: samples, frameCount: actualFrames, channelCount: channelCount, sampleRate: targetSampleRate
+        )
+    }
+}
+
+// MARK: - Choke group decision
+
+/// Every item id that must stop because it shares `triggeredGroup` with the item that was just
+/// triggered -- including items with an instance still being decoded/prepared (`pendingGroups`),
+/// not just ones already in `activePlaybacks` (`activeGroups`), so a second trigger in a choke
+/// group cancels one still starting instead of letting it start playing alongside the new one.
+func soundboardChokeGroupTargets(
+    triggeredItemID: UUID, triggeredGroup: String?,
+    activeGroups: [UUID: String], pendingGroups: [UUID: String]
+) -> Set<UUID> {
+    guard let group = triggeredGroup, !group.isEmpty else { return [] }
+    var targets = Set(activeGroups.filter { $0.value == group && $0.key != triggeredItemID }.keys)
+    targets.formUnion(pendingGroups.filter { $0.value == group && $0.key != triggeredItemID }.keys)
+    return targets
 }
 
 // MARK: - Fade envelope
