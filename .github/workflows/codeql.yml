@@ -1,0 +1,73 @@
+# Replaces GitHub's default CodeQL setup. Default setup builds Swift with an unbounded
+# `swift build` under Rosetta; since the app links ~1,500 vendored C/C++ files that build
+# wedged the macOS runner (3 runs, none finished). It also can't skip vendored code.
+# Categories match the old default setup so existing alerts and dismissals carry over.
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            runner: ubuntu-latest
+            build-mode: none
+          - language: python
+            runner: ubuntu-latest
+            build-mode: none
+          - language: c-cpp
+            runner: ubuntu-latest
+            build-mode: none
+          - language: swift
+            runner: macos-26
+            build-mode: manual
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: |
+            paths-ignore:
+              - App/Loopbacker/CAirwindows
+              - App/Loopbacker/CRNNoise
+              - App/Loopbacker/CWebRTCAEC
+              - App/Loopbacker/CYSFX
+      # Fewer parallel compiles than the default, to keep the Rosetta-traced build light.
+      # Two jobs keeps the Rosetta-traced build inside the runner's 7 GB.
+      - name: Build Swift app
+        if: matrix.language == 'swift'
+        working-directory: App/Loopbacker
+        run: swift build -j 2
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
