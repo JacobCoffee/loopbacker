@@ -3,7 +3,9 @@ import Combine
 import Sparkle
 
 /// A found update waiting on the user (or app quit) to decide what happens next. Sparkle keeps
-/// its session open until `reply` is invoked with a choice.
+/// its session open until `reply` is invoked with a choice. `AppUpdater` is the only caller and
+/// always nils out its `availableUpdate` reference before invoking `install()`/`dismiss()`, so the
+/// closure captured here is never called twice even if two call sites race (click + quit hook).
 struct AvailableAppUpdate {
     let displayVersion: String
     let isUserInitiated: Bool
@@ -32,15 +34,27 @@ final class AppUpdater: NSObject, ObservableObject {
     static let shared = AppUpdater()
 
     @Published private(set) var availableUpdate: AvailableAppUpdate?
+    /// Set once `availableUpdate` has been consumed by `installAvailableUpdate()` or
+    /// `installPendingUpdateOnQuit()`, until the session ends. The menu bar panel and app menu
+    /// show this as a non-actionable "Installing…" row instead of the dismissed Install button.
+    @Published private(set) var installingVersion: String?
     @Published private(set) var isDownloading = false
     @Published private(set) var downloadProgress: Double?
     @Published private(set) var lastCheckError: String?
     @Published private(set) var canCheckForUpdates = false
     @Published private(set) var didFindNoUpdate = false
+    /// True once we've told Sparkle to install (`reply(.install)`), until the process exits.
+    /// `AppDelegate.applicationShouldTerminate` honors Sparkle's own termination request
+    /// unconditionally while this is set, instead of treating it like a user-initiated quit.
+    private(set) var isTerminatingForUpdate = false
+
+    private var pendingTerminationRetry: (() -> Void)?
+    private var canCheckForUpdatesObservation: NSKeyValueObservation?
 
     private lazy var userDriver = GentleUserDriver(
         onUpdateFound: { [weak self] update in
             self?.availableUpdate = update
+            self?.installingVersion = nil
             self?.didFindNoUpdate = false
         },
         onDownloadProgress: { [weak self] downloading, progress in
@@ -53,10 +67,28 @@ final class AppUpdater: NSObject, ObservableObject {
         onError: { [weak self] message in
             self?.lastCheckError = message
         },
+        onInstalling: { [weak self] applicationTerminated, retryTerminatingApplication in
+            guard let self else { return }
+            isDownloading = true
+            downloadProgress = nil
+            guard !applicationTerminated else {
+                pendingTerminationRetry = nil
+                return
+            }
+            pendingTerminationRetry = retryTerminatingApplication
+            // We already agreed to quit (isTerminatingForUpdate, set before `install()` was
+            // called); if Sparkle's termination request didn't go through yet, ask it to try
+            // again instead of leaving the install stuck waiting on a quit that never happens.
+            if isTerminatingForUpdate {
+                retryTerminatingApplication()
+            }
+        },
         onSessionEnded: { [weak self] in
             self?.availableUpdate = nil
+            self?.installingVersion = nil
             self?.isDownloading = false
             self?.downloadProgress = nil
+            self?.pendingTerminationRetry = nil
         }
     )
 
@@ -75,6 +107,14 @@ final class AppUpdater: NSObject, ObservableObject {
             lastCheckError = "Updater didn't start: \(error.localizedDescription)"
         }
         canCheckForUpdates = updater.canCheckForUpdates
+        // Sparkle flips `canCheckForUpdates` false synchronously when a check starts and true
+        // again asynchronously once the session ends; observe it instead of snapshotting once.
+        canCheckForUpdatesObservation = updater.observe(\.canCheckForUpdates, options: [.new]) { [weak self] _, change in
+            guard let newValue = change.newValue else { return }
+            Task { @MainActor in
+                self?.canCheckForUpdates = newValue
+            }
+        }
     }
 
     /// User-initiated check from the app menu or menu bar panel.
@@ -82,22 +122,31 @@ final class AppUpdater: NSObject, ObservableObject {
         didFindNoUpdate = false
         lastCheckError = nil
         updater.checkForUpdates()
-        canCheckForUpdates = updater.canCheckForUpdates
     }
 
     func installAvailableUpdate() {
-        availableUpdate?.install()
+        guard let update = availableUpdate else { return }
+        availableUpdate = nil
+        installingVersion = update.displayVersion
+        isTerminatingForUpdate = true
+        update.install()
     }
 
     func dismissAvailableUpdate() {
-        availableUpdate?.dismiss()
+        guard let update = availableUpdate else { return }
+        availableUpdate = nil
+        update.dismiss()
     }
 
     /// Called from `applicationShouldTerminate`. If an update already finished downloading and is
     /// just waiting on the user, install it now so it's ready next launch; Sparkle's helper tool
-    /// finishes the install after this process exits.
+    /// finishes the install after this process exits. No-ops if nothing is pending, or if it was
+    /// already consumed by a racing `installAvailableUpdate()` call.
     func installPendingUpdateOnQuit() {
         guard let update = availableUpdate, update.isAlreadyDownloaded else { return }
+        availableUpdate = nil
+        installingVersion = update.displayVersion
+        isTerminatingForUpdate = true
         update.install()
     }
 }
@@ -110,6 +159,7 @@ private final class GentleUserDriver: NSObject, SPUUserDriver {
     private let onDownloadProgress: (Bool, Double?) -> Void
     private let onNoUpdateFound: () -> Void
     private let onError: (String) -> Void
+    private let onInstalling: (Bool, @escaping () -> Void) -> Void
     private let onSessionEnded: () -> Void
 
     private var expectedContentLength: UInt64 = 0
@@ -120,12 +170,14 @@ private final class GentleUserDriver: NSObject, SPUUserDriver {
         onDownloadProgress: @escaping (Bool, Double?) -> Void,
         onNoUpdateFound: @escaping () -> Void,
         onError: @escaping (String) -> Void,
+        onInstalling: @escaping (Bool, @escaping () -> Void) -> Void,
         onSessionEnded: @escaping () -> Void
     ) {
         self.onUpdateFound = onUpdateFound
         self.onDownloadProgress = onDownloadProgress
         self.onNoUpdateFound = onNoUpdateFound
         self.onError = onError
+        self.onInstalling = onInstalling
         self.onSessionEnded = onSessionEnded
     }
 
@@ -189,7 +241,7 @@ private final class GentleUserDriver: NSObject, SPUUserDriver {
     }
 
     func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {
-        onDownloadProgress(true, nil)
+        onInstalling(applicationTerminated, retryTerminatingApplication)
     }
 
     func showUpdateInstalledAndRelaunched(_ relaunched: Bool, acknowledgement: @escaping () -> Void) {

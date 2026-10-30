@@ -85,6 +85,7 @@ struct LoopbackerApp: App {
             StudioCommands(actions: actions, driverInstalled: driverInstaller.isInstalled,
                            driverUpdateAvailable: driverInstaller.updateAvailable,
                            availableAppUpdateVersion: appUpdater.availableUpdate?.displayVersion,
+                           installingAppUpdateVersion: appUpdater.installingVersion,
                            canCheckForUpdates: appUpdater.canCheckForUpdates)
         }
 
@@ -111,6 +112,7 @@ struct StudioCommands: Commands {
     let driverInstalled: Bool
     let driverUpdateAvailable: Bool
     let availableAppUpdateVersion: String?
+    let installingAppUpdateVersion: String?
     let canCheckForUpdates: Bool
 
     @FocusedBinding(\.studioSection) private var section: StudioSection?
@@ -125,6 +127,8 @@ struct StudioCommands: Commands {
                 .disabled(!canCheckForUpdates)
             if let version = availableAppUpdateVersion {
                 Button("Update to \(version)…") { actions.installAvailableUpdate() }
+            } else if let version = installingAppUpdateVersion {
+                Text("Installing \(version)…")
             }
         }
 
@@ -197,6 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Sparkle asking us to quit so it can finish installing an update we already agreed to
+        // (clicked Install, or it was auto-applied in this same call below): always honor it,
+        // independent of whether the user also clicked our own Quit button.
+        if AppUpdater.shared.isTerminatingForUpdate {
+            DefaultDeviceRestorer.shared.restoreDefaultsIfNeeded()
+            return .terminateNow
+        }
         if Self.shouldReallyQuit {
             // Install on quit: a downloaded update waiting for the user is applied now rather than
             // lost; Sparkle's helper finishes after this process exits.
