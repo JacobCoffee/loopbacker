@@ -8,11 +8,12 @@ baked-in data file). License: BSD-3-Clause, see `../Resources/RNNoise-LICENSE.tx
 (copied verbatim from upstream `COPYING`).
 
 Only the files needed for `rnnoise_create` / `rnnoise_init` / `rnnoise_process_frame` /
-`rnnoise_get_size` / `rnnoise_get_frame_size` / `rnnoise_destroy` are included, built for
-arm64 only (no x86 SSE/AVX2 runtime dispatch; `RNN_ENABLE_X86_RTCD` and `ENABLE_OSCE` are
-never defined, so `nnet.h`'s `compute_linear`/`compute_activation`/`compute_conv2d` macros
-resolve directly to the portable `_c` implementations and NEON vector code in
-`vec_neon.h`, compiled unconditionally for AArch64).
+`rnnoise_get_size` / `rnnoise_get_frame_size` / `rnnoise_destroy` are included. There's no x86
+SSE/AVX2 runtime dispatch (`RNN_ENABLE_X86_RTCD` and `ENABLE_OSCE` are never defined), so
+`nnet.h`'s `compute_linear`/`compute_activation`/`compute_conv2d` macros resolve directly to
+the portable `_c` implementations, with NEON vector code from `vec_neon.h` on arm64 and SSE2
+code from `vec_avx.h` on x86_64. The app only ships for Apple silicon, but the x86_64 slice
+must compile: CodeQL's Swift analysis builds the package as x86_64.
 
 Default model (`rnnoise_data.c`/`.h`, the `rnnoise8Za_25.pth` weights), not the "little"
 variant: ~29 MB of generated C source, ~4.5 MB of float weight data once compiled into the
@@ -25,13 +26,12 @@ small in absolute terms and the default model is the stronger denoiser.
 - `denoise.c/.h`, `pitch.c/.h`, `celt_lpc.c/.h`, `kiss_fft.c/.h`, `_kiss_fft_guts.h`,
   `rnnoise_tables.c`, `rnn.c/.h`, `nnet.c/.h`, `nnet_default.c`, `nnet_arch.h`,
   `parse_lpcnet_weights.c`, `rnnoise_data.c/.h`, `common.h`, `arch.h`, `opus_types.h`,
-  `cpu_support.h`, `vec.h`, `vec_neon.h`, `x86/x86_arch_macros.h` — upstream
+  `cpu_support.h`, `vec.h`, `vec_neon.h`, `vec_avx.h`, `x86/x86_arch_macros.h` — upstream
   sources/headers, unmodified except one cast in `denoise.c`'s unused
   `rnnoise_model_from_file` (`model->blob_len = (int)ftell(f);`) to silence
   `-Wshorten-64-to-32`, the only warning the vendored sources produced under SwiftPM's
-  default C warnings. (The x86 header is pulled in by a guarded `#include` in `vec.h`
-  that never fires on arm64, but the file must exist for the preprocessor to find it if
-  the guard were taken on another arch; kept for universal-capable builds.)
+  default C warnings. On x86_64, `nnet.h` emits upstream's own `#warning` that only
+  SSE/SSE2 is enabled.
 - `os_support.h` — **not** upstream. rnnoise normally pulls this from libopus; it's only
   used for the `OPUS_CLEAR` macro, so this is a 3-line local stand-in instead of vendoring
   all of libopus.

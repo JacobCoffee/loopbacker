@@ -178,7 +178,7 @@ loopbacker/
 ## Requirements
 
 - macOS 26+ (Tahoe or later)
-- Apple Silicon or Intel (universal binary)
+- Apple silicon (Intel Macs aren't supported)
 - CMake 3.20+
 
 ## License
