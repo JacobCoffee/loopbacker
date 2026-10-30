@@ -513,11 +513,10 @@ model-backed engine's compiled model weakly, behind a small generic `NoiseModelL
 the model (DPDFNet ~13 MB, FastEnhancer <1 MB) is freed with the last kernel that uses it.
 
 `NoiseEngineBenchmark` times 200 hops of each engine once per launch, when the Effects section
-first shows the picker. It recommends the best-cleanup engine that stays under its CPU budget,
-in order DPDFNet, then FastEnhancer, then RNNoise as the fallback of last resort: DPDFNet and
-FastEnhancer both qualify while they take at most 20% of a core (one 512-frame callback can run
-roughly two hops alongside the mix and effects); RNNoise has no budget to clear, since it's
-already a fraction of a core by design.
+first shows the picker. It recommends FastEnhancer while it takes at most 20% of a core (one
+512-frame callback can run roughly two hops alongside the mix and effects), and RNNoise
+otherwise. FastEnhancer is also the default engine for new setups. DPDFNet is never the
+recommendation: it cleans up slightly more, but its 60 ms of delay matters more on a live mic.
 
 The virtual mic route and the monitor route of the same mic share one suppressor. They mix
 identically, and the HAL calls both input callbacks back to back on the device's IO thread
@@ -577,9 +576,9 @@ model) at -60 dB max reduction:
 DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with DPDFNet
 slightly ahead of FastEnhancer on every metric -- consistent with the authors' own
 VoiceBank+DEMAND numbers for FastEnhancer-S against stronger non-causal baselines. FastEnhancer
-gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's
-recommended over DPDFNet whenever DPDFNet's CPU runs too close to the audio deadline. Re-run
-with `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
+gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's the
+recommended engine and the default. Re-run with
+`scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
 
 ## UI Cost
 

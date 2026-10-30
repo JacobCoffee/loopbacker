@@ -4,8 +4,8 @@ import Foundation
 enum NoiseSuppressionEngine: String, Codable, CaseIterable, Identifiable {
     /// CEVA's DPDFNet2 48 kHz (Apache-2.0): the strongest cleanup, 60 ms latency.
     case dpdfnet
-    /// aask1357's FastEnhancer-S 48 kHz (MIT): near-DPDFNet cleanup at RNNoise-like latency
-    /// (10.67 ms) and under 2% of a core.
+    /// aask1357's FastEnhancer-S 48 kHz (MIT): near-DPDFNet cleanup, 21 ms latency, under 2%
+    /// of a core. The default.
     case fastenhancer
     /// Xiph's RNNoise (BSD-3-Clause): light cleanup, 30 ms latency, a fraction of the CPU.
     case rnnoise
@@ -18,14 +18,14 @@ enum NoiseSuppressionEngine: String, Codable, CaseIterable, Identifiable {
 /// can opt out (`AudioSource.noiseSuppression`).
 struct NoiseSuppressionSettings: Codable, Equatable {
     var isEnabled = false
-    var engine: NoiseSuppressionEngine = .dpdfnet
+    var engine: NoiseSuppressionEngine = .fastenhancer
     /// How far noise may be pulled down. Easing off (e.g. -12 dB) keeps some room tone;
     /// -60 dB is effectively full removal.
     var maxReductionDB: Float = -60
 
     static let reductionRange: ClosedRange<Float> = -60 ... -6
 
-    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .dpdfnet, maxReductionDB: Float = -60) {
+    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .fastenhancer, maxReductionDB: Float = -60) {
         self.isEnabled = isEnabled
         self.engine = engine
         self.maxReductionDB = maxReductionDB
@@ -38,6 +38,7 @@ struct NoiseSuppressionSettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         isEnabled = (try? container.decode(Bool.self, forKey: .isEnabled)) ?? false
+        // Configs from before 4.4 have no engine key; DPDFNet was the only engine then.
         engine = (try? container.decode(NoiseSuppressionEngine.self, forKey: .engine)) ?? .dpdfnet
         maxReductionDB = (try? container.decode(Float.self, forKey: .maxReductionDB)) ?? -60
     }

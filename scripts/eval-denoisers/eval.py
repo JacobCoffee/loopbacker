@@ -23,9 +23,10 @@ docs/architecture/ARCHITECTURE.md -- this script only covers audio quality).
 
 Usage:
     scripts/eval-denoisers/build.sh                 # once, after `swift build -c release`
-    scripts/eval-denoisers/eval.py [--limit N] [--data-dir path] [--out results.json]
+    scripts/eval-denoisers/eval.py [--limit N] [--data-dir path] [--out results.json] [--per-clip path]
 
-Writes a Markdown table to stdout and the raw per-clip numbers to `results.json` (or --out).
+Writes a Markdown table to stdout and the averages to `results.json` (or --out). Per-clip
+numbers go to --per-clip only when given (they're ~900 KB, so they aren't committed).
 """
 from __future__ import annotations
 
@@ -164,6 +165,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".cache" / "loopbacker-eval" / "voicebank-demand")
     parser.add_argument("--limit", type=int, default=None, help="only score the first N clips (default: all 824)")
     parser.add_argument("--out", type=Path, default=SCRIPT_DIR / "results.json")
+    parser.add_argument("--per-clip", type=Path, default=None, help="also write every clip's scores here")
     args = parser.parse_args()
 
     if not CLI.exists():
@@ -213,7 +215,9 @@ def main() -> None:
         cond: {m: statistics.fmean(row[cond][m] for row in per_clip) for m in metrics}
         for cond in conditions
     }
-    args.out.write_text(json.dumps({"per_clip": per_clip, "summary": summary, "n_clips": len(per_clip)}, indent=2))
+    args.out.write_text(json.dumps({"n_clips": len(per_clip), "summary": summary}, indent=2) + "\n")
+    if args.per_clip:
+        args.per_clip.write_text(json.dumps(per_clip, indent=2))
     print(f"wrote {args.out}", file=sys.stderr)
 
     name = {"noisy": "Noisy input", "dpdfnet": "DPDFNet", "fastenhancer": "FastEnhancer", "rnnoise": "RNNoise"}

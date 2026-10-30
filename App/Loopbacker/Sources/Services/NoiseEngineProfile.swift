@@ -36,14 +36,10 @@ final class NoiseEngineBenchmark: ObservableObject {
     @Published private(set) var coreLoad: [NoiseSuppressionEngine: Double] = [:]
     @Published private(set) var isMeasuring = false
 
-    /// DPDFNet and FastEnhancer are recommended while they stay under this share of a core.
-    /// Each 512-frame IO callback can run two hops, and the IO thread also carries the mix and
-    /// effects, so this keeps the worst callback well inside its deadline. RNNoise has no limit:
-    /// it's the fallback of last resort, already a fraction of a core by design.
-    static let loadLimit: [NoiseSuppressionEngine: Double] = [.dpdfnet: 0.2, .fastenhancer: 0.2]
-    /// Best cleanup first; `recommended` picks the first of these that measures under its
-    /// `loadLimit`, falling back to RNNoise.
-    static let qualityOrder: [NoiseSuppressionEngine] = [.dpdfnet, .fastenhancer, .rnnoise]
+    /// FastEnhancer is recommended while it stays under this share of a core. Each 512-frame IO
+    /// callback can run two hops, and the IO thread also carries the mix and effects, so this
+    /// keeps the worst callback well inside its deadline.
+    static let fastEnhancerLoadLimit = 0.2
 
     /// The Mac's chip, e.g. "Apple M4 Max".
     let chipName: String = {
@@ -56,15 +52,14 @@ final class NoiseEngineBenchmark: ObservableObject {
 
     private var started = false
 
-    /// The best-cleanup engine that stays under its CPU budget on this Mac, falling back to
-    /// RNNoise. Unmeasured engines are assumed to qualify, so the UI doesn't flip recommendations
-    /// while `measureIfNeeded` is still running.
+    /// FastEnhancer: within a few percent of DPDFNet's cleanup on real speech (PESQ 2.99 vs
+    /// 3.04 on VoiceBank+DEMAND) at a third of its latency and CPU, which matters more for a
+    /// live mic. RNNoise if FastEnhancer measures over budget on this Mac. DPDFNet is never the
+    /// default pick: it's for users who want every last bit of cleanup and don't mind 60 ms.
+    /// Unmeasured counts as within budget, so the tag doesn't flip while measuring.
     var recommended: NoiseSuppressionEngine {
-        for engine in Self.qualityOrder.dropLast() {
-            if let load = coreLoad[engine], load > Self.loadLimit[engine] ?? .infinity { continue }
-            return engine
-        }
-        return Self.qualityOrder.last!
+        if let load = coreLoad[.fastenhancer], load > Self.fastEnhancerLoadLimit { return .rnnoise }
+        return .fastenhancer
     }
 
     func measureIfNeeded() {

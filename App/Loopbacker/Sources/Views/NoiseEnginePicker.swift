@@ -156,17 +156,15 @@ struct NoiseEnginePicker: View {
     private var recommendationNote: String {
         let chip = benchmark.chipName
         let basis = "CPU is the share of one core for one mic."
-        guard let dpdfnetLoad = benchmark.coreLoad[.dpdfnet] else {
+        guard let load = benchmark.coreLoad[.fastenhancer] else {
             return benchmark.isMeasuring ? "\(basis) Measuring all three engines on \(chip)…" : basis
         }
-        let dpdfnetPercent = Int((dpdfnetLoad * 100).rounded())
+        let percent = Int((load * 100).rounded())
         switch benchmark.recommended {
-        case .dpdfnet:
-            return "\(basis) DPDFNet takes \(dpdfnetPercent)% on \(chip), well inside the audio deadline, so it's recommended. Pick FastEnhancer for similar cleanup at lower latency, or RNNoise if you monitor yourself and even that delay bothers you."
-        case .fastenhancer:
-            return "\(basis) DPDFNet takes \(dpdfnetPercent)% on \(chip), too close to the audio deadline, so FastEnhancer is recommended instead: close to DPDFNet's cleanup, a fraction of its CPU."
         case .rnnoise:
-            return "\(basis) Both DPDFNet and FastEnhancer are too close to the audio deadline on \(chip), so RNNoise is recommended."
+            return "\(basis) FastEnhancer takes \(percent)% on \(chip), too close to the audio deadline, so RNNoise is recommended."
+        default:
+            return "\(basis) FastEnhancer is recommended: nearly DPDFNet's cleanup at a third of the delay, and \(percent < 1 ? "under 1" : "\(percent)")% on \(chip). Pick DPDFNet for the most cleanup if 60 ms of delay doesn't bother you."
         }
     }
 }
