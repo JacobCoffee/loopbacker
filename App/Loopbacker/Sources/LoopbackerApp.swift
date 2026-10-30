@@ -193,6 +193,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// LB-HOST-002: a clean termination proves no hosted node crashed this session, even one
+    /// still loaded and live right up to quit (its `QuarantineWitnessNode` may not `deinit`
+    /// before the process actually exits).
+    func applicationWillTerminate(_ notification: Notification) {
+        HostedPluginQuarantine.shared.clearSessionSentinels()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if Self.shouldReallyQuit {
             DefaultDeviceRestorer.shared.restoreDefaultsIfNeeded()

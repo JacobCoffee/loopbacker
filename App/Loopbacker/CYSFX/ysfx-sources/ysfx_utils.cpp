@@ -508,6 +508,25 @@ bool path_is_relative(const char *path)
 #endif
 }
 
+// Loopbacker patch (LB-PRESET-001): rejects `..` path traversal from untrusted JSFX script
+// data (ysfx_find_data_file below). Checks every `/`- or `\`-delimited component, not just a
+// textual "..", so "foo/../bar" and a lone ".." both reject, while "..foo" and "foo.." do not.
+bool path_contains_dotdot(const char *path)
+{
+    const char *component = path;
+    for (const char *p = path; ; ++p) {
+        if (*p == '\0' || is_path_separator(*p)) {
+            size_t len = (size_t)(p - component);
+            if (len == 2 && component[0] == '.' && component[1] == '.')
+                return true;
+            if (*p == '\0')
+                break;
+            component = p + 1;
+        }
+    }
+    return false;
+}
+
 //------------------------------------------------------------------------------
 
 #if !defined(_WIN32)

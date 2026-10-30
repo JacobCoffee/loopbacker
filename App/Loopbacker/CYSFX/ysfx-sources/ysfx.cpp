@@ -1870,7 +1870,6 @@ bool ysfx_find_data_file(ysfx_t *fx, EEL_F *file, std::string &result)
 
     std::string filepart;
 
-    bool accept_absolute = false;
     bool accept_relative = false;
 
     int32_t index = ysfx_eel_round<int32_t>(*file);
@@ -1893,18 +1892,26 @@ bool ysfx_find_data_file(ysfx_t *fx, EEL_F *file, std::string &result)
         accept_relative = true;
     }
     else if (ysfx_string_get(fx, *file, filepart)) {
-        accept_absolute = true;
         accept_relative = true;
     }
     else
         return false;
 
+    // Loopbacker patch (LB-PRESET-001): reject `..` traversal before building any candidate.
+    if (ysfx::path_contains_dotdot(filepart.c_str()))
+        return false;
+
     std::vector<std::string> filecandidates;
     filecandidates.reserve(2);
 
-    if (accept_absolute && !ysfx::path_is_relative(filepart.c_str()))
-        filecandidates.push_back(filepart);
-    else if (accept_relative) {
+    // Loopbacker patch (LB-PRESET-001): JSFX scripts are untrusted content (bundled with a
+    // preset, or dropped into a catalog root by anything that can write there); file_open must
+    // stay confined to the effect's own directory and the configured data root. Upstream
+    // additionally honored any absolute path a script's own string data named, which let a
+    // script read any file the user's TCC grants allow (under Loopbacker's identity) and feed
+    // its bytes into the output the virtual mic exposes to a call. Absolute paths are never
+    // honored here; only the two relative candidates below are tried.
+    if (accept_relative) {
         filecandidates.push_back(ysfx::path_directory(fx->source.main_file_path.c_str()) + filepart);
         if (!fx->config->data_root.empty())
             filecandidates.push_back(fx->config->data_root + filepart);

@@ -142,6 +142,10 @@ std::string path_ensure_final_separator(const char *path);
 bool path_has_suffix(const char *path, const char *suffix);
 // check whether the path is relative
 bool path_is_relative(const char *path);
+// Loopbacker patch (LB-PRESET-001): check whether the path contains a `..` component (any
+// platform separator); used to reject parent-directory traversal from untrusted JSFX script
+// data before it reaches the filesystem.
+bool path_contains_dotdot(const char *path);
 
 //------------------------------------------------------------------------------
 

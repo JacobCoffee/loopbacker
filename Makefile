@@ -53,7 +53,8 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
 	cp -R Driver/build/Loopbacker.driver $(APP_CONTENTS)/Resources/
-	codesign --force --deep --options runtime --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
+	codesign --force --options runtime --sign "$(SIGN_IDENTITY)" $(APP_CONTENTS)/Resources/Loopbacker.driver
+	codesign --force --options runtime --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
 		--sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	codesign --verify --deep --strict $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."

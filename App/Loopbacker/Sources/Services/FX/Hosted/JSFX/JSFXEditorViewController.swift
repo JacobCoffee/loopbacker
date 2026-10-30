@@ -116,7 +116,13 @@ private final class JSFXGraphicsView: NSView {
         if dirty { needsDisplay = true }
     }
 
-    private func ensureBuffer(width: Int, height: Int, scale: CGFloat) {
+    private func ensureBuffer(width rawWidth: Int, height rawHeight: Int, scale: CGFloat) {
+        // LB-RES-001: `width`/`height` track this view's bounds (itself seeded from the
+        // script's `@gfx w h` via `JSFXNode.gfxWidth/gfxHeight`, already clamped at load) times
+        // the backing scale factor; clamp again here so a window resize beyond that initial
+        // size still can't grow the pixel buffer unboundedly.
+        let width = min(max(rawWidth, 1), 4096)
+        let height = min(max(rawHeight, 1), 4096)
         guard width != bufferWidth || height != bufferHeight else { return }
         let needed = width * height * 4
         if needed > pixelCapacity {

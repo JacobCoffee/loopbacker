@@ -128,6 +128,13 @@ final class AUHostNode: FXHostedNode, @unchecked Sendable {
 
     static func load(ref: FXPluginRef, state: Data?, sampleRate: Double) async throws -> AUHostNode {
         let (type, subType, manufacturer) = try AUFourCC.parse(ref.identifier)
+        // LB-PRESET-001: a preset's AU ref is attacker-reachable (imported preset, hand-edited
+        // config) and names an arbitrary component type. Only effect types belong in a voice
+        // chain stage; refusing anything else here, before `AudioComponentFindNext` even looks
+        // one up, keeps a crafted ref from instantiating e.g. an output unit or a generator.
+        guard type == kAudioUnitType_Effect || type == kAudioUnitType_MusicEffect else {
+            throw AUHostError.malformedIdentifier(ref.identifier)
+        }
         var query = AudioComponentDescription(
             componentType: type, componentSubType: subType, componentManufacturer: manufacturer,
             componentFlags: 0, componentFlagsMask: 0)
@@ -574,8 +581,14 @@ final class AUHostNode: FXHostedNode, @unchecked Sendable {
                 name = cfName as String
                 if info.flags.rawValue & flagCFNameRelease != 0 { cfNameRef.release() }
             } else {
+                // LB-AU-001: `info.name` is a fixed 52-byte C array inside a stack copy of
+                // `AudioUnitParameterInfo`; a plugin that fills all 52 bytes without a NUL
+                // terminator makes `String(cString:)` read past the field into the rest of the
+                // struct and the stack. Stop at either a NUL or the field's own bound.
                 name = withUnsafeBytes(of: info.name) { raw in
-                    String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+                    let bytes = raw.bindMemory(to: UInt8.self)
+                    let end = bytes.firstIndex(of: 0) ?? bytes.count
+                    return String(decoding: bytes[..<end], as: UTF8.self)
                 }
             }
 

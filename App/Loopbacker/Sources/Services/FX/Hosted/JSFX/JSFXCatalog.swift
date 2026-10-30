@@ -23,8 +23,8 @@ enum JSFXCatalog: FXPluginCatalog {
         await Task.detached(priority: .utility) { () -> [FXPluginInfo] in
             var infos: [FXPluginInfo] = []
             var seenPaths = Set<String>()
-            for root in roots() {
-                for info in scanRoot(root) where seenPaths.insert(info.ref.identifier).inserted {
+            for (name, root) in roots() {
+                for info in scanRoot(root, rootName: name) where seenPaths.insert(info.ref.identifier).inserted {
                     infos.append(info)
                 }
             }
@@ -32,17 +32,14 @@ enum JSFXCatalog: FXPluginCatalog {
         }.value
     }
 
-    private static func roots() -> [URL] {
-        guard let support = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first else { return [] }
-        return [
-            support.appendingPathComponent("REAPER/Effects", isDirectory: true),
-            support.appendingPathComponent("Loopbacker/JSFX", isDirectory: true)
-        ]
+    /// Shares `JSFXCatalogRoots` with `JSFXNode.resolvedPath` so scanning and load-time
+    /// confinement always agree on root names/paths (LB-PRESET-001's `"<root>:<relative
+    /// path>"` ref format).
+    private static func roots() -> [(name: String, url: URL)] {
+        JSFXCatalogRoots.all().map { (name: $0.key, url: $0.value) }
     }
 
-    private static func scanRoot(_ root: URL) -> [FXPluginInfo] {
+    private static func scanRoot(_ root: URL, rootName: String) -> [FXPluginInfo] {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(
             at: root,
@@ -50,6 +47,7 @@ enum JSFXCatalog: FXPluginCatalog {
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
+        let rootPath = root.standardizedFileURL.path
         var infos: [FXPluginInfo] = []
         for case let url as URL in enumerator {
             guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
@@ -64,8 +62,19 @@ enum JSFXCatalog: FXPluginCatalog {
             let category = header.tags.first.map { $0.prefix(1).uppercased() + $0.dropFirst() }
                 ?? url.deletingLastPathComponent().lastPathComponent
 
+            // LB-PRESET-001: persist the ref relative to the catalog root it was found under
+            // (see `FXPluginRef.identifier`'s doc comment), not as an absolute path, so an
+            // exported preset stays portable and `JSFXNode.load` can validate it resolves back
+            // under a known root before touching disk.
+            var relativePath = url.standardizedFileURL.path
+            if relativePath.hasPrefix(rootPath) {
+                relativePath.removeFirst(rootPath.count)
+                while relativePath.hasPrefix("/") { relativePath.removeFirst() }
+            }
+            let identifier = "\(rootName):\(relativePath)"
+
             infos.append(FXPluginInfo(
-                ref: FXPluginRef(format: .jsfx, identifier: url.path, name: desc, vendor: nil),
+                ref: FXPluginRef(format: .jsfx, identifier: identifier, name: desc, vendor: nil),
                 category: category,
                 summary: desc
             ))

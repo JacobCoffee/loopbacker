@@ -19,7 +19,15 @@ struct FXPluginRef: Codable, Equatable, Hashable, Sendable {
     /// `.audioUnit`, `.jsfx` or `.airwindows`.
     var format: FXNodeKind
     /// AU: `"type subtype manufacturer"` as three FourCC strings, e.g. `"aufx dely appl"`.
-    /// JSFX: absolute path to the effect file. Airwindows: the registry name, e.g. `"Pressure5"`.
+    /// JSFX: `"<root>:<path relative to that root>"`, e.g. `"reaper:Vocal/Deesser.jsfx"` or
+    /// `"loopbacker:MyEffect.jsfx"` — `<root>` names one of `JSFXCatalog`'s two catalog roots
+    /// (`~/Library/Application Support/REAPER/Effects`, `.../Loopbacker/JSFX`), never an
+    /// absolute filesystem path, so an exported/imported preset is portable across machines
+    /// and `JSFXNode.load` can validate it resolves under a known root before touching disk
+    /// (LB-PRESET-001). A bare absolute path is still accepted for backward compatibility with
+    /// configs persisted before this format existed, but `JSFXNode.load` validates it resolves
+    /// under one of the same two roots exactly as the new scheme does — it is never honored
+    /// outside them. Airwindows: the registry name, e.g. `"Pressure5"`.
     var identifier: String
     var name: String
     var vendor: String?
@@ -53,6 +61,13 @@ struct FXNodeConfig: Codable, Equatable, Identifiable, Sendable {
     /// Airwindows chunk), restored after loading. Takes precedence over `params`.
     var pluginState: Data?
 
+    /// Decode-time cap on `pluginState` (LB-RES-001): a value past this is dropped rather than
+    /// handed to a hosted loader's own state parser. Each loader independently re-validates its
+    /// own internal sizes regardless (e.g. `JSFXNode.restoreState`'s per-field bounds checks,
+    /// LB-JSFX-001) — this cap exists so one maliciously or accidentally huge blob in an
+    /// imported preset or a hand-edited config can't even reach that point.
+    static let maxPluginStateSize = 16 * 1024 * 1024
+
     init(id: UUID = UUID(), kind: FXNodeKind, enabled: Bool = true, params: [String: Float] = [:],
          eqBands: [EQBandConfig]? = nil, pluginRef: FXPluginRef? = nil, pluginState: Data? = nil) {
         self.id = id
@@ -62,6 +77,22 @@ struct FXNodeConfig: Codable, Equatable, Identifiable, Sendable {
         self.eqBands = eqBands
         self.pluginRef = pluginRef
         self.pluginState = pluginState
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, enabled, params, eqBands, pluginRef, pluginState
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        kind = try container.decode(FXNodeKind.self, forKey: .kind)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        params = try container.decode([String: Float].self, forKey: .params)
+        eqBands = try container.decodeIfPresent([EQBandConfig].self, forKey: .eqBands)
+        pluginRef = try container.decodeIfPresent(FXPluginRef.self, forKey: .pluginRef)
+        let decodedState = try container.decodeIfPresent(Data.self, forKey: .pluginState)
+        pluginState = (decodedState?.count ?? 0) <= Self.maxPluginStateSize ? decodedState : nil
     }
 }
 

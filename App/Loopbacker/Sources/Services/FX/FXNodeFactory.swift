@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import Synchronization
 
 /// Builds `FXNode` instances from an `FXNodeConfig`: built-ins directly, hosted effects via
 /// their format's async loader. Off the IO thread only (hosted loads hit disk/other processes).
@@ -33,25 +35,79 @@ enum FXNodeFactory {
         return (node, loadError)
     }
 
+    /// Loads a hosted effect, coordinating with `HostedPluginQuarantine` (LB-HOST-002): a node
+    /// whose sentinel from a previous launch is still present (meaning that launch never
+    /// reached a successful first render for it) loads as a quarantined `PassthroughNode`
+    /// instead of being instantiated again. Otherwise the sentinel is written before `load()`
+    /// runs and cleared either on a graceful (non-crashing) load failure or, for a node that
+    /// did load, once `QuarantineWitnessNode` observes its first successful `process()` call.
     private static func makeHosted(_ config: FXNodeConfig, sampleRate: Float) async -> (node: any FXNode, loadError: String?) {
         guard let ref = config.pluginRef else {
             return (PassthroughNode(kind: config.kind), "No plugin selected")
         }
+        let quarantine = HostedPluginQuarantine.shared
+        if quarantine.isQuarantined(nodeID: config.id) {
+            return (PassthroughNode(kind: config.kind), "crashed Loopbacker last time; click to retry")
+        }
+        quarantine.beginTracking(nodeID: config.id, ref: ref)
         do {
+            let hosted: any FXHostedNode
             switch config.kind {
             case .audioUnit:
-                return (try await AUHostNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate)), nil)
+                hosted = try await AUHostNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate))
             case .jsfx:
-                return (try await JSFXNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate)), nil)
+                hosted = try await JSFXNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate))
             case .airwindows:
-                return (try await AirwindowsNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate)), nil)
+                hosted = try await AirwindowsNode.load(ref: ref, state: config.pluginState, sampleRate: Double(sampleRate))
             default:
+                quarantine.clearTracking(nodeID: config.id)
                 return (PassthroughNode(kind: config.kind), "Not a hosted kind")
             }
+            return (QuarantineWitnessNode(wrapping: hosted, nodeID: config.id), nil)
         } catch {
+            // A thrown Swift error is a graceful failure, not a crash: nothing to quarantine.
+            quarantine.clearTracking(nodeID: config.id)
             return (PassthroughNode(kind: config.kind), error.localizedDescription)
         }
     }
+}
+
+/// Wraps a hosted node so `HostedPluginQuarantine` can observe its first successful render
+/// without the render call itself doing any I/O (LB-HOST-002). Transparent pass-through
+/// otherwise: every `FXHostedNode` requirement forwards to the wrapped node unchanged.
+private final class QuarantineWitnessNode: FXHostedNode, HostedRenderWitness, @unchecked Sendable {
+    private let wrapped: any FXHostedNode
+    let kind: FXNodeKind
+    var specs: [FXParamSpec] { wrapped.specs }
+    var params: FXParamStore { wrapped.params }
+    var meters: FXMeters { wrapped.meters }
+    var latencySamples: Int { wrapped.latencySamples }
+    var ref: FXPluginRef { wrapped.ref }
+
+    /// Set once, on the IO thread, after the first `process()` call returns -- a plain atomic
+    /// store, no I/O. `HostedPluginQuarantine`'s single shared sweep (not a per-node poll)
+    /// reads this through `hasRendered` and, independently, notices if this instance is
+    /// deallocated without ever rendering (held weakly) -- both clear the crash sentinel.
+    private let rendered = Atomic<Bool>(false)
+    var hasRendered: Bool { rendered.load(ordering: .acquiring) }
+
+    init(wrapping node: any FXHostedNode, nodeID: UUID) {
+        wrapped = node
+        kind = node.kind
+        HostedPluginQuarantine.shared.observe(nodeID: nodeID, witness: self)
+    }
+
+    func process(_ block: FXBlock) {
+        wrapped.process(block)
+        if !rendered.load(ordering: .relaxed) {
+            rendered.store(true, ordering: .releasing)
+        }
+    }
+
+    func reset() { wrapped.reset() }
+
+    @MainActor func captureState() -> Data? { wrapped.captureState() }
+    @MainActor func makeEditor() async -> NSViewController? { await wrapped.makeEditor() }
 }
 
 /// A stage that failed to load (or has no plugin selected yet): carries audio through
