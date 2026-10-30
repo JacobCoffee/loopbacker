@@ -91,10 +91,15 @@ private struct Scenario {
     let bulkDelaySamples: Int
 }
 
-private func makeScenario(seconds: Float, bulkDelayMs: Float, nearStartSeconds: Float) -> Scenario {
+private func makeScenario(seconds: Float, bulkDelayMs: Float, nearStartSeconds: Float, nonlinear: Bool = false) -> Scenario {
     let far = voice(seconds: seconds, seed: 0)
+    // Real laptop/phone speakers compress and distort loud passages rather than reproducing
+    // them linearly; `tanh(2x)` models that soft-clipping before the signal bounces around the
+    // room, so MDF's (linear-only) model can't fully predict the echo shape the way it can for
+    // a pure room-impulse-response convolution.
+    let speakerOutput = nonlinear ? far.map { tanhf(2 * $0) / 2 } : far
     let ir = roomImpulseResponse()
-    let echoUndelayed = convolve(far, ir)
+    let echoUndelayed = convolve(speakerOutput, ir)
     let bulkDelaySamples = Int(bulkDelayMs / 1000 * rate)
     var echo = [Float](repeating: 0, count: far.count)
     for i in bulkDelaySamples..<far.count {
@@ -188,6 +193,20 @@ struct EchoCancellerTests {
         let outPower = output[window].reduce(Float(0)) { $0 + $1 * $1 }
         let erle = 10 * log10f(micPower / outPower)
         #expect(erle >= 20, "ERLE \(erle) dB at \(bulkDelayMs) ms bulk delay")
+    }
+
+    @Test("Attenuates nonlinear (soft-clipped speaker) echo too",
+          arguments: [40.0, 90.0, 150.0] as [Float])
+    func erleNonlinear(bulkDelayMs: Float) throws {
+        let scenario = makeScenario(seconds: 9, bulkDelayMs: bulkDelayMs, nearStartSeconds: 999, nonlinear: true)
+        let output = try run(scenario, driftPPM: 50)
+        #expect(output.allSatisfy { $0.isFinite })
+
+        let window = (scenario.mic.count - Int(2 * rate))..<scenario.mic.count
+        let micPower = scenario.mic[window].reduce(Float(0)) { $0 + $1 * $1 }
+        let outPower = output[window].reduce(Float(0)) { $0 + $1 * $1 }
+        let erle = 10 * log10f(micPower / outPower)
+        #expect(erle >= 10, "nonlinear ERLE \(erle) dB at \(bulkDelayMs) ms bulk delay")
     }
 
     @Test("Preserves near-end level within 3 dB during double talk")
