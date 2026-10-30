@@ -63,6 +63,9 @@ final class FXChain: @unchecked Sendable {
     private let abBypassFlag = Atomic<Bool>(false)
     private let masterEnabledFlag = Atomic<Bool>(true)
     private let voiceProbabilityBits = Atomic<UInt32>(Float(0).bitPattern)
+    /// Whether voice detection keeps running while effects are off, because app-audio ducking
+    /// (`VoiceBus`) still needs to know when the user is talking.
+    private let detectVoiceWhileOffFlag = Atomic<Bool>(false)
 
     // MARK: Graph ownership + config state (guarded by configLock; never touched on the IO thread)
 
@@ -126,6 +129,9 @@ final class FXChain: @unchecked Sendable {
     private var abDryWrite = 0
     private var abCrossfade: Float = 1 // 1 = normal chain output, 0 = fully bypassed (dry)
     private var masterCrossfade: Float = 1 // 1 = chain output, 0 = fully bypassed dry (no ratio); matches `masterEnabledFlag`'s default-enabled state
+    /// IO-thread only: effects are off and faded out, so `processChunk` is skipping the graph.
+    /// Cleared (after resetting the graph's history) the first block they're back on.
+    private var masterIdle = false
     private var inputRMSEnergy: Float = 0
     private var outputRMSEnergy: Float = 0
     private var abRatioSmoothed: Float = 1
@@ -435,16 +441,22 @@ final class FXChain: @unchecked Sendable {
 
     /// Any thread: whether `EffectsPreset.isEnabled` currently gates this chain's output to
     /// wet. Distinct from `isABBypassed`/`setABBypass` (the loudness-matched A/B comparison
-    /// toggle): this is "Effects Off" -- no RMS ratio applied, and once the crossfade settles
-    /// the output is bit-identical to the input. Defaults to `true` (enabled, matching every
-    /// pre-existing caller that never calls this) rather than mirroring `EffectsPreset`'s own
-    /// `isEnabled = false` default: `AudioRouter.attachFXChain` is responsible for calling
-    /// `setMasterEnabled(currentEffectsPreset.isEnabled)` synchronously right after construction
-    /// (not inside the async `updateConfigs` `Task`), before the chain is attached to a route
-    /// or its first `process` call, so a freshly created chain for a disabled preset is already
-    /// gated dry with no window where it would run wet.
+    /// toggle): this is "Effects Off" -- no RMS ratio applied, and once the 10 ms crossfade to
+    /// the undelayed input settles, the chain stops running its stages entirely: output is
+    /// bit-identical to the input with no added latency and no DSP cost. Defaults to `true`
+    /// (enabled, matching every pre-existing caller that never calls this) rather than
+    /// mirroring `EffectsPreset`'s own `isEnabled = false` default: `AudioRouter.attachFXChain`
+    /// is responsible for calling `setMasterEnabled(currentEffectsPreset.isEnabled)`
+    /// synchronously right after construction (not inside the async `updateConfigs` `Task`),
+    /// before the chain is attached to a route or its first `process` call, so a freshly
+    /// created chain for a disabled preset is already gated dry with no window where it would
+    /// run wet.
     var isMasterEnabled: Bool { masterEnabledFlag.load(ordering: .relaxed) }
     func setMasterEnabled(_ on: Bool) { masterEnabledFlag.store(on, ordering: .relaxed) }
+
+    /// Any thread: keep voice detection (and `VoiceBus`) running while effects are off. Set it
+    /// when app-audio ducking is on; otherwise an effects-off chain costs nothing.
+    func setDetectVoiceWhileOff(_ on: Bool) { detectVoiceWhileOffFlag.store(on, ordering: .relaxed) }
 
     // MARK: - Recording
 
@@ -513,9 +525,33 @@ final class FXChain: @unchecked Sendable {
 
     private func processChunk(_ buffer: UnsafeMutablePointer<Float>, frames: Int, stride: Int, rawPreNS: UnsafePointer<Float>?) {
         let mono = FXBlockIO.deinterleave(buffer, frames: frames, stride: stride, left: scratchLeft, right: scratchRight)
+
+        if !masterEnabledFlag.load(ordering: .relaxed), masterCrossfade == 0 {
+            // Effects off and already faded out: leave `buffer` untouched, like a chain that
+            // isn't there. Only voice detection keeps running, and only if ducking needs it.
+            masterIdle = true
+            if detectVoiceWhileOffFlag.load(ordering: .relaxed) {
+                for i in 0..<frames { vadMono[i] = mono ? scratchLeft[i] : 0.5 * (scratchLeft[i] + scratchRight[i]) }
+                let probability = vad?.process(vadMono, frames: frames) ?? 1
+                VoiceBus.update(probability)
+                voiceProbabilityBits.store(probability.bitPattern, ordering: .relaxed)
+            }
+            if let rawPreNS {
+                for i in 0..<frames {
+                    rawMonoScratch[i] = stride >= 2 ? 0.5 * (rawPreNS[i * stride] + rawPreNS[i * stride + 1]) : rawPreNS[i * stride]
+                    processedMonoScratch[i] = mono ? scratchLeft[i] : 0.5 * (scratchLeft[i] + scratchRight[i])
+                }
+                recorder.capture(raw: rawMonoScratch, processed: processedMonoScratch, frames: frames)
+            }
+            return
+        }
+        if masterIdle {
+            resumeFromIdle()
+            masterIdle = false
+        }
+
         memcpy(dryLeftScratch, scratchLeft, frames * MemoryLayout<Float>.size)
         memcpy(dryRightScratch, scratchRight, frames * MemoryLayout<Float>.size)
-
         // Feed the chain-level A/B dry ring with the unprocessed signal before any node runs.
         let abPushStart = abDryWrite
         for i in 0..<frames {
@@ -550,7 +586,7 @@ final class FXChain: @unchecked Sendable {
         }
 
         applyABBypass(left: scratchLeft, right: scratchRight, frames: frames, abPushStart: abPushStart)
-        applyMasterBypass(left: scratchLeft, right: scratchRight, frames: frames, abPushStart: abPushStart)
+        applyMasterBypass(left: scratchLeft, right: scratchRight, frames: frames)
 
         FXBlockIO.reinterleave(buffer, frames: frames, stride: stride, channels: min(stride, 2),
                                left: scratchLeft, right: scratchRight, mono: mono)
@@ -587,25 +623,40 @@ final class FXChain: @unchecked Sendable {
     }
 
     /// Crossfades the chain's output (after node processing and any A/B comparison) against
-    /// the same chain-level dry tap used for A/B, but unscaled (no loudness matching) and
-    /// driven by `masterEnabledFlag` (`EffectsPreset.isEnabled`) rather than the A/B toggle.
-    /// Composes with `applyABBypass`: a disabled master always wins, since this runs after it
-    /// and blends from whatever `applyABBypass` already produced toward pure delayed dry.
+    /// the *undelayed* input, unscaled (no loudness matching), driven by `masterEnabledFlag`
+    /// (`EffectsPreset.isEnabled`) rather than the A/B toggle. Undelayed on purpose: once this
+    /// settles at fully off, `processChunk` stops running the graph and hands the input
+    /// straight through, so the fade has to land on exactly that signal to avoid a jump of the
+    /// chain's latency. Composes with `applyABBypass`: a disabled master always wins, since this
+    /// runs after it.
     private func applyMasterBypass(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
-                                   frames: Int, abPushStart: Int) {
+                                   frames: Int) {
         let target: Float = masterEnabledFlag.load(ordering: .relaxed) ? 1 : 0
         guard target != 1 || masterCrossfade != 1 else { return } // steady-state enabled: nothing to blend
-        let latency = min(activeTotalLatency, Self.abDryCapacity - FXBlock.maxFrames)
         var fade = masterCrossfade
         for i in 0..<frames {
             fade = target > fade ? min(target, fade + Self.crossfadeStep) : max(target, fade - Self.crossfadeStep)
-            let readIndex = abPushStart + i - latency
-            let dl: Float = readIndex >= 0 ? abDryLeft[readIndex & (Self.abDryCapacity - 1)] : 0
-            let dr: Float = readIndex >= 0 ? abDryRight[readIndex & (Self.abDryCapacity - 1)] : 0
-            left[i] = fade * left[i] + (1 - fade) * dl
-            right[i] = fade * right[i] + (1 - fade) * dr
+            left[i] = fade * left[i] + (1 - fade) * dryLeftScratch[i]
+            right[i] = fade * right[i] + (1 - fade) * dryRightScratch[i]
         }
         masterCrossfade = fade
+    }
+
+    /// IO thread, first block after effects come back on: the graph didn't run while they were
+    /// off, so every stage's history (filters, envelopes, lookahead and dry rings) is from
+    /// before. Reset it and clear the rings so nothing stale leaks into the fade-in; stages
+    /// with latency then re-prime exactly like a stage switched back on.
+    private func resumeFromIdle() {
+        if let graph = activeGraphRef?.takeUnretainedValue() {
+            for slot in graph.slots {
+                slot.node.reset()
+                slot.dryLeft.update(repeating: 0, count: slot.dryCapacity)
+                slot.dryRight.update(repeating: 0, count: slot.dryCapacity)
+                if !slot.isSettledOff { slot.primingRemaining = slot.latency }
+            }
+        }
+        abDryLeft.update(repeating: 0, count: Self.abDryCapacity)
+        abDryRight.update(repeating: 0, count: Self.abDryCapacity)
     }
 
     /// Declicks a structural swap: the outgoing graph finishes its last block faded to

@@ -903,6 +903,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             let nodes = preset.nodes
             for chain in self.fxChainsByDevice.values {
                 chain.setMasterEnabled(preset.isEnabled)
+                chain.setDetectVoiceWhileOff(preset.appAudio.duckingEnabled)
                 Task { await chain.updateConfigs(nodes) }
             }
             let appConfig = AppAudioProcessor.Config(
@@ -938,6 +939,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
         let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
         chain.setMasterEnabled(currentEffectsPreset.isEnabled)
+        chain.setDetectVoiceWhileOff(currentEffectsPreset.appAudio.duckingEnabled)
         ctx.attachFXChain(chain)
         ctx.fxGroupKey = key
         fxChainsByDevice[key] = chain

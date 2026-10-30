@@ -286,6 +286,65 @@ struct FXChainTests {
         }
     }
 
+    @Test("Effects off adds no latency and stops running stages; turning back on resumes wet")
+    func masterDisabledSkipsGraphWithoutLatency() {
+        final class CountingDelayNode: FXNode, @unchecked Sendable {
+            let kind: FXNodeKind = .limiter
+            let specs: [FXParamSpec] = []
+            let params = FXParamStore(specs: [])
+            let meters = FXMeters()
+            let latencySamples = 64
+            var processCalls = 0
+            private var ring = [Float](repeating: 0, count: 64)
+            private var pos = 0
+            func process(_ block: FXBlock) {
+                processCalls += 1
+                for i in 0..<block.frames {
+                    let out = ring[pos]
+                    ring[pos] = block.left[i]
+                    pos = (pos + 1) % ring.count
+                    block.left[i] = out
+                }
+                if block.channels == 2 { for i in 0..<block.frames { block.right[i] = block.left[i] } }
+            }
+            func reset() { ring = [Float](repeating: 0, count: 64); pos = 0 }
+        }
+
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "master-idle")
+        let node = CountingDelayNode()
+        chain.debugInstallGraph(ChainGraph(slots: [
+            ChainGraph.Slot(id: UUID(), node: node, enabled: true, latency: node.latencySamples, loadError: nil)
+        ]))
+        chain.setMasterEnabled(false)
+
+        let frames = 480
+        func run(_ phase: Int) -> (input: [Float], output: [Float]) {
+            var input = [Float](repeating: 0, count: frames)
+            for i in 0..<frames { input[i] = sinf(2 * .pi * 440 * Float(phase * frames + i) / Self.sampleRate) * 0.5 }
+            var buffer = [Float](repeating: 0, count: frames * 2)
+            for i in 0..<frames { buffer[i * 2] = input[i]; buffer[i * 2 + 1] = input[i] }
+            buffer.withUnsafeMutableBufferPointer {
+                chain.process($0.baseAddress!, frames: frames, stride: 2, sampleTime: nil, rawPreNS: nil)
+            }
+            return (input, stride(from: 0, to: frames * 2, by: 2).map { buffer[$0] })
+        }
+
+        _ = run(0) // the 10 ms fade from wet to the undelayed input
+        let callsAfterFade = node.processCalls
+        for phase in 1...4 {
+            let (input, output) = run(phase)
+            #expect(output == input, "effects off must pass input through with no delay")
+        }
+        #expect(node.processCalls == callsAfterFade, "stages must not run while effects are off")
+
+        chain.setMasterEnabled(true)
+        _ = run(5) // fade back in while the stage re-primes
+        let (input, output) = run(6)
+        for i in node.latencySamples..<frames {
+            #expect(abs(output[i] - input[i - node.latencySamples]) < 1e-5, "sample \(i): expected the stage's delayed (wet) output")
+        }
+    }
+
     @Test("A/B bypass applies the measured output/input loudness ratio to the dry path, not a frozen unity")
     func abBypassAppliesMeasuredRatio() async {
         final class GainNode: FXNode, @unchecked Sendable {
