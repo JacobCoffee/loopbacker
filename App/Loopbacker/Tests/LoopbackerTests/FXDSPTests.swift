@@ -208,6 +208,31 @@ struct GateNodeTests {
         let peak = output.map { abs($0) }.max() ?? 0
         #expect(peak < 0.001)
     }
+
+    @Test("A zero Range still ramps gain back to unity instead of staying stuck attenuated")
+    func zeroRangeRampsToUnity() {
+        let node = GateNode(sampleRate: rate)
+        set(node, "mode", 0) // Level
+        set(node, "threshold", -10)
+        set(node, "attack", 1)
+        set(node, "release", 1)
+        set(node, "hold", 0)
+        // Closes the gate on silence first (gainDB ramps toward the still-nonzero range).
+        let silence = silence(seconds: 0.2)
+        _ = run(node, silence)
+        let closedGain = -node.meters.gainReductionDB
+        #expect(closedGain < -5, "gate failed to close before the range change: \(closedGain) dB")
+        // Range becomes 0 while the gate is still closed and negative: deriving the ramp rate
+        // from `rangeDB` alone gives a zero rate here, permanently stranding `gainDB` below 0
+        // even though Range now reads 0 dB.
+        set(node, "range", 0)
+        let loud = sine(440, seconds: 0.3, amplitude: 0.5) // well above the -10 dB threshold
+        let output = run(node, loud)
+        let steady = output.suffix(4800)
+        let inSteady = loud.suffix(4800)
+        let gainDB = dB(rms(output[steady.indices])) - dB(rms(loud[inSteady.indices]))
+        #expect(abs(gainDB) < 0.5, "gate stuck at \(gainDB) dB instead of ramping back to unity")
+    }
 }
 
 @Suite("EQNode")
@@ -246,6 +271,22 @@ struct EQNodeTests {
         let steady = (output.count / 2)...
         let gainDB = dB(rms(output[steady])) - dB(rms(tone[steady]))
         #expect(abs(gainDB) < 0.3)
+    }
+
+    @Test("Two setBands calls before process never lose the latest update")
+    func twoPublicationsBeforeProcessApplyTheLatest() {
+        let node = EQNode(sampleRate: rate)
+        // The first call's publish must not be the one that lands: with a 2-slot index
+        // publication, this exact pair returns the published index to 0 == the reader's
+        // initial `lastAppliedIndex`, so the change is never detected and both calls are
+        // silently dropped.
+        node.setBands([EQBandConfig(id: 0, type: .peaking, frequencyHz: 1000, gainDB: 18, q: 1)])
+        node.setBands([EQBandConfig(id: 0, type: .peaking, frequencyHz: 1000, gainDB: 6, q: 1)])
+        let tone = sine(1000, seconds: 0.5, amplitude: 0.2)
+        let output = run(node, tone)
+        let steady = (output.count / 2)...
+        let gainDB = dB(rms(output[steady])) - dB(rms(tone[steady]))
+        #expect(abs(gainDB - 6) < 0.2, "measured \(gainDB) dB, expected the second call's 6 dB")
     }
 
     @Test("setBands mid-stream doesn't click")
@@ -422,6 +463,29 @@ struct ReverbNodeTests {
         let output = run(node, input, channels: 2)
         #expect(output.allSatisfy { $0.isFinite })
     }
+
+    @Test("A Size/Pre-Delay jump mid-stream doesn't click")
+    func sizeAndPreDelayDeclick() {
+        let node = ReverbNode(sampleRate: rate)
+        set(node, "size", 20)
+        set(node, "damping", 30)
+        set(node, "preDelay", 5)
+        set(node, "mix", 100)
+        let tone = sine(300, seconds: 1, amplitude: 0.3)
+        let output = run(node, tone, channels: 2, onBlock: { i in
+            if i == 20 {
+                // A full-scale jump of both params at once: the delay-line read positions
+                // these drive (Size: ~506 -> ~2193 samples behind the write head; Pre-Delay:
+                // 5 ms -> 200 ms) must crossfade, not relocate the read head instantly.
+                set(node, "size", 100)
+                set(node, "preDelay", 200)
+            }
+        })
+        #expect(output.allSatisfy { $0.isFinite })
+        let baseline = maxStep(Array(tone[0..<4096]))
+        let worst = maxStep(output)
+        #expect(worst < baseline * 8, "max step \(worst) vs clean-tone baseline \(baseline)")
+    }
 }
 
 @Suite("LimiterNode")
@@ -511,6 +575,28 @@ struct LimiterNodeTests {
         })
         #expect(output.allSatisfy { $0.isFinite })
     }
+
+    @Test("Lowering the ceiling mid-lookahead rescales an already-queued peak, not just new ones")
+    func ceilingChangeRescalesQueuedPeak() {
+        let node = LimiterNode(sampleRate: rate)
+        set(node, "inputGain", 0)
+        set(node, "ceiling", -1)
+        set(node, "release", 60)
+        // An isolated full-scale impulse: its main FIR peak is queued using the -1 dB ceiling.
+        // `latencySamples` (~72 at 48 kHz) later, lowering the ceiling to -12 dB must still
+        // bring that already-queued impulse's emitted gain under the *new* ceiling: storing
+        // `ceilingLinear / peak` (baked in at push time) instead of the raw peak would leave
+        // it emitted at the stale -1 dB requirement.
+        var signal = [Float](repeating: 0, count: 300)
+        signal[0] = 1
+        let output = run(node, signal, blockSize: 1, onBlock: { i in
+            if i == 60 { set(node, "ceiling", -12) }
+        })
+        let newCeilingLinear = powf(10, -12 / 20)
+        let peakOut = output.map { abs($0) }.max() ?? 0
+        #expect(peakOut <= newCeilingLinear * 1.05,
+               "peak \(peakOut) exceeds the new -12 dB ceiling (\(newCeilingLinear)) -- emitted using the stale -1 dB gain")
+    }
 }
 
 @Suite("PitchShiftNode")
@@ -530,6 +616,29 @@ struct PitchShiftNodeTests {
         let measured = dominantFrequency(steady)
         let expected = inputFreq * powf(2, semitones / 12)
         #expect(abs(measured - expected) / expected < 0.01, "measured \(measured) Hz, expected \(expected) Hz")
+    }
+
+    @Test("The non-bypassed wet path at ratio 1 is unity gain and aligned to the actual FFT latency")
+    func wetPathUnityGainAndLatencyAligned() {
+        let node = PitchShiftNode(sampleRate: rate)
+        set(node, "semitones", 0)
+        // `formant` has no effect with `preserveFormants` off, but a nonzero value avoids the
+        // explicit `bypass` dry passthrough, forcing the signal through the real FFT
+        // analysis/synthesis round trip -- unlike `transparentPassthrough` above.
+        set(node, "formant", 1)
+        set(node, "preserveFormants", 0)
+        set(node, "mix", 100)
+        let tone = sine(300, seconds: 1, amplitude: 0.4)
+        let output = run(node, tone)
+        // The declared latency must be the actual wet-path latency (`fftSize`), not the
+        // shorter `inFifoLatency`: using that offset below is itself part of the regression,
+        // since the too-short declared latency would misalign this comparison by one hop.
+        let latency = node.latencySamples
+        #expect(latency == 1024, "declared latency \(latency), expected the full FFT size")
+        let steadyOut = output[(latency + 4096)...]
+        let steadyIn = tone[(latency + 4096)...]
+        let gainDB = dB(rms(steadyOut)) - dB(rms(steadyIn))
+        #expect(abs(gainDB) < 0.3, "wet path gain \(gainDB) dB, expected ~0 dB (unity) for an unchanged spectrum")
     }
 
     @Test("Zero semitones and zero formant is an exact, latency-aligned passthrough")
@@ -630,5 +739,96 @@ struct FXDeclickTests {
         #expect(output.allSatisfy { $0.isFinite })
         let baseline = maxStep(Array(tone[0..<4096]))
         #expect(maxStep(output) < baseline * 10)
+    }
+}
+
+@Suite("FXDSPCommon")
+struct FXDSPCommonTests {
+    @Test("fxRenormalizeLFO keeps a rotated unit vector at magnitude 1 over a long-running session")
+    func lfoRotationStaysNormalized() {
+        // The same per-sample rotation increment ChorusNode's default rate and ReverbNode's
+        // lines use (0.8 Hz / 48 kHz): small enough that `cosf(w)` rounds to exactly 1, so
+        // `sinf(w)` alone nudges the vector's magnitude every sample. Run far more samples than
+        // a single audio buffer to accumulate the drift a long session would show.
+        let w = 2 * Float.pi * 0.8 / 48_000
+        let rc = cosf(w), rs = sinf(w)
+        var c: Float = 1, s: Float = 0
+        for _ in 0..<2_000_000 {
+            let nc = c * rc - s * rs
+            let ns = c * rs + s * rc
+            c = nc; s = ns
+            fxRenormalizeLFO(&c, &s)
+        }
+        let mag = sqrtf(c * c + s * s)
+        #expect(abs(mag - 1) < 1e-4, "magnitude drifted to \(mag) even with renormalization")
+    }
+
+    @Test("Without renormalization, the same rotation measurably drifts off unit magnitude")
+    func lfoRotationDriftsWithoutRenormalization() {
+        let w = 2 * Float.pi * 0.8 / 48_000
+        let rc = cosf(w), rs = sinf(w)
+        var c: Float = 1, s: Float = 0
+        for _ in 0..<2_000_000 {
+            let nc = c * rc - s * rs
+            let ns = c * rs + s * rc
+            c = nc; s = ns
+        }
+        let mag = sqrtf(c * c + s * s)
+        #expect(abs(mag - 1) > 1e-4,
+               "expected measurable drift without renormalization (baseline for the fix above); got \(mag)")
+    }
+
+    @Test("pvWrapPhase keeps a phase within -pi...pi while preserving its sin/cos")
+    func wrapsPitchShiftPhase() {
+        #expect(abs(pvWrapPhase(5 * Float.pi)) <= Float.pi + 1e-5)
+        #expect(abs(pvWrapPhase(-100.3)) <= Float.pi + 1e-5)
+        // A phase that has run many times around the circle (as an unwrapped `sumPhase` would
+        // without the periodic wrap the fix adds) must wrap to something trigonometrically
+        // equivalent. Kept to a magnitude where the *input* itself still has full Float
+        // precision (a huge raw phase value has already lost precision representing itself,
+        // independent of `pvWrapPhase` -- exactly the failure mode wrapping every hop avoids by
+        // never letting `sumPhase` reach that magnitude in the first place).
+        let x: Float = 1.7
+        let farOut = x + 100 * 2 * Float.pi
+        let wrapped = pvWrapPhase(farOut)
+        #expect(abs(wrapped) <= Float.pi + 1e-3)
+        #expect(abs(sinf(wrapped) - sinf(x)) < 1e-3, "sin mismatch after wrapping \(farOut) -> \(wrapped)")
+        #expect(abs(cosf(wrapped) - cosf(x)) < 1e-3, "cos mismatch after wrapping \(farOut) -> \(wrapped)")
+    }
+}
+
+@Suite("FXKWeighting")
+struct FXKWeightingTests {
+    @Test("Reproduces the ITU-R BS.1770-5 Annex 1 Table 1 (shelf) coefficients at 48 kHz")
+    func matchesPublishedShelfCoefficients() {
+        let coeffs = FXKWeighting.coefficients(sampleRate: 48_000)
+        #expect(abs(coeffs.shelf.b0 - 1.53512485958697) < 1e-9)
+        #expect(abs(coeffs.shelf.b1 - (-2.69169618940638)) < 1e-9)
+        #expect(abs(coeffs.shelf.b2 - 1.19839281085285) < 1e-9)
+        #expect(abs(coeffs.shelf.a1 - (-1.69065929318241)) < 1e-9)
+        #expect(abs(coeffs.shelf.a2 - 0.73248077421585) < 1e-9)
+    }
+
+    @Test("Reproduces the ITU-R BS.1770-5 Annex 1 Table 2 (RLB high-pass) coefficients at 48 kHz")
+    func matchesPublishedHighpassCoefficients() {
+        let coeffs = FXKWeighting.coefficients(sampleRate: 48_000)
+        #expect(coeffs.highpass.b0 == 1)
+        #expect(coeffs.highpass.b1 == -2)
+        #expect(coeffs.highpass.b2 == 1)
+        #expect(abs(coeffs.highpass.a1 - (-1.99004745483398)) < 1e-9)
+        #expect(abs(coeffs.highpass.a2 - 0.99007225036621) < 1e-9)
+    }
+
+    @Test("Differs from FXBiquadCoeffs.make's generic RBJ shelf/high-pass at 48 kHz")
+    func differsFromGenericRBJDesign() {
+        // The regression this guards: passing the quoted frequency/Q straight into the RBJ
+        // cookbook formulas does *not* reproduce the published coefficients above.
+        let coeffs = FXKWeighting.coefficients(sampleRate: 48_000)
+        let genericShelf = FXBiquadCoeffs.make(type: .highshelf, frequency: 1681.9744509555319,
+                                               q: 0.7071752369554196, gainDB: 3.999843853973347, sampleRate: 48_000)
+        let genericHighpass = FXBiquadCoeffs.make(type: .highpass, frequency: 38.13547087602444,
+                                                   q: 0.5003270373238773, gainDB: 0, sampleRate: 48_000)
+        #expect(abs(coeffs.shelf.b0 - genericShelf.b0) > 1e-6)
+        #expect(abs(coeffs.highpass.b1 - genericHighpass.b1) > 1e-6)
     }
 }

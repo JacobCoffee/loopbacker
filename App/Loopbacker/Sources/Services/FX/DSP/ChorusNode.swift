@@ -121,12 +121,20 @@ final class ChorusNode: FXNode, @unchecked Sendable {
             let wetR = read(bufR, delaySamples: max(1, delayR))
 
             // Rotate the LFO unit vectors by the per-sample increment (cos/sin addition
-            // formula), i.e. advance the phase without calling `sinf`/`cosf` every sample.
-            let nlc = lfoLCos * lfoRotCos - lfoLSin * lfoRotSin
-            let nls = lfoLCos * lfoRotSin + lfoLSin * lfoRotCos
+            // formula), i.e. advance the phase without calling `sinf`/`cosf` every sample. The
+            // recurrence is an exact rotation only in infinite precision; in `Float` it drifts
+            // the vectors' magnitude away from 1 over a long-running session (`cosf(w)` rounds
+            // to exactly 1 at the default 0.8 Hz/48 kHz, so `sinf(w)` alone keeps nudging the
+            // magnitude up each sample), eventually pushing the delay excursion past the
+            // capacity sized from `maxDepthMs` and wrapping the masked read into unrelated
+            // audio. Renormalized every sample -- cheap next to the multiplies above.
+            var nlc = lfoLCos * lfoRotCos - lfoLSin * lfoRotSin
+            var nls = lfoLCos * lfoRotSin + lfoLSin * lfoRotCos
+            fxRenormalizeLFO(&nlc, &nls)
             lfoLCos = nlc; lfoLSin = fxFlush(nls)
-            let nrc = lfoRCos * lfoRotCos - lfoRSin * lfoRotSin
-            let nrs = lfoRCos * lfoRotSin + lfoRSin * lfoRotCos
+            var nrc = lfoRCos * lfoRotCos - lfoRSin * lfoRotSin
+            var nrs = lfoRCos * lfoRotSin + lfoRSin * lfoRotCos
+            fxRenormalizeLFO(&nrc, &nrs)
             lfoRCos = nrc; lfoRSin = fxFlush(nrs)
 
             let mix = mixSmoother.next()

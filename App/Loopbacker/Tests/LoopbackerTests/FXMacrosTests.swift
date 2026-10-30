@@ -71,4 +71,25 @@ struct FXMacrosTests {
             #expect(preset.nodes.contains { $0.kind == kind && $0.enabled })
         }
     }
+
+    @Test("Increasing Noise strengthens suppression (lower gate range, lower max reduction), not weakens it")
+    func noiseIncreasesSuppressionStrength() {
+        let low = FXMacros.apply(values(0, 0, 0.1, 0), to: EffectsPreset(nodes: []), noise: NoiseSuppressionSettings())
+        let high = FXMacros.apply(values(0, 0, 0.9, 0), to: EffectsPreset(nodes: []), noise: NoiseSuppressionSettings())
+        let lowGateRange = low.0.nodes.first { $0.kind == .gate }?.params["range"] ?? 0
+        let highGateRange = high.0.nodes.first { $0.kind == .gate }?.params["range"] ?? 0
+        #expect(highGateRange < lowGateRange,
+               "higher Noise should attenuate more (more negative range): low \(lowGateRange), high \(highGateRange)")
+        #expect(high.1.maxReductionDB < low.1.maxReductionDB,
+               "higher Noise should suppress more (more negative maxReductionDB): low \(low.1.maxReductionDB), high \(high.1.maxReductionDB)")
+    }
+
+    @Test("Touching an existing disabled EQ's bands (Clarity/Warmth) re-enables it")
+    func reEnablesDisabledEQ() {
+        let disabledEQ = FXNodeConfig(kind: .eq, enabled: false, eqBands: [])
+        let base = EffectsPreset(nodes: [disabledEQ])
+        let (preset, _) = FXMacros.apply(values(0.5, 0.5, 0, 0), to: base, noise: NoiseSuppressionSettings())
+        let eq = preset.nodes.first { $0.kind == .eq }
+        #expect(eq?.enabled == true, "an existing disabled EQ should be enabled once a macro writes bands into it")
+    }
 }

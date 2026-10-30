@@ -56,10 +56,12 @@ final class LimiterNode: FXNode, @unchecked Sendable {
     private let delayR: UnsafeMutablePointer<Float>
     private var delayWrite = 0
 
-    // MARK: Monotonic deque of (sample index, safe gain), ascending index / ascending gain, so
-    // the front is always the minimum gain still inside the lookahead window.
+    // MARK: Monotonic deque of (sample index, true-peak magnitude), descending index / descending
+    // peak, so the front is always the maximum peak (== minimum safe gain, recomputed from the
+    // *current* ceiling on every read, not baked in at push time) still inside the lookahead
+    // window.
     private let dequeIndex: UnsafeMutablePointer<Int>
-    private let dequeGain: UnsafeMutablePointer<Float>
+    private let dequePeak: UnsafeMutablePointer<Float>
     private let dequeCapacity: Int
     private var dequeHead = 0
     private var dequeTail = 0 // one-past-last
@@ -103,14 +105,14 @@ final class LimiterNode: FXNode, @unchecked Sendable {
 
         dequeCapacity = delayFrames + 4
         dequeIndex = .allocate(capacity: dequeCapacity)
-        dequeGain = .allocate(capacity: dequeCapacity)
+        dequePeak = .allocate(capacity: dequeCapacity)
     }
 
     deinit {
         firTaps.deallocate()
         historyL.deallocate(); historyR.deallocate()
         delayL.deallocate(); delayR.deallocate()
-        dequeIndex.deallocate(); dequeGain.deallocate()
+        dequeIndex.deallocate(); dequePeak.deallocate()
     }
 
     private func refreshParams() {
@@ -171,16 +173,20 @@ final class LimiterNode: FXNode, @unchecked Sendable {
             delayWrite = (delayWrite + 1) & delayMask
 
             let peak = truePeak()
-            let safeGain = peak > ceilingLinear ? ceilingLinear / peak : 1
 
-            // Push (index, safeGain) onto the monotonic deque, discarding any trailing entries
-            // whose gain is >= this one (they can never be the minimum again while this sample
-            // is still in the window) — the standard sliding-window-minimum maintenance.
-            while dequeTail > dequeHead && dequeGain[(dequeTail - 1) % dequeCapacity] >= safeGain {
+            // Push (index, peak) onto the monotonic deque, discarding any trailing entries
+            // whose peak is <= this one (they can never be the window maximum again while this
+            // sample is still in the window) -- the standard sliding-window-maximum
+            // maintenance. Storing the raw peak (not `ceilingLinear`-derived safe gain) means a
+            // ceiling change between push and read is picked up immediately: the queued
+            // requirement is always recomputed against the *current* ceiling below, instead of
+            // baking in whatever ceiling was active when a peak was detected and letting an
+            // already-queued impulse emit at the old, now-stale gain.
+            while dequeTail > dequeHead && dequePeak[(dequeTail - 1) % dequeCapacity] <= peak {
                 dequeTail -= 1
             }
             dequeIndex[dequeTail % dequeCapacity] = sampleCounter
-            dequeGain[dequeTail % dequeCapacity] = safeGain
+            dequePeak[dequeTail % dequeCapacity] = peak
             dequeTail += 1
             // Evict entries that have fallen out of the lookahead window.
             let windowStart = sampleCounter - latencySamples
@@ -189,7 +195,8 @@ final class LimiterNode: FXNode, @unchecked Sendable {
             }
             sampleCounter += 1
 
-            let targetGain = dequeHead < dequeTail ? dequeGain[dequeHead % dequeCapacity] : 1
+            let windowPeak = dequeHead < dequeTail ? dequePeak[dequeHead % dequeCapacity] : 0
+            let targetGain = windowPeak > ceilingLinear ? ceilingLinear / windowPeak : 1
             if targetGain < currentGain {
                 currentGain = targetGain // instant: a peak in the window must never be exceeded.
             } else {

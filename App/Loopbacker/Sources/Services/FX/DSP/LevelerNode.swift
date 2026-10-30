@@ -56,8 +56,9 @@ final class LevelerNode: FXNode, @unchecked Sendable {
     init(sampleRate: Float) {
         self.sampleRate = sampleRate
         params = FXParamStore(specs: FXBuiltinSpecs.leveler)
-        shelfCoeffs = FXBiquadCoeffs.make(type: .highshelf, frequency: 1681.9744509555319, q: 0.7071752369554196, gainDB: 3.999843853973347, sampleRate: Double(sampleRate))
-        hpCoeffs = FXBiquadCoeffs.make(type: .highpass, frequency: 38.13547087602444, q: 0.5003270373238773, gainDB: 0, sampleRate: Double(sampleRate))
+        let coeffs = FXKWeighting.coefficients(sampleRate: Double(sampleRate))
+        shelfCoeffs = coeffs.shelf
+        hpCoeffs = coeffs.highpass
         windowFrames = max(1, Int(0.4 * sampleRate))
         windowBuffer = .allocate(capacity: windowFrames)
         windowBuffer.initialize(repeating: 0, count: windowFrames)

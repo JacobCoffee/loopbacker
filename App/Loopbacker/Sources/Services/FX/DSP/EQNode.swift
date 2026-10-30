@@ -27,16 +27,27 @@ private struct FXEQSection: Sendable {
 /// sections are numerically sensitive in `Float`.
 ///
 /// `setBands` is called from the UI while the IO thread may be mid-block, so coefficients are
-/// double-buffered: the writer (guarded by a `Mutex` so two concurrent editors don't tear a
-/// buffer) fully builds the inactive buffer, then publishes it with one atomic store; the IO
-/// thread only ever atomic-loads which buffer is current — never blocks, never sees a partial
-/// write. On a publish, the IO thread doesn't jump-cut coefficients (an audible click on
-/// resonant bands): it linearly interpolates each coefficient from the last live value to the
-/// new one over ~5 ms, then snaps exactly to avoid drift.
+/// published through a pool of `publishSlots` snapshot buffers tagged with a monotonically
+/// increasing generation: the writer (guarded by a `Mutex` so two concurrent editors don't tear
+/// a buffer) fully builds the next slot, then publishes `(slot, generation)` with one atomic
+/// store. The IO thread atomic-loads the generation, and on a change copies that slot's full
+/// snapshot into its own `toCoeffs` buffer *once*, immediately releasing the slot back to the
+/// pool -- unlike reading the shared slot on every sample for the whole ~5 ms ramp (which would
+/// let two publications landing before the IO thread notices either one tear the buffer it's
+/// mid-interpolating from), and unlike a 2-slot index that a second publication before the IO
+/// thread picks up the first can flip back to the value the reader already considers applied,
+/// silently dropping it. Never blocks, never sees a partial write. On a publish, the IO thread
+/// doesn't jump-cut coefficients (an audible click on resonant bands): it linearly interpolates
+/// each coefficient from the last live value to the new one (toward the IO-owned copy, not the
+/// pool slot) over ~5 ms, then snaps exactly to avoid drift.
 final class EQNode: FXNode, @unchecked Sendable {
     private static let maxBands = 16
     private static let maxSectionsPerBand = 4
     private static let maxSections = maxBands * maxSectionsPerBand
+    /// Pool size for publish snapshots: generous headroom over the 1-2 in-flight publications
+    /// a UI edit stream realistically produces between IO blocks, so a writer can never wrap
+    /// around and overwrite a slot before the IO thread's single, immediate copy-out of it.
+    private static let publishSlots = 8
 
     let kind: FXNodeKind = .eq
     let specs = FXBuiltinSpecs.eq
@@ -50,14 +61,15 @@ final class EQNode: FXNode, @unchecked Sendable {
 
     // MARK: Published coefficients (writer: any thread; reader: IO thread)
     private let publishBuffers: [UnsafeMutablePointer<FXEQSection>]
-    private let publishedIndex = Atomic<Int>(0)
+    private let publishedGeneration = Atomic<UInt32>(0)
     private let writeLock = Mutex<Void>(())
+    private var nextGeneration: UInt32 = 0 // writer-owned, serialized by `writeLock`.
 
     // MARK: IO-thread-only state
     private let liveCoeffs: UnsafeMutablePointer<FXEQSection>
     private let fromCoeffs: UnsafeMutablePointer<FXEQSection>
-    private var targetBufferIndex = 0
-    private var lastAppliedIndex = 0
+    private let toCoeffs: UnsafeMutablePointer<FXEQSection> // IO-owned copy of the active publish.
+    private var lastAppliedGeneration: UInt32 = 0
     private let rampTotal: Int
     private var rampRemaining = 0
     private let sectionStates: UnsafeMutablePointer<FXBiquadState> // [channel][section], channel-major
@@ -68,7 +80,7 @@ final class EQNode: FXNode, @unchecked Sendable {
         outputGain = FXSmoother(initial: 1, timeMs: 20, sampleRate: sampleRate)
         rampTotal = max(1, Int(0.005 * sampleRate))
 
-        publishBuffers = (0..<2).map { _ in
+        publishBuffers = (0..<Self.publishSlots).map { _ in
             let p = UnsafeMutablePointer<FXEQSection>.allocate(capacity: Self.maxSections)
             p.initialize(repeating: FXEQSection(), count: Self.maxSections)
             return p
@@ -77,6 +89,8 @@ final class EQNode: FXNode, @unchecked Sendable {
         liveCoeffs.initialize(repeating: FXEQSection(), count: Self.maxSections)
         fromCoeffs = .allocate(capacity: Self.maxSections)
         fromCoeffs.initialize(repeating: FXEQSection(), count: Self.maxSections)
+        toCoeffs = .allocate(capacity: Self.maxSections)
+        toCoeffs.initialize(repeating: FXEQSection(), count: Self.maxSections)
         sectionStates = .allocate(capacity: Self.maxSections * 2)
         sectionStates.initialize(repeating: FXBiquadState(), count: Self.maxSections * 2)
     }
@@ -85,15 +99,18 @@ final class EQNode: FXNode, @unchecked Sendable {
         for b in publishBuffers { b.deinitialize(count: Self.maxSections); b.deallocate() }
         liveCoeffs.deinitialize(count: Self.maxSections); liveCoeffs.deallocate()
         fromCoeffs.deinitialize(count: Self.maxSections); fromCoeffs.deallocate()
+        toCoeffs.deinitialize(count: Self.maxSections); toCoeffs.deallocate()
         sectionStates.deinitialize(count: Self.maxSections * 2); sectionStates.deallocate()
     }
 
-    /// Any thread. Builds the full section list for `bands` (≤16, extra ignored) into the
-    /// currently-unpublished buffer, then publishes it. Disabled bands contribute no sections.
+    /// Any thread. Builds the full section list for `bands` (≤16, extra ignored) into the next
+    /// pool slot, then publishes it tagged with a fresh generation. Disabled bands contribute no
+    /// sections.
     func setBands(_ bands: [EQBandConfig]) {
         writeLock.withLock { _ in
-            let target = 1 - publishedIndex.load(ordering: .relaxed)
-            let buf = publishBuffers[target]
+            nextGeneration += 1
+            let generation = nextGeneration
+            let buf = publishBuffers[Int(generation % UInt32(Self.publishSlots))]
             var idx = 0
             for band in bands.prefix(Self.maxBands) where band.enabled {
                 for c in Self.sections(for: band, sampleRate: sampleRate) {
@@ -103,7 +120,7 @@ final class EQNode: FXNode, @unchecked Sendable {
                 }
             }
             for j in idx..<Self.maxSections { buf[j] = FXEQSection() }
-            publishedIndex.store(target, ordering: .releasing)
+            publishedGeneration.store(generation, ordering: .releasing)
         }
     }
 
@@ -134,11 +151,15 @@ final class EQNode: FXNode, @unchecked Sendable {
         }
         meters.inputPeak = fxBlockPeak(block)
 
-        let pubIdx = publishedIndex.load(ordering: .acquiring)
-        if pubIdx != lastAppliedIndex {
+        let pubGen = publishedGeneration.load(ordering: .acquiring)
+        if pubGen != lastAppliedGeneration {
             fromCoeffs.update(from: liveCoeffs, count: Self.maxSections)
-            targetBufferIndex = pubIdx
-            lastAppliedIndex = pubIdx
+            // Copy the whole snapshot out of the shared pool slot once, right here, instead of
+            // reading it from `publishBuffers` on every sample for the rest of the ramp: the
+            // slot is immediately free for the writer to reuse, and interpolation below only
+            // ever touches this IO-owned copy.
+            toCoeffs.update(from: publishBuffers[Int(pubGen % UInt32(Self.publishSlots))], count: Self.maxSections)
+            lastAppliedGeneration = pubGen
             rampRemaining = rampTotal
         }
 
@@ -146,12 +167,11 @@ final class EQNode: FXNode, @unchecked Sendable {
         for i in 0..<block.frames {
             if rampRemaining > 0 {
                 let t = Double(rampTotal - rampRemaining + 1) / Double(rampTotal)
-                let target = publishBuffers[targetBufferIndex]
                 for s in 0..<Self.maxSections {
-                    liveCoeffs[s] = FXEQSection.lerp(fromCoeffs[s], target[s], t)
+                    liveCoeffs[s] = FXEQSection.lerp(fromCoeffs[s], toCoeffs[s], t)
                 }
                 rampRemaining -= 1
-                if rampRemaining == 0 { liveCoeffs.update(from: target, count: Self.maxSections) }
+                if rampRemaining == 0 { liveCoeffs.update(from: toCoeffs, count: Self.maxSections) }
             }
 
             let g = outputGain.next()

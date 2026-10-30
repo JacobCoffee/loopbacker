@@ -36,11 +36,15 @@ final class ReverbNode: FXNode, @unchecked Sendable {
     private let sampleRate: Float
     private var lastGeneration: UInt32 = .max
 
-    private var sizeFraction: Float = 0.5
-    private var dampCoeff: Float = 0.3
-    private var preDelaySamples: Float = 10
+    // `size`/`damping`/`preDelay` all drive either a delay-line read position or the loop's
+    // feedback gain -- jumping any of them at a block boundary while input/an existing tail is
+    // present would discontinuously relocate a read head or step the loop gain, clicking.
+    // Smoothed per sample like `mixSmoother`; only `feedbackGain` (derived from the smoothed
+    // `sizeFraction`, not the raw param) needs no smoother of its own.
+    private var sizeSmoother: FXSmoother
+    private var dampSmoother: FXSmoother
+    private var preDelaySmoother: FXSmoother
     private var mixSmoother: FXSmoother
-    private var feedbackGain: Float = 0.75
 
     /// Row-major `lineCount x lineCount`, normalized ±1/√8 — fixed for the node's lifetime.
     private let hadamard: UnsafeMutablePointer<Float>
@@ -65,6 +69,9 @@ final class ReverbNode: FXNode, @unchecked Sendable {
     init(sampleRate: Float) {
         self.sampleRate = sampleRate
         params = FXParamStore(specs: FXBuiltinSpecs.reverb)
+        sizeSmoother = FXSmoother(initial: 0.5, timeMs: 30, sampleRate: sampleRate)
+        dampSmoother = FXSmoother(initial: 0.3, timeMs: 30, sampleRate: sampleRate)
+        preDelaySmoother = FXSmoother(initial: 10, timeMs: 30, sampleRate: sampleRate)
         mixSmoother = FXSmoother(initial: 0.15, timeMs: 30, sampleRate: sampleRate)
 
         let n = Self.lineCount
@@ -155,16 +162,13 @@ final class ReverbNode: FXNode, @unchecked Sendable {
         let gen = params.generation
         guard gen != lastGeneration else { return }
         lastGeneration = gen
-        sizeFraction = params.get(0) / 100
+        sizeSmoother.target = params.get(0) / 100
         let dampingFraction = params.get(1) / 100
         // Higher damping -> lower cutoff -> more one-pole smoothing per bounce.
         let cutoffHz = 20_000 * powf(0.02, dampingFraction)
-        dampCoeff = expf(-2 * Float.pi * cutoffHz / sampleRate)
-        preDelaySamples = params.get(2) / 1000 * sampleRate
+        dampSmoother.target = expf(-2 * Float.pi * cutoffHz / sampleRate)
+        preDelaySmoother.target = params.get(2) / 1000 * sampleRate
         mixSmoother.target = params.get(3) / 100
-        // Bigger rooms decay longer: map size to a feedback gain comfortably under the
-        // stability limit (1 / line gain, which is unity here since lines are pure delays).
-        feedbackGain = 0.6 + 0.37 * sizeFraction
     }
 
     func reset() {
@@ -177,6 +181,9 @@ final class ReverbNode: FXNode, @unchecked Sendable {
         }
         preDelayBuffer.update(repeating: 0, count: preDelayMask + 1)
         preDelayWrite = 0
+        sizeSmoother.snap()
+        dampSmoother.snap()
+        preDelaySmoother.snap()
         mixSmoother.snap()
     }
 
@@ -194,8 +201,6 @@ final class ReverbNode: FXNode, @unchecked Sendable {
     func process(_ block: FXBlock) {
         refreshParams()
         meters.inputPeak = fxBlockPeak(block)
-        // 30%...130% of the base length as the room grows from empty to `size` = 100.
-        let sizeScale = 0.3 + sizeFraction
         let n = Self.lineCount
 
         for i in 0..<block.frames {
@@ -203,8 +208,18 @@ final class ReverbNode: FXNode, @unchecked Sendable {
             let dryR = block.channels == 2 ? block.right[i] : dryL
             let monoIn = 0.5 * (dryL + dryR)
 
+            // 30%...130% of the base length as the room grows from empty to `size` = 100,
+            // smoothed per sample (not jumped at the block boundary) so a Size/Pre-Delay/
+            // Damping drag crossfades the delay-line read positions and feedback gain instead
+            // of relocating a read head or stepping the loop gain discontinuously.
+            let sizeNow = sizeSmoother.next()
+            let sizeScale = 0.3 + sizeNow
+            let dampCoeffNow = dampSmoother.next()
+            let preDelayNow = preDelaySmoother.next()
+            let feedbackGainNow = 0.6 + 0.37 * sizeNow
+
             preDelayBuffer[preDelayWrite] = monoIn
-            let readPos = Float(preDelayWrite) - max(0, preDelaySamples)
+            let readPos = Float(preDelayWrite) - max(0, preDelayNow)
             let i0 = Int(floor(readPos))
             let frac = readPos - Float(i0)
             let a = preDelayBuffer[i0 & preDelayMask]
@@ -215,12 +230,17 @@ final class ReverbNode: FXNode, @unchecked Sendable {
             for k in 0..<n {
                 let modulatedLength = Float(lineLengths[k]) * sizeScale + lfoSin[k] * Self.lfoDepthSamples
                 let raw = readLine(k, delaySamples: max(4, modulatedLength))
-                dampStates[k] = fxFlush(raw + dampCoeff * (dampStates[k] - raw))
+                dampStates[k] = fxFlush(raw + dampCoeffNow * (dampStates[k] - raw))
                 dampedOut[k] = dampStates[k]
 
                 let rc = lfoRotCos[k], rs = lfoRotSin[k]
-                let nc = lfoCos[k] * rc - lfoSin[k] * rs
-                let ns = lfoCos[k] * rs + lfoSin[k] * rc
+                var nc = lfoCos[k] * rc - lfoSin[k] * rs
+                var ns = lfoCos[k] * rs + lfoSin[k] * rc
+                // The rotation recurrence is exact only in infinite precision; in `Float` it
+                // drifts the (cos, sin) vector away from unit magnitude over a long-running
+                // session, growing the delay-line modulation depth past the capacity sized
+                // from `maxDepthMs` until masked reads wrap into unrelated audio.
+                fxRenormalizeLFO(&nc, &ns)
                 lfoCos[k] = nc
                 lfoSin[k] = fxFlush(ns)
             }
@@ -229,8 +249,9 @@ final class ReverbNode: FXNode, @unchecked Sendable {
                 var acc: Float = 0
                 let rowBase = k * n
                 for j in 0..<n { acc += hadamard[rowBase + j] * dampedOut[j] }
-                feedbackVec[k] = acc * feedbackGain
+                feedbackVec[k] = acc * feedbackGainNow
             }
+
             for k in 0..<n {
                 let buf = lineBufferStarts[k]
                 buf[writeIndices[k]] = prefed * 0.35 + feedbackVec[k]

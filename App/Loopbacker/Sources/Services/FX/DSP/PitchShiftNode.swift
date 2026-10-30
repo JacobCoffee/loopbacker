@@ -1,6 +1,16 @@
 import Accelerate
 import Foundation
 
+/// Wraps a phase in radians into `-pi...pi`, keeping accumulated synthesis phases bounded so
+/// `Float` precision doesn't degrade (and `cosf`/`sinf`'s own argument-reduction accuracy
+/// doesn't degrade) over a long-running session.
+@inline(__always) func pvWrapPhase(_ x: Float) -> Float {
+    let twoPi: Float = 2 * .pi
+    var y = x.truncatingRemainder(dividingBy: twoPi)
+    if y > .pi { y -= twoPi } else if y < -.pi { y += twoPi }
+    return y
+}
+
 /// One channel's phase-vocoder pitch shifter (Bernsee's classic FFT bin-remapping algorithm),
 /// extended with identity phase locking and a cepstral formant-preservation stage. Owns all its
 /// FFT buffers; `PitchShiftNode` runs one instance per channel.
@@ -229,7 +239,12 @@ private final class PVChannel {
             tmp /= freqPerBin
             tmp = 2 * .pi * tmp / Float(osamp)
             tmp += Float(k) * expct
-            sumPhase[k] = fxFlush(sumPhase[k] + tmp)
+            // Wrap modulo 2*pi every hop: an unwrapped running phase for a persistent spectral
+            // peak grows without bound (~2*pi*1000 rad/s for a 1 kHz tone), reaching Float's
+            // ~2-radian ULP within under an hour and quantizing pitch audibly. Wrapping keeps
+            // the stored phase, and the `cosf`/`sinf` below that consume it, in the precise
+            // range without changing the relative analysis-phase offsets pass 2 depends on.
+            sumPhase[k] = pvWrapPhase(fxFlush(sumPhase[k] + tmp))
         }
         // Pass 2: lock every other bin to its (now up to date) region peak.
         for k in 0...half {
@@ -241,13 +256,16 @@ private final class PVChannel {
             } else {
                 let srcK = synSourceBin[k], srcPeak = synSourceBin[peak]
                 if srcK >= 0, srcPeak >= 0 {
-                    phase = sumPhase[peak] + (curPhase[srcK] - curPhase[srcPeak])
+                    phase = pvWrapPhase(sumPhase[peak] + (curPhase[srcK] - curPhase[srcPeak]))
                 } else {
                     var tmp = synFreq[k] - Float(k) * freqPerBin
                     tmp /= freqPerBin
                     tmp = 2 * .pi * tmp / Float(osamp)
                     tmp += Float(k) * expct
-                    phase = sumPhase[k] + tmp
+                    // Fallback (no source bin on either side): also accumulates from the old
+                    // `sumPhase[k]` every hop a bin keeps falling back, so it needs the same
+                    // wrap as the peak case.
+                    phase = pvWrapPhase(fxFlush(sumPhase[k] + tmp))
                 }
                 sumPhase[k] = phase
             }
@@ -258,7 +276,12 @@ private final class PVChannel {
 
         vDSP_fft_zip(fftSetup, &splitComplex, 1, log2n, FFTDirection(kFFTDirection_Inverse))
 
-        let outScale: Float = 2 / (Float(half) * Float(osamp))
+        // Unnormalized inverse complex FFT of a spectrum built from (2x-doubled-magnitude)
+        // positive frequencies only gives N times the windowed real input; combined with the
+        // squared-Hann overlap-add sum of 3*osamp/8, outScale must be 8/(N*osamp*3) -- not
+        // 4/(N*osamp) -- for unity gain through an unchanged spectrum (verified by
+        // `PitchShiftNodeTests.transparentWetPathIsUnityGain`).
+        let outScale: Float = 8 / (3 * Float(fftSize) * Float(osamp))
         for k in 0..<fftSize {
             outputAccum[k] = fxFlush(outputAccum[k] + window[k] * splitReal[k] * outScale)
         }
@@ -322,7 +345,12 @@ final class PitchShiftNode: FXNode, @unchecked Sendable {
         params = FXParamStore(specs: FXBuiltinSpecs.pitchShift)
         left = PVChannel(fftSize: Self.fftSize, osamp: Self.osamp, sampleRate: sampleRate)
         right = PVChannel(fftSize: Self.fftSize, osamp: Self.osamp, sampleRate: sampleRate)
-        latencySamples = left.inFifoLatency
+        // The wet FIFO schedule adds a further `stepSize` samples beyond `inFifoLatency`
+        // (input first buffered through `inFifoLatency`, then the hop's output only lands in
+        // `outFIFO` after one more `stepSize`-sample hop): a sample fed at t=0 first affects
+        // output at t=fftSize, not t=inFifoLatency. Declaring the shorter `inFifoLatency` here
+        // would leave the wet path one hop behind the dry path for every bypass/partial mix.
+        latencySamples = Self.fftSize
         mixSmoother = FXSmoother(initial: 1, timeMs: 20, sampleRate: sampleRate)
 
         dryFrames = max(1, latencySamples)

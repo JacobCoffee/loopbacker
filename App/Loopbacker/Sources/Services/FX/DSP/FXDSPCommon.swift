@@ -159,3 +159,72 @@ struct FXEnvelopeDB {
     let c = max(-3, min(3, x))
     return c * (27 + c * c) / (27 + 9 * c * c)
 }
+
+// MARK: - LFO rotation renormalization
+
+/// Renormalizes a 2D unit-vector LFO rotation recurrence (`c' = c*rc - s*rs; s' = c*rs + s*rc`,
+/// used by `ChorusNode` and `ReverbNode` for per-sample modulation without calling `sinf`/
+/// `cosf` every sample) back to unit magnitude. That recurrence is an exact rotation only in
+/// infinite precision; in `Float` it drifts the vector's magnitude away from 1 over a
+/// long-running session, growing the modulation depth unboundedly until delay reads wrap into
+/// unrelated audio. Cheap to call every sample: the magnitude check is the only extra work
+/// unless drift has actually accumulated, when one `rsqrt` corrects it.
+@inline(__always) func fxRenormalizeLFO(_ cosValue: inout Float, _ sinValue: inout Float) {
+    let magSq = cosValue * cosValue + sinValue * sinValue
+    guard abs(magSq - 1) > 1e-6 else { return }
+    let invMag = 1 / sqrtf(magSq)
+    cosValue *= invMag
+    sinValue *= invMag
+}
+
+// MARK: - BS.1770 K-weighting
+
+/// ITU-R BS.1770 K-weighting: a head-related high-shelf stage (Annex 1 Table 1) cascaded with
+/// an RLB (revised low-frequency B) high-pass stage (Annex 1 Table 2). Annex 1 tabulates
+/// coefficients only at 48 kHz, and those coefficients are *not* reproducible by passing the
+/// quoted frequency/Q into `FXBiquadCoeffs.make`: the shelf uses a different analog prototype
+/// than the RBJ cookbook shelf, and the high-pass's published numerator is the un-normalized
+/// `[1, -2, 1]`, not RBJ's `(1+cos(w0))`-scaled one. This derives the same two stages from
+/// their analog prototypes (corner frequency + Q) via the bilinear transform with frequency
+/// pre-warping, the standard approach (used by libebur128) for sample rates other than 48 kHz;
+/// at `sampleRate == 48_000` it reproduces the Annex 1 Table 1/Table 2 values to within
+/// floating-point epsilon (`FXDSPTests`). `LevelerNode`, `AutoSetup`, and the test support's
+/// `measuredLUFS` all build their filters from this one implementation, so "LUFS" means the
+/// same measurement everywhere in the app and in its tests.
+enum FXKWeighting {
+    private static let shelfGainDB = 3.999843853973347
+    private static let shelfFrequency = 1681.9744509555319
+    private static let shelfQ = 0.7071752369554196
+    /// Exact exponent relating the shelf's bandwidth gain to its DC gain (libebur128); not
+    /// `sqrt(vh)` -- the small difference is required to reproduce the published coefficients.
+    private static let shelfVbExponent = 0.4996667741545416
+
+    private static let highpassFrequency = 38.13547087602444
+    private static let highpassQ = 0.5003270373238773
+
+    /// `(shelf, highpass)` biquad coefficients for `sampleRate`, in `FXBiquadState`'s
+    /// convention (`y = b0 x[n] + b1 x[n-1] + b2 x[n-2] - a1 y[n-1] - a2 y[n-2]`, `a0` already
+    /// divided out).
+    static func coefficients(sampleRate: Double) -> (shelf: FXBiquadCoeffs, highpass: FXBiquadCoeffs) {
+        let vh = pow(10, shelfGainDB / 20)
+        let vb = pow(vh, shelfVbExponent)
+        let kShelf = tan(Double.pi * shelfFrequency / sampleRate)
+        let a0Shelf = 1 + kShelf / shelfQ + kShelf * kShelf
+        var shelf = FXBiquadCoeffs()
+        shelf.b0 = (vh + vb * (kShelf / shelfQ) + kShelf * kShelf) / a0Shelf
+        shelf.b1 = (2 * (kShelf * kShelf - vh)) / a0Shelf
+        shelf.b2 = (vh - vb * (kShelf / shelfQ) + kShelf * kShelf) / a0Shelf
+        shelf.a1 = (2 * (kShelf * kShelf - 1)) / a0Shelf
+        shelf.a2 = (1 - kShelf / shelfQ + kShelf * kShelf) / a0Shelf
+
+        let kHP = tan(Double.pi * highpassFrequency / sampleRate)
+        let a0HP = 1 + kHP / highpassQ + kHP * kHP
+        var highpass = FXBiquadCoeffs()
+        highpass.b0 = 1
+        highpass.b1 = -2
+        highpass.b2 = 1
+        highpass.a1 = (2 * (kHP * kHP - 1)) / a0HP
+        highpass.a2 = (1 - kHP / highpassQ + kHP * kHP) / a0HP
+        return (shelf, highpass)
+    }
+}

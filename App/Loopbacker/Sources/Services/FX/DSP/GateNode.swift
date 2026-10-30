@@ -95,8 +95,14 @@ final class GateNode: FXNode, @unchecked Sendable {
         // silence (without this, the envelope would equal the raw instantaneous key level and
         // dip to -inf dB at every zero crossing of a steady tone/voice).
         envelope.setTimes(attackMs: 1, releaseMs: 10, sampleRate: sampleRate)
-        dBPerSampleAttack = abs(rangeDB) / max(attackMs * sampleRate / 1000, 1)
-        dBPerSampleRelease = abs(rangeDB) / max(releaseMs * sampleRate / 1000, 1)
+        // The ramp rate is derived from an excursion of at least 1 dB, never from `rangeDB`
+        // itself: deriving it from `rangeDB` alone means a range of exactly 0 (a supported
+        // value) produces a zero rate, so a gate caught mid-close when range changes to 0 (or
+        // one just constructed before a persisted zero range is applied) can never ramp its
+        // already-negative `gainDB` back to the new unity target and stays permanently
+        // attenuated even though Range reads 0 dB.
+        dBPerSampleAttack = max(abs(rangeDB), 1) / max(attackMs * sampleRate / 1000, 1)
+        dBPerSampleRelease = max(abs(rangeDB), 1) / max(releaseMs * sampleRate / 1000, 1)
     }
     func reset() {
         keyStateL.reset()
