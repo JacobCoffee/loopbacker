@@ -68,7 +68,12 @@ final class AppAudioProcessor: @unchecked Sendable {
         guard frames > 0, stride > 0 else { return }
         let duckingEnabled = duckingEnabledBits.load(ordering: .relaxed)
         let levelerEnabled = levelerEnabledBits.load(ordering: .relaxed)
-        guard duckingEnabled || levelerEnabled else { return }
+        guard duckingEnabled || levelerEnabled else {
+            duckGain = 1
+            AppAudioDuckBus.update(1)
+            return
+        }
+        if !duckingEnabled { duckGain = 1 }
         let cfg = (
             duckingEnabled: duckingEnabled,
             duckAmountDB: Float(bitPattern: duckAmountDBBits.load(ordering: .relaxed)),
@@ -83,6 +88,7 @@ final class AppAudioProcessor: @unchecked Sendable {
             processChunk(buffer.advanced(by: offset * stride), frames: n, stride: stride, cfg: cfg)
             offset += n
         }
+        AppAudioDuckBus.update(duckGain)
     }
 
     private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames: Int, stride: Int,
@@ -113,5 +119,48 @@ final class AppAudioProcessor: @unchecked Sendable {
 
         FXBlockIO.reinterleave(buf, frames: frames, stride: stride, channels: min(stride, 2),
                                left: leftScratch, right: rightScratch, mono: mono)
+    }
+}
+
+/// App-wide measured duck gain, published by whichever `AppAudioProcessor` route last processed
+/// a block, so the Effects page's meter can show the gain actually applied rather than a UI-side
+/// guess. Lock-free: a single atomic float plus a timestamp, mirroring `VoiceBus`'s pattern —
+/// min-with-decay instead of max-with-decay, since 1 (unity, no reduction) is this bus's "quiet"
+/// baseline and lower values are "more active".
+///
+/// Thread contract: `update` runs on each app-capture route's IO thread; `gain` runs on the
+/// main thread (the Effects page's meter). Both are safe to call concurrently.
+enum AppAudioDuckBus {
+    /// How long a published value is trusted before it's treated as stale (the route that was
+    /// publishing it stopped) and reported as unity gain instead.
+    private static let staleNanos: UInt64 = 300_000_000
+    /// One-pole relaxation of the previous (most-ducked) reading back toward unity before
+    /// taking the min with a fresh reading, so the meter eases back up smoothly instead of
+    /// latching at the deepest duck forever.
+    private static let decayPerUpdate: Float = 0.97
+
+    private static let bits = Atomic<UInt32>(Float(1).bitPattern)
+    private static let lastUpdateNanos = Atomic<UInt64>(0)
+
+    /// Any thread (an `AppAudioProcessor`'s IO thread), once per processed block.
+    static func update(_ gain: Float) {
+        lastUpdateNanos.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
+        let clamped = min(max(gain, 0), 1)
+        var current = bits.load(ordering: .relaxed)
+        while true {
+            let relaxed = 1 - (1 - Float(bitPattern: current)) * decayPerUpdate
+            let next = min(relaxed, clamped)
+            let result = bits.compareExchange(expected: current, desired: next.bitPattern, ordering: .relaxed)
+            if result.exchanged { break }
+            current = result.original
+        }
+    }
+
+    /// Any thread. The current linear duck gain (1 = no reduction), or 1 if no app-capture
+    /// route has published recently.
+    static func gain() -> Float {
+        let last = lastUpdateNanos.load(ordering: .relaxed)
+        guard last != 0, DispatchTime.now().uptimeNanoseconds &- last < staleNanos else { return 1 }
+        return Float(bitPattern: bits.load(ordering: .relaxed))
     }
 }

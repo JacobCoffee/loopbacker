@@ -4,7 +4,6 @@ import SwiftUI
 /// chain. A live duck-gain meter shows how far app audio is currently pulled down.
 struct AppAudioSection: View {
     @EnvironmentObject var routingState: RoutingState
-    @Environment(MeterLevels.self) private var meters
 
     private var appAudio: AppAudioFX { routingState.effectsPreset.appAudio }
 
@@ -84,16 +83,14 @@ struct AppAudioSection: View {
         }
     }
 
-    /// `AppAudioProcessor` doesn't expose a shared live duck-gain readout, so this meter reads
-    /// the loudest currently-captured app source as a proxy for how hard ducking is working:
-    /// full-height bar at the configured `duckAmountDB` would mean it's fully engaged.
+    /// Live duck-gain meter driven by `AppAudioDuckBus`, the actual gain `AppAudioProcessor`
+    /// applied on its IO thread (not inferred from app-signal presence: silent app audio or a
+    /// release still in progress both show the real current reduction).
     private var duckGainMeter: some View {
         TimelineView(.periodic(from: .now, by: 1.0 / 20.0)) { _ in
-            let loudestApp = routingState.sources
-                .filter { $0.sourceType == .appCapture && $0.isEnabled }
-                .map { meters.peak(source: $0.deviceUID) }
-                .max() ?? 0
-            let duckGainDB = loudestApp > 0.01 ? appAudio.duckAmountDB : 0
+            let duckGainDB = min(0, fxLinearToDB(AppAudioDuckBus.gain()))
+            let lowerBound = AppAudioFX.duckAmountRange.lowerBound
+            let fraction = lowerBound == 0 ? 0 : min(max(duckGainDB / lowerBound, 0), 1)
 
             HStack(spacing: 10) {
                 Text("Duck Gain")
@@ -104,7 +101,7 @@ struct AppAudioSection: View {
                         RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5))
                         RoundedRectangle(cornerRadius: 4)
                             .fill(Color.loopbacker.opacity(0.65))
-                            .frame(width: max(2, CGFloat(duckGainDB / AppAudioFX.duckAmountRange.lowerBound)) * geo.size.width)
+                            .frame(width: max(2, CGFloat(fraction) * geo.size.width))
                             .animation(.linear(duration: 0.15), value: duckGainDB)
                     }
                 }
