@@ -49,6 +49,8 @@ struct InteractiveEQView: View {
         case .lowshelf: return "Low Shelf"
         case .peaking: return "Peaking"
         case .highshelf: return "High Shelf"
+        case .lowpass: return "Low Pass"
+        case .notch: return "Notch"
         }
     }
 

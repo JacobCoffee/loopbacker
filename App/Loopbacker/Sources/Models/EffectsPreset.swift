@@ -1,28 +1,5 @@
 import Foundation
 
-// MARK: - EQ Band
-
-struct EQBandConfig: Codable, Equatable, Identifiable {
-    let id: Int
-    var type: BandType
-    var frequencyHz: Float
-    var gainDB: Float
-    var q: Float
-
-    enum BandType: String, Codable {
-        case highpass, lowshelf, peaking, highshelf
-    }
-
-    /// "Masculine Voice + Broadcast Sound" preset from EasyEffects
-    /// Matches jtrv/47542c8be6345951802eebcf9dc7da31 gist values
-    static let broadcastMasculine: [EQBandConfig] = [
-        EQBandConfig(id: 0, type: .highpass, frequencyHz: 80,    gainDB:  0, q: 0.7),   // rumble cut
-        EQBandConfig(id: 1, type: .peaking,  frequencyHz: 220,   gainDB: -2, q: 0.7),   // mud reduction
-        EQBandConfig(id: 2, type: .peaking,  frequencyHz: 350,   gainDB: -2, q: 1.2),   // boxiness
-        EQBandConfig(id: 3, type: .peaking,  frequencyHz: 3500,  gainDB:  2, q: 0.9),   // presence
-        EQBandConfig(id: 4, type: .highshelf, frequencyHz: 10000, gainDB:  2, q: 0.7),   // air
-    ]
-}
 
 // MARK: - Effects Preset
 

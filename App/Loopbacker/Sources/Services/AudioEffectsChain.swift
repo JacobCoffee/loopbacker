@@ -775,6 +775,9 @@ final class AudioEffectsChain {
             a0 = (A + 1) - (A - 1) * cosw0 + twoSqrtAAlpha
             a1 = 2.0 * ((A - 1) - (A + 1) * cosw0)
             a2 = (A + 1) - (A - 1) * cosw0 - twoSqrtAAlpha
+
+        case .lowpass, .notch:
+            b0 = 1; b1 = 0; b2 = 0; a0 = 1; a1 = 0; a2 = 0
         }
 
         // Normalize

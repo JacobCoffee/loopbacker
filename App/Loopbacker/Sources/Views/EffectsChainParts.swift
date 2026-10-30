@@ -274,6 +274,8 @@ struct EQBandRow: View {
         case .lowshelf: return "LS"
         case .peaking: return "PK"
         case .highshelf: return "HS"
+        case .lowpass: return "LP"
+        case .notch: return "NT"
         }
     }
 
