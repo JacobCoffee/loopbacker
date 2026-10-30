@@ -25,12 +25,9 @@ struct AutoSetupResult: Sendable {
 /// change (missing built-ins are added, same as `FXMacros`).
 enum AutoSetup {
     /// K-weighting (ITU-R BS.1770): a ~+4 dB high-shelf above ~1.68 kHz, then a ~38 Hz
-    /// high-pass -- the same two-stage filter `LevelerNode` uses, so "speech is at -18 LUFS"
+    /// high-pass -- the same shared design `LevelerNode` uses (`FXKWeighting`), built for the
+    /// recording's own sample rate rather than assuming 48 kHz, so "speech is at -18 LUFS"
     /// means the same thing in both places.
-    private static let kShelf = FXBiquadCoeffs.make(type: .highshelf, frequency: 1681.9744509555319,
-                                                     q: 0.7071752369554196, gainDB: 3.999843853973347, sampleRate: 48_000)
-    private static let kHighpass = FXBiquadCoeffs.make(type: .highpass, frequency: 38.13547087602444,
-                                                        q: 0.5003270373238773, gainDB: 0, sampleRate: 48_000)
 
     static func analyze(_ recording: FXRecording, base: EffectsPreset, noise: NoiseSuppressionSettings) -> AutoSetupResult {
         let sampleRate = Float(recording.sampleRate > 0 ? recording.sampleRate : 48_000)
@@ -103,6 +100,7 @@ enum AutoSetup {
             let correction = min(4, max(-4, -tiltDB * 0.5))
             setBand(&bands, id: BandID.tiltCorrection, type: .highshelf, freq: 6000, q: 0.7, gainDB: correction)
         }
+        setParams(&preset, kind: .eq) { config in config.enabled = true }
 
         setParams(&preset, kind: .deEsser) { config in
             config.enabled = sibilanceDB > 1
@@ -214,13 +212,14 @@ enum AutoSetup {
     /// so a `target` means the same thing here as it does to the leveler.
     private static func kWeightedIntegratedLUFS(_ samples: [Float], where predicate: (Int) -> Bool,
                                                 sampleRate: Float) -> Float {
+        let coeffs = FXKWeighting.coefficients(sampleRate: Double(sampleRate))
         var shelf = FXBiquadState()
         var hp = FXBiquadState()
         var sumSquares: Double = 0
         var count = 0
         for i in 0..<samples.count {
-            var k = Float(shelf.process(Double(samples[i]), kShelf))
-            k = Float(hp.process(Double(k), kHighpass))
+            var k = Float(shelf.process(Double(samples[i]), coeffs.shelf))
+            k = Float(hp.process(Double(k), coeffs.highpass))
             if predicate(i) {
                 sumSquares += Double(k * k)
                 count += 1

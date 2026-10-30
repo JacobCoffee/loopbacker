@@ -77,6 +77,20 @@ struct AutoSetupTests {
         #expect(threshold < result.peakDBFS, "gate threshold should sit below the recording's peak")
     }
 
+    @Test("Tilt correction re-enables an existing disabled EQ")
+    func reEnablesDisabledEQ() {
+        var base = FactoryPresets.preset(id: "meeting-natural")!.preset
+        guard let eqIdx = base.nodes.firstIndex(where: { $0.kind == .eq }) else {
+            Issue.record("meeting-natural has no EQ node")
+            return
+        }
+        base.nodes[eqIdx].enabled = false
+        let result = AutoSetup.analyze(recording(voice(speechPeakDBFS: -20, tiltBiasDB: 22, seed: 99)), base: base,
+                                       noise: NoiseSuppressionSettings())
+        let eq = result.preset.nodes.first { $0.kind == .eq }
+        #expect(eq?.enabled == true, "an existing disabled EQ should be enabled once the tilt correction writes a band into it")
+    }
+
     @Test("An empty recording degrades gracefully with no NaN")
     func emptyRecording() {
         let base = FactoryPresets.preset(id: "meeting-natural")!.preset

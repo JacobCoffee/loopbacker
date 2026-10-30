@@ -65,15 +65,19 @@ enum FXMacros {
             setBand(&bands, id: BandID.mud, type: .peaking, freq: 350, q: 1.0, gainDB: lerp(mudRange, 1 - warmth))
         }
 
-        // Noise: gate range/threshold + noise suppression reduction.
+        // Noise: gate range/threshold + noise suppression reduction. `range`/`reductionRange`
+        // are lerped by `1 - noiseAmt`: both ranges run weak-attenuation-first
+        // (gateRangeRange low = -6 dB, reductionRange low = -20 dB), so turning Noise *up* must
+        // move *down* each range toward its stronger (more negative) end. The opening threshold
+        // keeps lerping by `noiseAmt` directly (it's already increasing = more aggressive).
         ensureNode(&preset, kind: .gate)
         setParams(&preset, kind: .gate) { config in
             config.enabled = true
-            config.params["range"] = lerp(gateRangeRange, noiseAmt)
+            config.params["range"] = lerp(gateRangeRange, 1 - noiseAmt)
             config.params["threshold"] = lerp(gateThresholdRange, noiseAmt)
         }
         noise.isEnabled = noiseAmt > 0.02
-        noise.maxReductionDB = lerp(reductionRange, noiseAmt)
+        noise.maxReductionDB = lerp(reductionRange, 1 - noiseAmt)
 
         // Loudness: leveler target + compression amount.
         ensureNode(&preset, kind: .leveler)
@@ -103,9 +107,11 @@ enum FXMacros {
         let mud = band(bands, id: BandID.mud)?.gainDB ?? mudRange.upperBound
         let warmth = unlerp(bodyRange, body) * 0.6 + (1 - unlerp(mudRange, mud)) * 0.4
 
-        let gateRange = preset.nodes.first { $0.kind == .gate }?.params["range"] ?? gateRangeRange.lowerBound
-        let reduction = noise.isEnabled ? noise.maxReductionDB : reductionRange.lowerBound
-        let noiseAmt = unlerp(gateRangeRange, gateRange) * 0.5 + unlerp(reductionRange, reduction) * 0.5
+        // Inverse of `apply`'s `1 - noiseAmt` lerp: a missing gate/disabled suppression falls
+        // back to each range's weak (noiseAmt == 0) end, its upper bound, not the lower one.
+        let gateRange = preset.nodes.first { $0.kind == .gate }?.params["range"] ?? gateRangeRange.upperBound
+        let reduction = noise.isEnabled ? noise.maxReductionDB : reductionRange.upperBound
+        let noiseAmt = (1 - unlerp(gateRangeRange, gateRange)) * 0.5 + (1 - unlerp(reductionRange, reduction)) * 0.5
 
         let target = preset.nodes.first { $0.kind == .leveler }?.params["target"] ?? levelerTargetRange.lowerBound
         let ratio = preset.nodes.first { $0.kind == .compressor }?.params["ratio"] ?? compressorRatioRange.lowerBound
@@ -150,6 +156,7 @@ enum FXMacros {
 
     private static func withEQBands(_ preset: inout EffectsPreset, _ body: (inout [EQBandConfig]) -> Void) {
         guard let idx = preset.nodes.firstIndex(where: { $0.kind == .eq }) else { return }
+        preset.nodes[idx].enabled = true
         var bands = preset.nodes[idx].eqBands ?? []
         body(&bands)
         preset.nodes[idx].eqBands = bands

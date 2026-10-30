@@ -33,10 +33,9 @@ func runFXChain(_ nodes: [FXNodeConfig], sampleRate: Float, input: [Float], chun
 /// `samples` so their history stays correct across gaps. Mono, matching `LevelerNode`'s
 /// per-channel average, so a leveler's `target` param means the same thing here.
 func measuredLUFS(_ samples: [Float], ranges: [Range<Int>], sampleRate: Float) -> Float {
-    let shelf = FXBiquadCoeffs.make(type: .highshelf, frequency: 1681.9744509555319, q: 0.7071752369554196,
-                                    gainDB: 3.999843853973347, sampleRate: Double(sampleRate))
-    let hp = FXBiquadCoeffs.make(type: .highpass, frequency: 38.13547087602444, q: 0.5003270373238773, gainDB: 0,
-                                 sampleRate: Double(sampleRate))
+    let coeffs = FXKWeighting.coefficients(sampleRate: Double(sampleRate))
+    let shelf = coeffs.shelf
+    let hp = coeffs.highpass
     var shelfState = FXBiquadState()
     var hpState = FXBiquadState()
     var sumSquares: Double = 0
