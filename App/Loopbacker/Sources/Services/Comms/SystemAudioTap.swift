@@ -18,7 +18,6 @@ enum SystemAudioTapPermission: Sendable, Equatable {
 }
 
 enum SystemAudioTapError: Error, Sendable, Equatable, LocalizedError {
-    case processObjectLookupFailed(OSStatus)
     case tapCreationFailed(OSStatus)
     case aggregateCreationFailed(OSStatus)
     case ioProcCreationFailed(OSStatus)
@@ -26,7 +25,6 @@ enum SystemAudioTapError: Error, Sendable, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .processObjectLookupFailed(let status): "Could not look up Loopbacker's own audio process object (\(status))."
         case .tapCreationFailed(let status): "Could not create a system audio tap (\(status)). Check System Settings > Privacy & Security > Microphone/System Audio Recording."
         case .aggregateCreationFailed(let status): "Could not create the private aggregate device for the system audio tap (\(status))."
         case .ioProcCreationFailed(let status): "Could not install the tap's IO callback (\(status))."
@@ -38,16 +36,48 @@ enum SystemAudioTapError: Error, Sendable, Equatable, LocalizedError {
 enum SystemAudioTapState: Sendable, Equatable {
     case stopped
     case running
+    /// The default output device is one of Loopbacker's own virtual devices, or there is no
+    /// default output device at all: there's no physical speaker for echo cancellation to
+    /// matter against, so the tap doesn't run (no coreaudiod round trip, no TCC prompt) until
+    /// the default output becomes a real device again. `EchoCanceller` stays attached to
+    /// voice routes regardless; with the ring getting nothing written to it, AEC3's reverse
+    /// stream is silence, so it finds no echo to cancel and effectively passes the mic through.
+    case noPhysicalOutput
     case failed(SystemAudioTapError)
 }
 
-/// Core Audio process tap capturing the system's audio output — everything except Loopbacker's
-/// own process — as the far-end reference for `EchoCanceller`.
+/// Core Audio process tap capturing exactly what the *current default output device* plays, as
+/// the far-end reference for `EchoCanceller`.
 ///
-/// Uses the macOS 14.2+ process tap API (`CATapDescription` + `AudioHardwareCreateProcessTap`):
-/// a stereo global tap excluding Loopbacker's own process object (otherwise the voice Loopbacker
-/// sends to the virtual mic would loop back in as "echo" of itself), wrapped in a private,
-/// tap-only aggregate device so it can be driven with a device IOProc like any other HAL device.
+/// Uses the macOS 14.2+ process tap API (`CATapDescription` + `AudioHardwareCreateProcessTap`),
+/// scoped to the default output device's UID and first stream (`initExcludingProcesses:
+/// andDeviceUID:withStream:`, refined in Swift as `init(excludingProcesses:deviceUID:stream:)`)
+/// rather than a global tap: a global tap mixes every process's rendered audio regardless of
+/// which device it plays to, so audio apps rendering only into one of Loopbacker's own virtual
+/// output devices would pollute the reference with sound that either never reaches a speaker
+/// at all, or reaches one through a separate output route and would then be double-counted,
+/// offset in time from the system-output copy. Scoping to the device that's actually driving
+/// real speakers right now is the only way the reference matches "what the mic can physically
+/// pick up". `isMixdown`/`isMono` are set explicitly (stereo) after construction since the
+/// scoped initializer otherwise matches the tapped stream's native channel count, which the
+/// aggregate/IOProc/ring below assume is always 2 (see `systemAudioTapIOProc`'s channel guard).
+/// Wrapped in a private, tap-only aggregate device so it can be driven with a device IOProc
+/// like any other HAL device.
+///
+/// Deliberately does *not* exclude Loopbacker's own process from the tap. The only audio
+/// Loopbacker itself renders to a real output device is the monitor route (you hearing your
+/// own processed voice through real speakers) plus incidental UI sounds -- genuine sources of
+/// acoustic echo the mic will pick up, exactly like any other app's audio. The thing that might
+/// look like it needs excluding, the virtual mic, never appears in this tap at all regardless:
+/// it's an *input* device other apps capture from, not something CoreAudio mixes into any
+/// process's rendered *output*, which is the only thing a process tap captures. So there's no
+/// "self-echo" to guard against here, and excluding Loopbacker would instead leave the monitor
+/// path's real acoustic echo uncancelled.
+///
+/// If the default output device *is* one of Loopbacker's own virtual devices (nothing plays to
+/// real speakers right now), `rebuild` skips creating a tap entirely and reports
+/// `.noPhysicalOutput` -- there's nothing for echo cancellation to do until a real device is
+/// the default again, at which point the default-output-device listener rebuilds.
 ///
 /// Thread contract: `start`/`stop`/`rebuild` run on the main actor and are not real-time safe —
 /// they allocate Objective-C tap/aggregate-device objects and talk to coreaudiod. The IOProc
@@ -67,7 +97,9 @@ final class SystemAudioTap: ObservableObject {
     /// Kept small (20 ms) so it stays well below the shortest acoustic bulk delay worth
     /// compensating; see `EchoCancellerTests` and the integration note in the task report for
     /// the open question of how this interacts with reverberant (room-impulse-response) echo.
-    private static let ringTargetFillFrames: UInt32 = 960
+    /// `AudioRouter` reads this to fold the ring's own latency into its HAL-based stream-delay
+    /// estimate for AEC3.
+    nonisolated static let referenceTargetFillFrames: UInt32 = 960
 
     @Published private(set) var state: SystemAudioTapState = .stopped
     @Published private(set) var permission: SystemAudioTapPermission = .unknown
@@ -83,7 +115,7 @@ final class SystemAudioTap: ObservableObject {
 
     init() {
         ring = DriftCompensatedRing(capacityFrames: Self.ringCapacityFrames, channels: 2,
-                                     targetFill: Self.ringTargetFillFrames, sampleRate: 48_000)
+                                     targetFill: Self.referenceTargetFillFrames, sampleRate: 48_000)
         ioContext = UnsafeMutablePointer<IOContext>.allocate(capacity: 1)
         ioContext.initialize(to: IOContext(ring: Unmanaged.passUnretained(ring).toOpaque()))
     }
@@ -111,34 +143,35 @@ final class SystemAudioTap: ObservableObject {
     }
 
     /// Tears down and recreates the tap/aggregate/IOProc in place. Used for both the initial
-    /// start and recovery from a default-output device change: a global tap's format tracks
-    /// whatever device is currently driving system output, so switching outputs (e.g. built-in
-    /// speakers to a USB interface) can change its sample rate or channel count underneath the
-    /// aggregate device built around it.
+    /// start and recovery from a default-output device change: a device-scoped tap's format
+    /// tracks whatever device it names, so switching outputs (e.g. built-in speakers to a USB
+    /// interface, or to/from one of Loopbacker's own virtual devices) means re-pointing it at
+    /// the new default, or dropping it entirely if there's no physical device to tap.
     private func rebuild() {
         teardown()
 
-        var ownProcessObject = AudioObjectID(kAudioObjectUnknown)
-        var pid = getpid()
-        var processAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var processObjectSize = UInt32(MemoryLayout<AudioObjectID>.size)
-        let lookupStatus = withUnsafeMutablePointer(to: &pid) { pidPtr in
-            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &processAddress,
-                                       UInt32(MemoryLayout<pid_t>.size), pidPtr,
-                                       &processObjectSize, &ownProcessObject)
+        guard let outputDeviceUID = Self.defaultOutputDeviceUID() else {
+            tapLogger.info("No default output device; system audio tap stays stopped")
+            state = .noPhysicalOutput
+            return
         }
-        guard lookupStatus == noErr, ownProcessObject != kAudioObjectUnknown else {
-            fail(.processObjectLookupFailed(lookupStatus))
+        guard !Self.isLoopbackerVirtualDevice(outputDeviceUID) else {
+            tapLogger.info("Default output (\(outputDeviceUID)) is a Loopbacker virtual device; nothing to echo-cancel")
+            state = .noPhysicalOutput
             return
         }
 
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcessObject])
+        // No process exclusion list: see the class doc for why Loopbacker's own process stays
+        // in (it's the only way to capture the monitor route's real acoustic echo source).
+        // Scoped to the default output device's first stream: see the class doc for why a
+        // global tap is wrong here. `isMixdown`/`isMono` force the stereo shape the aggregate/
+        // IOProc/ring below assume, overriding the tapped stream's native channel count.
+        let description = CATapDescription(excludingProcesses: [], deviceUID: outputDeviceUID, stream: 0)
         description.name = "Loopbacker System Audio Tap"
         description.isPrivate = true
         description.muteBehavior = .unmuted
+        description.isMixdown = true
+        description.isMono = false
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTapID)
@@ -213,6 +246,40 @@ final class SystemAudioTap: ObservableObject {
         state = .failed(error)
     }
 
+    // MARK: - Default output device lookup
+
+    /// The current default output device's UID, or nil if none can be found.
+    private static func defaultOutputDeviceUID() -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var deviceIDSize = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                                &deviceIDSize, &deviceID)
+        guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
+
+        var uidAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfUID: Unmanaged<CFString>? = nil
+        var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let uidStatus = withUnsafeMutablePointer(to: &cfUID) { ptr in
+            AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, ptr)
+        }
+        guard uidStatus == noErr, let cf = cfUID else { return nil }
+        return cf.takeRetainedValue() as String
+    }
+
+    /// `VirtualDeviceChannels.micUID` ("LoopbackerDevice_UID") and the extra output devices
+    /// (`"LoopbackerDevice_UID_2"`, ...) all share this prefix; matches `DefaultDeviceRestorer`'s
+    /// own `isLoopbackerDevice` check.
+    private static func isLoopbackerVirtualDevice(_ uid: String) -> Bool {
+        uid.contains("Loopbacker")
+    }
+
     // MARK: - Default output device changes
 
     private func installDefaultOutputListenerIfNeeded() {
@@ -223,7 +290,10 @@ final class SystemAudioTap: ObservableObject {
             mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main) { [weak self] _, _ in
             MainActor.assumeIsolated {
-                guard let self, self.state == .running else { return }
+                // Rebuilds whenever the listener is installed (i.e. demand is active, from
+                // `start()` through `stop()`), not only while currently `.running`: this is
+                // exactly how `.noPhysicalOutput` -> real-device transitions get picked up.
+                guard let self else { return }
                 tapLogger.info("Default output device changed; rebuilding system audio tap")
                 self.rebuild()
             }
@@ -273,10 +343,10 @@ private func systemAudioTapIOProc(
     guard frames > 0 else { return noErr }
 
     let floats = data.assumingMemoryBound(to: Float.self)
-    // `stereoGlobalTapButExcludeProcesses` always mixes down to stereo (mono sources are
-    // duplicated to both channels by the tap itself), so this is the only shape the ring
-    // (always stereo) ever needs to handle. Drop anything else rather than reshaping on the
-    // IO thread, which would need an allocation.
+    // `description.isMixdown = true` (set in `rebuild`) forces a stereo mix regardless of the
+    // tapped device's native channel count, so this is the only shape the ring (always
+    // stereo) ever needs to handle. Drop anything else rather than reshaping on the IO
+    // thread, which would need an allocation.
     guard channels == ring.channels else { return noErr }
     ring.write(floats, frames: UInt32(frames))
     return noErr

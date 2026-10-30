@@ -20,6 +20,7 @@ struct LoopbackerApp: App {
         let audioDeviceManager = AudioDeviceManager()
         let audioRouter = AudioRouter()
         let appCaptureService = AppCaptureService()
+        let systemAudioTap = SystemAudioTap()
         _routingState = StateObject(wrappedValue: routingState)
         _audioDeviceManager = StateObject(wrappedValue: audioDeviceManager)
         _driverInstaller = StateObject(wrappedValue: DriverInstaller())
@@ -32,7 +33,8 @@ struct LoopbackerApp: App {
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
             audioRouter: audioRouter,
-            appCaptureService: appCaptureService
+            appCaptureService: appCaptureService,
+            systemAudioTap: systemAudioTap
         ))
     }
 
@@ -52,6 +54,7 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
                 .environmentObject(fxEngine)
+                .environmentObject(routingSync.systemAudioTap)
                 .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
@@ -69,6 +72,7 @@ struct LoopbackerApp: App {
                 .environmentObject(audioRouter)
                 .environmentObject(appCaptureService)
                 .environmentObject(fxEngine)
+                .environmentObject(routingSync.systemAudioTap)
                 .environment(audioRouter.meters)
         } label: {
             Image(systemName: "waveform.path")

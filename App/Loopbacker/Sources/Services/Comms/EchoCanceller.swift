@@ -41,7 +41,7 @@ private let aecLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category
 ///   processing path, which (verified with an interposed malloc over 2000 process() calls)
 ///   does not allocate — all working buffers are sized at `webrtc_aec3_create`/`Initialize`
 ///   time.
-/// - `setEnabled` may be called from any thread.
+/// - `setEnabled` and `setStreamDelay` may be called from any thread.
 final class EchoCanceller: @unchecked Sendable {
     static let sampleRate = 48_000
     static let hop = Int(webrtc_aec3_frame_size(48_000))
@@ -52,8 +52,13 @@ final class EchoCanceller: @unchecked Sendable {
     private static let fadeStep: Float = 1.0 / 480.0
     /// Starting point handed to AEC3's internal delay estimator: the ring's own latency plus a
     /// margin for device-to-device scheduling jitter. AEC3 refines this continuously, so this
-    /// only needs to be in the right ballpark, not exact.
+    /// only needs to be in the right ballpark, not exact. `AudioRouter` overrides this with a
+    /// real HAL-latency estimate via `setStreamDelay` once a route attaches; this default only
+    /// matters for the brief window before that first call, and in tests that skip it.
     private static let initialDelayMs: Int32 = 30
+    /// ERLE smoothing: a one-pole average over roughly 1 s of hops (100 at 10 ms/hop), so the
+    /// UI's live indicator doesn't flicker hop to hop.
+    private static let erleSmoothing: Float = 0.01
 
     /// Declared latency: a hop must fill before any of it can be emitted.
     let latencySamples = EchoCanceller.hop - 1
@@ -68,6 +73,28 @@ final class EchoCanceller: @unchecked Sendable {
     private var fifoWrite: Int
     private let fifoMask: Int
 
+    /// Set from any thread (`AudioRouter`, computing it from HAL latency properties);
+    /// applied on the IO thread at the start of the next hop, since the AEC3 state isn't safe
+    /// to touch concurrently with `ProcessStream`/`ProcessReverseStream`.
+    private let desiredDelayMs = Atomic<Int32>(EchoCanceller.initialDelayMs)
+    /// IO thread only: the delay last actually pushed into AEC3, to skip the shim call on hops
+    /// where nothing changed.
+    private var appliedDelayMs = EchoCanceller.initialDelayMs
+    /// Smoothed echo-return-loss enhancement in dB (how much the hop's power dropped from mic
+    /// input to cancelled output), for `EchoCancellationSection`'s live "echo removed"
+    /// indicator. Updated every hop on the IO thread, read from any thread.
+    private let erleDBBits = Atomic<UInt32>(Float(0).bitPattern)
+
+    /// Shared-route cache: the other voice route on the same capture device (virtual mic +
+    /// monitor) copies this call's result instead of re-running AEC3 on the same mic block,
+    /// the same downmix/writeback/cache-by-`sampleTime` shape `NoiseSuppressor.process` uses.
+    /// Duplicated rather than factored into a shared helper type since `NoiseSuppressor.swift`
+    /// belongs to another slice. Touched only by `process(_:frames:stride:sampleTime:)`.
+    private let busy = Atomic<Bool>(false)
+    private var cachedStart: Float64 = -1
+    private var cachedFrames = 0
+    private var cachedActive = false
+
     /// One wired (mlock'd) anonymous mapping holds every buffer the IO thread touches.
     private let arena: UnsafeMutableRawPointer
     private let arenaSize: Int
@@ -75,6 +102,7 @@ final class EchoCanceller: @unchecked Sendable {
     private let hopOut: UnsafeMutablePointer<Float>
     private let refRaw: UnsafeMutablePointer<Float>
     private let fifo: UnsafeMutablePointer<Float>
+    private let cachedBlock: UnsafeMutablePointer<Float>
 
     /// An echo canceller reading its far-end reference from `reference`, or nil (logged) if the
     /// vendored AEC3 implementation can't be initialized.
@@ -103,7 +131,7 @@ final class EchoCanceller: @unchecked Sendable {
 
         func rounded(_ bytes: Int, to alignment: Int) -> Int { (bytes + alignment - 1) / alignment * alignment }
         let refChannels = max(reference.channels, 1)
-        let floatCounts = [Self.hop, Self.hop, Self.hop * refChannels, fifoSize]
+        let floatCounts = [Self.hop, Self.hop, Self.hop * refChannels, fifoSize, Self.maxBlock]
         let total = rounded(
             floatCounts.reduce(0) { $0 + rounded($1 * MemoryLayout<Float>.size, to: 64) },
             to: Int(getpagesize()))
@@ -124,6 +152,7 @@ final class EchoCanceller: @unchecked Sendable {
         hopOut = floats(Self.hop)
         refRaw = floats(Self.hop * refChannels)
         fifo = floats(fifoSize)
+        cachedBlock = floats(Self.maxBlock)
     }
 
     deinit {
@@ -135,14 +164,26 @@ final class EchoCanceller: @unchecked Sendable {
         enabled.store(on, ordering: .relaxed)
     }
 
+    /// Updates AEC3's delay-estimator starting point (see `webrtc_aec3_shim.h`). Any thread.
+    func setStreamDelay(ms: Int32) {
+        desiredDelayMs.store(ms, ordering: .relaxed)
+    }
+
+    /// Smoothed echo-return-loss enhancement in dB, or 0 before the first hop with meaningful
+    /// mic input has run. Any thread.
+    var erleDB: Float { Float(bitPattern: erleDBBits.load(ordering: .relaxed)) }
+
     func reset() {
         webrtc_aec3_reset(state)
-        webrtc_aec3_set_stream_delay_ms(state, Self.initialDelayMs)
+        let delay = desiredDelayMs.load(ordering: .relaxed)
+        webrtc_aec3_set_stream_delay_ms(state, delay)
+        appliedDelayMs = delay
         wetGain = 0
         hopFill = 0
         fifoRead = 0
         fifoWrite = EchoCanceller.hop - 1
         fifo.update(repeating: 0, count: fifoMask + 1)
+        erleDBBits.store(Float(0).bitPattern, ordering: .relaxed)
     }
 
     // MARK: - IO thread
@@ -155,6 +196,57 @@ final class EchoCanceller: @unchecked Sendable {
             let n = min(frames - offset, Self.maxBlock)
             processChunk(mic.advanced(by: offset), frames: n)
             offset += n
+        }
+    }
+
+    /// Cancels far-end echo from a voice pair's mixed buffer in place: downmixes `stride`
+    /// channels to mono, runs `process`, and writes the result back to up to 2 channels --
+    /// `NoiseSuppressor.process`'s downmix/writeback/cache-by-`sampleTime` shape, so the other
+    /// voice route on the same capture device (virtual mic + monitor) copies this call's
+    /// result instead of re-running AEC3 on the same mic block.
+    ///
+    /// - Parameter sampleTime: the block's HAL input sample time. A block already processed
+    ///   for another route (same start and length) is copied instead of processed again.
+    func process(_ buffer: UnsafeMutablePointer<Float>, frames: Int, stride: Int, sampleTime: Float64?) {
+        let channels = min(stride, 2)
+        guard channels > 0, frames > 0 else { return }
+        guard busy.compareExchange(expected: false, desired: true, ordering: .acquiring).exchanged else { return }
+        defer { busy.store(false, ordering: .releasing) }
+
+        if let sampleTime, sampleTime == cachedStart, frames == cachedFrames {
+            if cachedActive { writeBack(cachedBlock, into: buffer, frames: frames, stride: stride, channels: channels) }
+            return
+        }
+
+        let shareable = sampleTime != nil && frames <= Self.maxBlock
+        cachedStart = shareable ? sampleTime! : -1
+        cachedFrames = shareable ? frames : 0
+        cachedActive = false
+        var offset = 0
+        while offset < frames {
+            let n = min(frames - offset, Self.maxBlock)
+            let block = buffer.advanced(by: offset * stride)
+            downmix(block, frames: n, stride: stride, channels: channels, into: cachedBlock)
+            processChunk(cachedBlock, frames: n)
+            if shareable { cachedActive = true }
+            writeBack(cachedBlock, into: block, frames: n, stride: stride, channels: channels)
+            offset += n
+        }
+    }
+
+    private func downmix(_ buffer: UnsafePointer<Float>, frames: Int, stride: Int, channels: Int,
+                         into mono: UnsafeMutablePointer<Float>) {
+        for i in 0..<frames {
+            let base = i * stride
+            mono[i] = channels == 1 ? buffer[base] : 0.5 * (buffer[base] + buffer[base + 1])
+        }
+    }
+
+    private func writeBack(_ mono: UnsafePointer<Float>, into buffer: UnsafeMutablePointer<Float>,
+                           frames: Int, stride: Int, channels: Int) {
+        for i in 0..<frames {
+            buffer[i * stride] = mono[i]
+            if channels == 2 { buffer[i * stride + 1] = mono[i] }
         }
     }
 
@@ -179,14 +271,32 @@ final class EchoCanceller: @unchecked Sendable {
         wetGain = g
     }
 
-    /// Pulls the matching reference hop, runs AEC3 on `hopIn`, and queues the result.
+    /// Applies any pending delay update, pulls the matching reference hop, runs AEC3 on
+    /// `hopIn`, queues the result, and updates the smoothed ERLE metric.
     private func runHop() {
+        let wantedDelay = desiredDelayMs.load(ordering: .relaxed)
+        if wantedDelay != appliedDelayMs {
+            webrtc_aec3_set_stream_delay_ms(state, wantedDelay)
+            appliedDelayMs = wantedDelay
+        }
+
         let hop = EchoCanceller.hop
         reference.read(into: refRaw, frames: UInt32(hop))
         _ = webrtc_aec3_process_reverse_stream(state, refRaw)
 
         hopOut.update(from: hopIn, count: hop)
         _ = webrtc_aec3_process_stream(state, hopOut)
+
+        var inPower: Float = 0
+        var outPower: Float = 0
+        vDSP_measqv(hopIn, 1, &inPower, vDSP_Length(hop))
+        vDSP_measqv(hopOut, 1, &outPower, vDSP_Length(hop))
+        if inPower > 1e-9, outPower > 1e-9 {
+            let instantaneousERLE = max(0, 10 * log10f(inPower / outPower))
+            let prev = Float(bitPattern: erleDBBits.load(ordering: .relaxed))
+            let smoothed = prev + Self.erleSmoothing * (instantaneousERLE - prev)
+            erleDBBits.store(smoothed.bitPattern, ordering: .relaxed)
+        }
 
         for i in 0..<hop {
             fifo[fifoWrite & fifoMask] = hopOut[i]

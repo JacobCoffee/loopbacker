@@ -13,6 +13,10 @@ final class RoutingSync: ObservableObject {
     private let audioDeviceManager: AudioDeviceManager
     private let audioRouter: AudioRouter
     private let appCaptureService: AppCaptureService
+    /// Owned here (not by a view) so it starts/stops with echo-cancellation demand for the
+    /// app's whole lifetime, same as the audio routing it's wired into. Injected as an
+    /// environment object for `EchoCancellationSection`'s permission/status UI.
+    let systemAudioTap: SystemAudioTap
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -20,12 +24,14 @@ final class RoutingSync: ObservableObject {
         routingState: RoutingState,
         audioDeviceManager: AudioDeviceManager,
         audioRouter: AudioRouter,
-        appCaptureService: AppCaptureService
+        appCaptureService: AppCaptureService,
+        systemAudioTap: SystemAudioTap
     ) {
         self.routingState = routingState
         self.audioDeviceManager = audioDeviceManager
         self.audioRouter = audioRouter
         self.appCaptureService = appCaptureService
+        self.systemAudioTap = systemAudioTap
 
         start()
     }
@@ -36,6 +42,11 @@ final class RoutingSync: ObservableObject {
         audioRouter.currentEffectsPreset = routingState.effectsPreset
         audioRouter.updateEffectsPreset(routingState.effectsPreset)
         push(NoisePush(settings: routingState.noiseSuppression, sources: routingState.sources))
+        // The reference ring exists as soon as `systemAudioTap` is constructed, independent of
+        // whether the tap itself is running yet, so routes can attach an `EchoCanceller` to it
+        // right away; it just reads silence until the tap starts.
+        audioRouter.setEchoReference(systemAudioTap.ring)
+        pushEcho(EchoPush(settings: routingState.noiseSuppression, sources: routingState.sources))
 
         // Start routing for saved state after the audio system settles.
         // After a driver reinstall, coreaudiod can take 2-3s to fully
@@ -111,6 +122,16 @@ final class RoutingSync: ObservableObject {
             .dropFirst()
             .sink { [weak self] in self?.push($0) }
             .store(in: &cancellables)
+
+        // Push echo-cancellation settings and start/stop `SystemAudioTap` with demand (any
+        // enabled, non-excluded source wanting it): the tap costs a coreaudiod round trip and a
+        // TCC-gated process tap, so it shouldn't run with nothing to feed.
+        Publishers.CombineLatest(routingState.$noiseSuppression, routingState.$sources)
+            .map { EchoPush(settings: $0, sources: $1) }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.pushEcho($0) }
+            .store(in: &cancellables)
     }
 
     private func push(_ noise: NoisePush) {
@@ -130,6 +151,31 @@ final class RoutingSync: ObservableObject {
             let devices = sources.filter { !$0.isAppCapture && !$0.deviceUID.isEmpty }
             excludedDeviceUIDs = Set(devices.filter { !$0.noiseSuppression }.map(\.deviceUID))
             dryMonitorDeviceUIDs = Set(devices.filter { !$0.denoiseMonitor }.map(\.deviceUID))
+        }
+    }
+
+    private func pushEcho(_ echo: EchoPush) {
+        audioRouter.updateEchoCancellation(excludedDeviceUIDs: echo.excludedDeviceUIDs)
+        if echo.tapWanted {
+            systemAudioTap.start()
+        } else {
+            systemAudioTap.stop()
+        }
+    }
+
+    private struct EchoPush: Equatable {
+        /// Device sources that opted out.
+        let excludedDeviceUIDs: Set<String>
+        /// Whether any enabled, non-excluded, non-muted device source wants echo cancellation
+        /// right now -- the tap's start/stop demand signal.
+        let tapWanted: Bool
+
+        init(settings: NoiseSuppressionSettings, sources: [AudioSource]) {
+            let devices = sources.filter { !$0.isAppCapture && !$0.deviceUID.isEmpty }
+            let excluded = Set(devices.filter { !$0.echoCancellation }.map(\.deviceUID))
+            excludedDeviceUIDs = excluded
+            tapWanted = settings.echoCancellation
+                && devices.contains { $0.isEnabled && !$0.isMuted && !excluded.contains($0.deviceUID) }
         }
     }
 
