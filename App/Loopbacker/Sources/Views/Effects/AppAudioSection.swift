@@ -201,6 +201,11 @@ struct AppAudioSection: View {
         }
         .padding(Metrics.panelPadding)
         .glassPanel(cornerRadius: Metrics.panelRadius, tint: callDuckSettings.listenDuckEnabled ? Color.loopbacker.opacity(0.08) : nil)
+        // The app list is only filled when something asks for it; without this the picker
+        // said no app was playing while Spotify was.
+        .task(id: callDuckSettings.listenDuckEnabled) {
+            if callDuckSettings.listenDuckEnabled { await appCaptureService.refreshApps() }
+        }
     }
 
     private var appPicker: some View {

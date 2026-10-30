@@ -359,8 +359,12 @@ private func listenDuckerIOProc(
 
     let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
     let outList = UnsafeMutableAudioBufferListPointer(outputData)
-    guard let inBuffer = inList.first, let inPtr = inBuffer.mData,
+    // The aggregate's input side is the output sub-device's own input streams (an interface
+    // like an M2 has inputs) followed by the tap, so the tap is the last input buffer, not the
+    // first. Reading the first replayed the interface's inputs while the tapped apps stayed muted.
+    guard inList.count > 0, let inPtr = inList[inList.count - 1].mData,
           let outBuffer = outList.first, let outPtr = outBuffer.mData else { return noErr }
+    let inBuffer = inList[inList.count - 1]
     let inChannels = Int(inBuffer.mNumberChannels)
     let outChannels = Int(outBuffer.mNumberChannels)
     guard inChannels > 0, outChannels > 0 else { return noErr }
