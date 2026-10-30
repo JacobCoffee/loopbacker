@@ -1,0 +1,28 @@
+desc:Loopbacker Test Gain/Pan
+tags: utility gain testing
+author: Loopbacker
+
+slider1:gain_db=0<-24,24,0.1>Gain (dB)
+slider2:pan=0<-1,1,0.01>Pan
+slider3:mode=0<0,2,1{Stereo,Mono,Mute}>Mode
+
+@init
+gain = 1;
+
+@slider
+gain = 2 ^ (gain_db / 6);
+
+@sample
+mode == 2 ? (
+  spl0 = 0;
+  spl1 = 0;
+) : mode == 1 ? (
+  mono = (spl0 + spl1) * 0.5 * gain;
+  spl0 = mono;
+  spl1 = mono;
+) : (
+  left_gain = gain * (pan <= 0 ? 1 : 1 - pan);
+  right_gain = gain * (pan >= 0 ? 1 : 1 + pan);
+  spl0 *= left_gain;
+  spl1 *= right_gain;
+);

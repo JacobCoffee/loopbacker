@@ -1,0 +1,28 @@
+desc:Loopbacker Test Meter (gfx)
+tags: meter testing gfx
+author: Loopbacker
+
+slider1:gain_db=0<-24,24,0.1>Gain (dB)
+
+@init
+gfx_ext_retina = 1;
+peak = 0;
+
+@slider
+gain = 2 ^ (gain_db / 6);
+
+@sample
+spl0 *= gain;
+spl1 *= gain;
+level = abs(spl0) > abs(spl1) ? abs(spl0) : abs(spl1);
+level > peak ? peak = level : peak *= 0.999;
+
+@gfx 200 80
+gfx_r = 0.1; gfx_g = 0.1; gfx_b = 0.1; gfx_a = 1;
+gfx_x = 0; gfx_y = 0;
+gfx_rectto(gfx_w, gfx_h);
+gfx_r = 0.1; gfx_g = 0.8; gfx_b = 0.2; gfx_a = 1;
+bar_w = peak * gfx_w;
+bar_w > gfx_w ? bar_w = gfx_w;
+gfx_x = 0; gfx_y = gfx_h * 0.5;
+gfx_rectto(bar_w, gfx_h);
