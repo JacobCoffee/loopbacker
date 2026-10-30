@@ -44,6 +44,9 @@ struct AudioSource: Identifiable, Equatable, Codable {
     /// The monitor (hearing yourself) is denoised too. Off, it skips suppression and its delay;
     /// the virtual mic stays denoised.
     var denoiseMonitor: Bool
+    /// Echo cancellation for this device's voice routes, when it's switched on globally.
+    /// Mirrors `noiseSuppression`'s per-source opt-out. App captures are never run through it.
+    var echoCancellation: Bool
 
     init(
         id: UUID = UUID(),
@@ -59,7 +62,8 @@ struct AudioSource: Identifiable, Equatable, Codable {
         sourceType: SourceType = .device,
         appBundleID: String = "",
         noiseSuppression: Bool = true,
-        denoiseMonitor: Bool = true
+        denoiseMonitor: Bool = true,
+        echoCancellation: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -75,6 +79,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         self.appBundleID = appBundleID
         self.noiseSuppression = noiseSuppression
         self.denoiseMonitor = denoiseMonitor
+        self.echoCancellation = echoCancellation
     }
 
     var isAppCapture: Bool { sourceType == .appCapture }
@@ -82,6 +87,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
         case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression, denoiseMonitor
+        case echoCancellation
     }
 
     init(from decoder: Decoder) throws {
@@ -100,6 +106,7 @@ struct AudioSource: Identifiable, Equatable, Codable {
         appBundleID = (try? container.decode(String.self, forKey: .appBundleID)) ?? ""
         noiseSuppression = (try? container.decode(Bool.self, forKey: .noiseSuppression)) ?? true
         denoiseMonitor = (try? container.decode(Bool.self, forKey: .denoiseMonitor)) ?? true
+        echoCancellation = (try? container.decode(Bool.self, forKey: .echoCancellation)) ?? true
     }
 
     /// Create an AudioSource from a captured app

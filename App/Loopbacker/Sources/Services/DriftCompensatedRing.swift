@@ -14,7 +14,7 @@ import Synchronization
 /// `writePos` is the only state shared between them: the writer publishes it with release
 /// ordering after copying frames in, the reader loads it with acquire ordering before reading
 /// them. Everything else is owned by one side.
-final class DriftCompensatedRing {
+final class DriftCompensatedRing: @unchecked Sendable {
     /// Ratio deviation per frame of fill error. Closed-loop time constant is
     /// 1 / (gain * sampleRate) ≈ 10 s at 48 kHz; a 50 ppm drift settles ~25 frames off target.
     private static let gain = 2e-6

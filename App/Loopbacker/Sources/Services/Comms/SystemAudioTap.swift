@@ -18,7 +18,6 @@ enum SystemAudioTapPermission: Sendable, Equatable {
 }
 
 enum SystemAudioTapError: Error, Sendable, Equatable, LocalizedError {
-    case processObjectLookupFailed(OSStatus)
     case tapCreationFailed(OSStatus)
     case aggregateCreationFailed(OSStatus)
     case ioProcCreationFailed(OSStatus)
@@ -26,7 +25,6 @@ enum SystemAudioTapError: Error, Sendable, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .processObjectLookupFailed(let status): "Could not look up Loopbacker's own audio process object (\(status))."
         case .tapCreationFailed(let status): "Could not create a system audio tap (\(status)). Check System Settings > Privacy & Security > Microphone/System Audio Recording."
         case .aggregateCreationFailed(let status): "Could not create the private aggregate device for the system audio tap (\(status))."
         case .ioProcCreationFailed(let status): "Could not install the tap's IO callback (\(status))."
@@ -41,13 +39,22 @@ enum SystemAudioTapState: Sendable, Equatable {
     case failed(SystemAudioTapError)
 }
 
-/// Core Audio process tap capturing the system's audio output — everything except Loopbacker's
-/// own process — as the far-end reference for `EchoCanceller`.
+/// Core Audio process tap capturing the system's audio output, Loopbacker's own included, as
+/// the far-end reference for `EchoCanceller`.
 ///
 /// Uses the macOS 14.2+ process tap API (`CATapDescription` + `AudioHardwareCreateProcessTap`):
-/// a stereo global tap excluding Loopbacker's own process object (otherwise the voice Loopbacker
-/// sends to the virtual mic would loop back in as "echo" of itself), wrapped in a private,
-/// tap-only aggregate device so it can be driven with a device IOProc like any other HAL device.
+/// a stereo global tap over every process's rendered output, wrapped in a private, tap-only
+/// aggregate device so it can be driven with a device IOProc like any other HAL device.
+///
+/// Deliberately does *not* exclude Loopbacker's own process. The only audio Loopbacker itself
+/// renders to a real output device is the monitor route (you hearing your own processed voice
+/// through real speakers) plus incidental UI sounds -- genuine sources of acoustic echo the mic
+/// will pick up, exactly like any other app's audio. The thing that might look like it needs
+/// excluding, the virtual mic, never appears in this tap at all regardless: it's an *input*
+/// device other apps capture from, not something CoreAudio mixes into any process's rendered
+/// *output*, which is the only thing a process tap captures. So there's no "self-echo" to guard
+/// against here, and excluding Loopbacker would instead leave the monitor path's real acoustic
+/// echo uncancelled.
 ///
 /// Thread contract: `start`/`stop`/`rebuild` run on the main actor and are not real-time safe —
 /// they allocate Objective-C tap/aggregate-device objects and talk to coreaudiod. The IOProc
@@ -67,7 +74,9 @@ final class SystemAudioTap: ObservableObject {
     /// Kept small (20 ms) so it stays well below the shortest acoustic bulk delay worth
     /// compensating; see `EchoCancellerTests` and the integration note in the task report for
     /// the open question of how this interacts with reverberant (room-impulse-response) echo.
-    private static let ringTargetFillFrames: UInt32 = 960
+    /// `AudioRouter` reads this to fold the ring's own latency into its HAL-based stream-delay
+    /// estimate for AEC3.
+    nonisolated static let referenceTargetFillFrames: UInt32 = 960
 
     @Published private(set) var state: SystemAudioTapState = .stopped
     @Published private(set) var permission: SystemAudioTapPermission = .unknown
@@ -83,7 +92,7 @@ final class SystemAudioTap: ObservableObject {
 
     init() {
         ring = DriftCompensatedRing(capacityFrames: Self.ringCapacityFrames, channels: 2,
-                                     targetFill: Self.ringTargetFillFrames, sampleRate: 48_000)
+                                     targetFill: Self.referenceTargetFillFrames, sampleRate: 48_000)
         ioContext = UnsafeMutablePointer<IOContext>.allocate(capacity: 1)
         ioContext.initialize(to: IOContext(ring: Unmanaged.passUnretained(ring).toOpaque()))
     }
@@ -118,24 +127,9 @@ final class SystemAudioTap: ObservableObject {
     private func rebuild() {
         teardown()
 
-        var ownProcessObject = AudioObjectID(kAudioObjectUnknown)
-        var pid = getpid()
-        var processAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var processObjectSize = UInt32(MemoryLayout<AudioObjectID>.size)
-        let lookupStatus = withUnsafeMutablePointer(to: &pid) { pidPtr in
-            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &processAddress,
-                                       UInt32(MemoryLayout<pid_t>.size), pidPtr,
-                                       &processObjectSize, &ownProcessObject)
-        }
-        guard lookupStatus == noErr, ownProcessObject != kAudioObjectUnknown else {
-            fail(.processObjectLookupFailed(lookupStatus))
-            return
-        }
-
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcessObject])
+        // No process exclusion list: see the class doc for why Loopbacker's own process stays
+        // in (it's the only way to capture the monitor route's real acoustic echo source).
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
         description.name = "Loopbacker System Audio Tap"
         description.isPrivate = true
         description.muteBehavior = .unmuted

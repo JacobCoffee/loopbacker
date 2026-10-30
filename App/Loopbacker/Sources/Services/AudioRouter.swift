@@ -38,6 +38,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// opted out, or route stopped). Queue only.
     private let dpdfnetState = NoiseModelLoadState<NoiseSuppressionModel>()
     private let fastEnhancerState = NoiseModelLoadState<FastEnhancerModel>()
+    /// Echo cancellation's own global toggle lives on `noiseSuppression.echoCancellation`
+    /// (shared with noise suppression's push), so only the per-source opt-out and the far-end
+    /// reference need their own state here; read and written only on `queue`.
+    private var echoExcludedDevices: Set<String> = []
+    /// `SystemAudioTap.ring`, injected once by `RoutingSync` via `setEchoReference`. Exists as
+    /// soon as the tap object does (independent of whether the tap is running), so routes can
+    /// attach an `EchoCanceller` the moment echo cancellation turns on even if the tap itself
+    /// hasn't started producing real reference data yet.
+    private var echoReference: DriftCompensatedRing?
+    /// Echo cancellers currently attached to any voice route, mirrored for cross-thread reads
+    /// (`echoCancellationERLE()`, the live "echo removed" indicator), the same snapshot/lock
+    /// shape as `fxChainsByDevice`/`fxChainsSnapshot`.
+    private let echoCancellersLock = NSLock()
+    private var echoCancellersSnapshot: [EchoCanceller] = []
 
     // MARK: - Internal state
 
@@ -71,7 +85,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// the compiler's checking.
     ///
     /// Signal path per block: capture `inputChannels` into `renderBuffer` → source meter →
-    /// mix matrix into `mixBuffer` (`outputChannels` wide) → noise suppression (voice routes,
+    /// mix matrix into `mixBuffer` (`outputChannels` wide) → echo cancellation (voice routes,
+    /// channels 1–2, against `SystemAudioTap`'s reference) → noise suppression (voice routes,
     /// channels 1–2) → voice `FXChain` (voice routes) or `AppAudioProcessor` (app-capture
     /// routes) → output meter → ring → playback.
     fileprivate final class RouteContext: @unchecked Sendable {
@@ -109,8 +124,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// App-capture routes only (game/music/browser): ducking + leveling. Never set on
         /// voice-input or output routes.
         let appAudioProcessor: AppAudioProcessor?
-        /// Voice routes only: the dry mix just before noise suppression, snapshotted each
-        /// block for the chain's recorder.
+        /// Voice routes only: the mix just before noise suppression (after echo cancellation,
+        /// which runs first), snapshotted each block for the chain's recorder.
         private(set) var preNSBuffer: UnsafeMutablePointer<Float>?
 
         /// Routes fed by a physical input (mic → virtual device, mic → monitor). Only these run
@@ -131,6 +146,14 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         private(set) var noiseOwner: NoiseSuppressor?
         /// Queue only: fading out ahead of `detachNoiseSuppressor`.
         var noiseDetaching = false
+        /// The canceller the audio thread runs, published unretained exactly like `noiseSlot`.
+        /// `echoOwner` holds the strong reference. Shared with the other voice route on the
+        /// same capture device, runs before noise suppression.
+        let echoSlot = Atomic<Unmanaged<EchoCanceller>?>(nil)
+        /// Queue only.
+        private(set) var echoOwner: EchoCanceller?
+        /// Queue only: fading out ahead of `detachEchoCanceller`.
+        var echoDetaching = false
 
         // Meter levels -- C buffers written on the RT thread, read and decayed on main.
         // Source levels are per captured channel; output levels are per playback channel.
@@ -218,6 +241,20 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return noiseOwner
         }
 
+        /// Queue only.
+        func attachEchoCanceller(_ canceller: EchoCanceller) {
+            echoOwner = canceller
+            echoSlot.store(.passUnretained(canceller), ordering: .releasing)
+        }
+
+        /// Queue only. Unpublishes the canceller and hands back the strong reference: an audio
+        /// callback may still be inside it, so the caller must keep it alive a while longer.
+        func detachEchoCanceller() -> EchoCanceller? {
+            echoSlot.store(nil, ordering: .releasing)
+            defer { echoOwner = nil }
+            return echoOwner
+        }
+
         /// Grow the block buffers. Only call before the route's callbacks are running.
         func reserveBlockFrames(_ frames: UInt32) {
             guard frames > blockFrames else { return }
@@ -251,6 +288,11 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         func processCapturedBlock(frames: UInt32, sampleTime: Float64? = nil) {
             computePeak(from: renderBuffer, channels: inputChannels, frames: frames, into: meterLevelsPtr)
             mix(frames: frames)
+            if let canceller = echoSlot.load(ordering: .acquiring) {
+                canceller._withUnsafeGuaranteedRef {
+                    $0.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels), sampleTime: sampleTime)
+                }
+            }
             if let preNSBuffer {
                 memcpy(preNSBuffer, mixBuffer, Int(frames * outputChannels) * MemoryLayout<Float>.size)
             }
@@ -451,6 +493,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             ctx.isMonitor = true
             self.attachFXChain(to: ctx)
             self.applyNoiseSuppression(to: ctx)
+            self.applyEchoCancellation(to: ctx)
+            self.refreshEchoCancellersSnapshot()
             // Monitor hears the same channel mix as the virtual device (e.g. mono mic fanned to L+R).
             if let pending = self.pendingMixMatrices[sourceDeviceUID] {
                 self.applyMixToContext(ctx, routes: pending)
@@ -864,6 +908,170 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - Echo cancellation
+
+    /// Any thread. Gives the audio engine the far-end reference ring for echo cancellation
+    /// (`SystemAudioTap.ring`, owned by `RoutingSync`), or clears it (e.g. the tap object is
+    /// being torn down). Existing routes that want echo cancellation re-apply immediately;
+    /// routes with no reference yet attach once this lands.
+    func setEchoReference(_ ring: DriftCompensatedRing?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.echoReference = ring
+            self.applyEchoCancellationToAllRoutes()
+        }
+    }
+
+    /// Apply echo cancellation's per-source opt-outs to every voice-input route. The global
+    /// on/off toggle is read from `noiseSuppression.echoCancellation`, already landed by
+    /// `updateNoiseSuppression` (`RoutingSync` pushes both from the same settings object, in
+    /// order, over the serial `queue`).
+    func updateEchoCancellation(excludedDeviceUIDs: Set<String>) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.echoExcludedDevices = excludedDeviceUIDs
+            self.applyEchoCancellationToAllRoutes()
+        }
+    }
+
+    /// Any thread. A representative attached canceller's smoothed ERLE (dB), for
+    /// `EchoCancellationSection`'s live "echo removed" indicator, or nil if none is attached.
+    func echoCancellationERLE() -> Float? {
+        echoCancellersLock.lock()
+        defer { echoCancellersLock.unlock() }
+        return echoCancellersSnapshot.first?.erleDB
+    }
+
+    /// Must run on `queue`.
+    private func applyEchoCancellationToAllRoutes() {
+        for ctx in voiceContexts { applyEchoCancellation(to: ctx) }
+        refreshEchoCancellersSnapshot()
+    }
+
+    /// Must run on `queue`. Gives `ctx` an echo canceller reading the shared far-end reference
+    /// ring, or takes it away. Voice routes on the same capture device share one canceller,
+    /// the same sharing shape `applyNoiseSuppression` uses for `NoiseSuppressor`.
+    private func applyEchoCancellation(to ctx: RouteContext) {
+        guard ctx.isVoiceInput, !ctx.echoDetaching else { return }
+        let wanted = noiseSuppression.echoCancellation && echoReference != nil
+            && !echoExcludedDevices.contains(ctx.captureDeviceUID)
+
+        if let current = ctx.echoOwner {
+            if wanted {
+                current.setEnabled(true)
+            } else {
+                fadeOutEchoCanceller(of: ctx)
+            }
+            return
+        }
+        guard wanted, let reference = echoReference else { return }
+
+        let sibling = voiceContexts.first {
+            $0 !== ctx && $0.captureDeviceUID == ctx.captureDeviceUID && $0.sampleRate == ctx.sampleRate
+                && !$0.echoDetaching
+        }
+        if let shared = sibling?.echoOwner {
+            ctx.attachEchoCanceller(shared)
+            shared.setEnabled(true)
+            return
+        }
+        guard let canceller = EchoCanceller.make(reference: reference) else { return }
+        canceller.setStreamDelay(ms: estimateStreamDelayMs(for: ctx))
+        canceller.setEnabled(true)
+        ctx.attachEchoCanceller(canceller)
+        logger.info("Echo cancellation started on \(ctx.captureDeviceUID)")
+    }
+
+    /// Must run on `queue`. Crossfades `ctx`'s canceller to dry (10 ms, inside
+    /// `EchoCanceller.process`), then detaches it -- the same two-phase shape
+    /// `fadeOutNoiseSuppressor` uses.
+    private func fadeOutEchoCanceller(of ctx: RouteContext) {
+        guard let current = ctx.echoOwner else { return }
+        ctx.echoDetaching = true
+        let sharedWithKeeper = voiceContexts.contains { $0 !== ctx && $0.echoOwner === current && !$0.echoDetaching }
+        if !sharedWithKeeper { current.setEnabled(false) }
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            let old = ctx.detachEchoCanceller()
+            ctx.echoDetaching = false
+            // An audio callback that loaded the slot just before it was cleared may still be
+            // running `old`; one IO cycle is a few ms, so half a second is ample.
+            self?.queue.asyncAfter(deadline: .now() + 0.5) { withExtendedLifetime(old) {} }
+            guard let self, self.voiceContexts.contains(where: { $0 === ctx }) else { return }
+            self.applyEchoCancellation(to: ctx)
+            self.refreshEchoCancellersSnapshot()
+        }
+    }
+
+    /// Must run on `queue`. Mirrors `fxChainsSnapshot`'s publish-for-cross-thread-reads pattern.
+    private func refreshEchoCancellersSnapshot() {
+        let owners = voiceContexts.compactMap(\.echoOwner)
+        echoCancellersLock.lock()
+        echoCancellersSnapshot = owners
+        echoCancellersLock.unlock()
+    }
+
+    /// Must run on `queue`. Starting point for AEC3's delay estimator (see
+    /// `webrtc_aec3_shim.h`): the tap's own ring latency (system audio → reference ring) plus
+    /// the default output device's rendering latency (reference → speaker) plus `ctx`'s
+    /// capture device's latency (mic → this callback), from HAL `kAudioDevicePropertyLatency`/
+    /// `SafetyOffset`/stream latency and buffer size, plus a margin for inter-device scheduling
+    /// jitter. AEC3 only needs this in the right ballpark -- it refines the rest on its own.
+    private func estimateStreamDelayMs(for ctx: RouteContext) -> Int32 {
+        let outputLatencyFrames = defaultOutputDeviceID()
+            .map { Self.haLatencyFrames($0, scope: kAudioObjectPropertyScopeOutput) } ?? 0
+        let inputLatencyFrames = Self.haLatencyFrames(ctx.captureDeviceID, scope: kAudioObjectPropertyScopeInput)
+        let tapRingMs = Double(SystemAudioTap.referenceTargetFillFrames) / 48_000 * 1000
+        let outputMs = Double(outputLatencyFrames) / 48_000 * 1000
+        let inputMs = Double(inputLatencyFrames) / ctx.sampleRate * 1000
+        let schedulingMarginMs = 10.0
+        return Int32((tapRingMs + outputMs + inputMs + schedulingMarginMs).rounded())
+    }
+
+    private func defaultOutputDeviceID() -> AudioObjectID? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
+        return status == noErr && deviceID != kAudioObjectUnknown ? deviceID : nil
+    }
+
+    /// Sum of HAL round-trip latency contributors for `deviceID` in `scope`: device buffering
+    /// latency, safety offset, the first stream's own latency, and the current buffer size --
+    /// everything CoreAudio reports between a sample leaving/entering the render callback and
+    /// it actually reaching the speaker/mic.
+    private static func haLatencyFrames(_ deviceID: AudioObjectID, scope: AudioObjectPropertyScope) -> UInt32 {
+        func property(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                      _ propScope: AudioObjectPropertyScope = scope) -> UInt32 {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: propScope,
+                                                      mElement: kAudioObjectPropertyElementMain)
+            guard AudioObjectHasProperty(objectID, &address) else { return 0 }
+            var value: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value) == noErr ? value : 0
+        }
+
+        var total = property(deviceID, kAudioDevicePropertyLatency)
+            + property(deviceID, kAudioDevicePropertySafetyOffset)
+            + property(deviceID, kAudioDevicePropertyBufferFrameSize)
+
+        var streamsAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: scope,
+                                                         mElement: kAudioObjectPropertyElementMain)
+        var streamsSize: UInt32 = 0
+        if AudioObjectGetPropertyDataSize(deviceID, &streamsAddress, 0, nil, &streamsSize) == noErr,
+           streamsSize >= UInt32(MemoryLayout<AudioObjectID>.size) {
+            let count = Int(streamsSize) / MemoryLayout<AudioObjectID>.size
+            var streamIDs = [AudioObjectID](repeating: 0, count: count)
+            var fullSize = streamsSize
+            if AudioObjectGetPropertyData(deviceID, &streamsAddress, 0, nil, &fullSize, &streamIDs) == noErr,
+               let firstStream = streamIDs.first {
+                total += property(firstStream, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal)
+            }
+        }
+        return total
+    }
+
     /// Must run on `queue`. Nil while a model-backed engine's model is still loading: the load
     /// runs in the background (~1.5 s compile after an app or OS update, ~30 ms from cache) and
     /// re-applies the settings when done, so routes start right away and suppression fades in
@@ -1059,6 +1267,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         )
         attachFXChain(to: ctx)
         applyNoiseSuppression(to: ctx)
+        applyEchoCancellation(to: ctx)
+        refreshEchoCancellersSnapshot()
 
         // Create input AUHAL (captures from source device)
         guard setupInputUnit(ctx) else {
@@ -1132,6 +1342,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         // Only now is it provably safe to detach the voice FX chain: the capture device's IO
         // callbacks that might still be inside `FXChain.process` have been stopped.
         detachFXChain(from: ctx)
+        refreshEchoCancellersSnapshot()
 
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
@@ -1238,6 +1449,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
         // Only now is it provably safe to detach the voice FX chain (see stopRoutingInternal).
         detachFXChain(from: ctx)
+        refreshEchoCancellersSnapshot()
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
