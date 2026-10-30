@@ -40,10 +40,10 @@ enum RuleEngine {
 @MainActor
 final class Debouncer {
     private let delay: TimeInterval
-    private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+    private let schedule: (TimeInterval, @escaping @MainActor () -> Void) -> Void
     private var generation = 0
 
-    init(delay: TimeInterval, schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, work in
+    init(delay: TimeInterval, schedule: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, work in
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }) {
         self.delay = delay
@@ -51,7 +51,7 @@ final class Debouncer {
     }
 
     /// Schedules `action`, canceling any call still pending from a previous `call(_:)`.
-    func call(_ action: @escaping () -> Void) {
+    func call(_ action: @escaping @MainActor () -> Void) {
         generation += 1
         let myGeneration = generation
         schedule(delay) { [weak self] in
