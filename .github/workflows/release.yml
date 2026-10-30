@@ -219,22 +219,22 @@ jobs:
             > checksums-sha256.txt
 
       # ── GitHub Release ───────────────────────────────────────────
+      # Releases are immutable once published, so every asset (including the
+      # appcast) has to be attached when the release is created.
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" \
-            --generate-notes \
-            "Loopbacker-${TAG}.dmg" \
-            "Loopbacker-Driver-${TAG}.zip" \
-            "Loopbacker-${TAG}.sbom.json" \
+          assets=(
+            "Loopbacker-${TAG}.dmg"
+            "Loopbacker-Driver-${TAG}.zip"
+            "Loopbacker-${TAG}.sbom.json"
             checksums-sha256.txt
-
-      - name: Upload signed appcast
-        if: steps.secrets.outputs.has_sparkle_key == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" appcast/appcast.xml
+          )
+          if [ -f appcast/appcast.xml ]; then
+            assets+=(appcast/appcast.xml)
+          fi
+          gh release create "$TAG" --generate-notes "${assets[@]}"
 
       # ── Cleanup ──────────────────────────────────────────────────
       - name: Cleanup keychain
