@@ -25,10 +25,13 @@ private let aecLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category
 /// starting point), so it isn't limited by `reference`'s own ring latency the way MDF was —
 /// AEC3 handles delays up to roughly 500 ms on its own.
 ///
-/// Known gap: AEC3's double-talk (simultaneous far-end echo + near-end speech) suppression is
-/// more aggressive than MDF's was on this app's synthetic double-talk test — see
-/// `../../../CWebRTCAEC/README.md`'s "Double-talk tuning" section for the measured numbers and
-/// what was tried.
+/// Double-talk (simultaneous far-end echo + near-end speech) note: AEC3's suppressor is more
+/// aggressive than MDF's was at suppressing near-end speech when the echo and near-end are
+/// comparable in level; `makeEchoCanceller3Config()` tunes `dominant_nearend_detection` to
+/// recognize double talk faster, verified against a sweep of echo:near-end loudness ratios
+/// (real desk speakers measure roughly -10 to -20 dB below the near-end talker's own mic
+/// level) — see `../../../CWebRTCAEC/README.md`'s "Double-talk tuning" section for the full
+/// table and what was tried.
 ///
 /// Thread contract:
 /// - `process` runs on the capture device's IO thread. It is the sole reader of `reference`

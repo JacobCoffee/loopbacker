@@ -27,22 +27,24 @@ struct WebRTCAEC3State {
 
 // EchoCanceller3's default `dominant_nearend_detection` thresholds (tuned for WebRTC's own
 // call scenarios) suppress near-end speech more than this app's "preserve the talker during
-// double talk" requirement wants when the echo and near-end are comparable in level. Lowering
-// `snr_threshold` makes AEC3 switch to its gentler `nearend_tuning` suppression curve (instead
-// of `normal_tuning`) at a lower near-end-to-residual-noise ratio, so it recognizes double talk
-// sooner and backs off suppression instead of attenuating the talker along with the echo.
+// double talk" requirement wants when the echo and near-end are comparable in level. These
+// values were chosen from a sweep across echo:near-end ratios of 0/-6/-12/-18 dB comparing
+// AEC3's stock config against several tuning candidates -- see
+// `../../README.md#double-talk-tuning` for the full table. Lowering `snr_threshold`/
+// `enr_threshold` makes AEC3 switch to its gentler `nearend_tuning` suppression curve (instead
+// of `normal_tuning`) at a lower near-end-to-residual-noise ratio; lowering `hold_duration`/
+// `trigger_threshold`/`enr_exit_threshold` makes it enter and re-enter that state faster once
+// double talk starts, instead of waiting out `hold_duration` frames of the louder/decaying
+// signal before switching. At -6/-12 dB (closest to a real desk) this wins
+// -2.99/-1.61 dB measured with the slower-entry variant down to -2.92/-1.58 dB, while keeping
+// far-end-only ERLE comfortably above the 25 dB bar (31.6/31.3 dB linear/nonlinear).
 static webrtc::EchoCanceller3Config makeEchoCanceller3Config() {
     webrtc::EchoCanceller3Config config;
-    // Lower thresholds than AEC3's defaults (snr_threshold 30, enr_threshold .25): makes AEC3
-    // classify a frame as "dominant nearend" (double talk) sooner, switching to its gentler
-    // `nearend_tuning` suppression curve instead of `normal_tuning` more readily. Verified
-    // empirically against EchoCancellerTests' double-talk scenario (improves near-end
-    // preservation from -10.6 dB to -6.85 dB vs. AEC3's defaults; still short of the 3 dB
-    // target -- see CWebRTCAEC/README.md for the full account).
     config.suppressor.dominant_nearend_detection.snr_threshold = 5.0f;
     config.suppressor.dominant_nearend_detection.enr_threshold = 1.0f;
-    config.suppressor.dominant_nearend_detection.hold_duration = 25;
-    config.suppressor.dominant_nearend_detection.trigger_threshold = 3;
+    config.suppressor.dominant_nearend_detection.enr_exit_threshold = 2.0f;
+    config.suppressor.dominant_nearend_detection.hold_duration = 10;
+    config.suppressor.dominant_nearend_detection.trigger_threshold = 1;
     return config;
 }
 
