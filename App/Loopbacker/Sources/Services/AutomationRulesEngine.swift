@@ -75,7 +75,8 @@ final class AutomationRulesEngine: ObservableObject {
         let signals = currentSignals
 
         if rulesState.isPaused {
-            guard let paused = rulesState.pausedSignals, RuleEngine.shouldResume(pausedSignals: paused, currentSignals: signals) else {
+            guard let paused = rulesState.pausedSignals,
+                  RuleEngine.shouldResume(pausedSignals: paused, currentSignals: signals, rules: rulesState.rules) else {
                 return
             }
             rulesState.resume()

@@ -84,6 +84,15 @@ class RoutingState: ObservableObject {
     /// Positions of connector dots, reported via PreferenceKey
     @Published var connectorPositions: [ConnectorEnd: CGPoint] = [:]
 
+    /// True while `applyConfig` is assigning `sources`/`routes`/`outputDestinations` in
+    /// sequence. Each is its own `@Published` property, so a naive observer of e.g. `$sources`
+    /// alone would see new sources paired with not-yet-updated routes (or vice versa) mid-call.
+    /// `RoutingSync` checks this to skip reconciling on those partial states and instead
+    /// reconciles once, against the fully-consistent result, via `configReplaced`.
+    private(set) var isReplacingConfig = false
+    /// Fires once after `applyConfig` finishes assigning every field.
+    let configReplaced = PassthroughSubject<Void, Never>()
+
     /// Where `save()`/`load()` read and write `config.json`. Injectable so tests never touch
     /// the real Application Support path (and so another instance's saved config).
     private let persistenceDirectory: URL
@@ -166,61 +175,16 @@ class RoutingState: ObservableObject {
         save()
     }
 
-    /// One source's device UID changing underneath it, from `rebindMissingDeviceSources`.
-    struct RebindChange: Equatable {
-        let sourceId: UUID
-        let sourceName: String
-        let old: String
-        let newUID: String
-        let newName: String
-    }
-
-    /// Re-binds device sources whose current device is unavailable.
-    ///
-    /// Sources with a configured `fallbackDevices` list use it: the most-preferred *present*
-    /// device wins, so a source switches back to a higher-preference device (e.g. the primary
-    /// interface) as soon as it reappears, not just when its current device disappears.
-    ///
-    /// Sources with no configured list fall back to the legacy behavior: re-bind only while the
-    /// current device is missing, by matching a single unclaimed input device with the same
-    /// name (CoreAudio UIDs change when a different driver claims the hardware, e.g. MOTU's
-    /// CoreUAC driver vs. AppleUSBAudioEngine).
+    /// Re-binds device sources whose current device is unavailable. See `DeviceRebinder.rebind`
+    /// for the rules.
     @discardableResult
     func rebindMissingDeviceSources(to devices: [SystemAudioDevice]) -> [RebindChange] {
-        let presentUIDs = Set(devices.map(\.uid))
-        var claimedUIDs = Set(sources.map(\.deviceUID))
-        var changes: [RebindChange] = []
-
-        for idx in sources.indices {
-            let source = sources[idx]
-            guard !source.isAppCapture, !source.deviceUID.isEmpty else { continue }
-
-            if !source.fallbackDevices.isEmpty {
-                guard let target = DeviceFallback.resolve(preferences: source.fallbackDevices, presentUIDs: presentUIDs),
-                      target != source.deviceUID else { continue }
-                let newName = source.fallbackDevices.first { $0.uid == target }?.name
-                    ?? devices.first { $0.uid == target }?.name ?? ""
-                changes.append(RebindChange(sourceId: source.id, sourceName: source.name,
-                                             old: source.deviceUID, newUID: target, newName: newName))
-                claimedUIDs.remove(source.deviceUID)
-                claimedUIDs.insert(target)
-                sources[idx].deviceUID = target
-                continue
-            }
-
-            guard !presentUIDs.contains(source.deviceUID) else { continue }
-            let candidates = devices.filter {
-                $0.isInput && $0.name == source.name && !claimedUIDs.contains($0.uid)
-            }
-            guard candidates.count == 1, let match = candidates.first else { continue }
-            claimedUIDs.insert(match.uid)
-            changes.append(RebindChange(sourceId: source.id, sourceName: source.name,
-                                         old: source.deviceUID, newUID: match.uid, newName: match.name))
-            sources[idx].deviceUID = match.uid
+        let result = DeviceRebinder.rebind(sources: sources, devices: devices)
+        if !result.changes.isEmpty {
+            sources = result.sources
+            save()
         }
-
-        if !changes.isEmpty { save() }
-        return changes
+        return result.changes
     }
 
     func addOutputChannel() {
@@ -420,15 +384,22 @@ class RoutingState: ObservableObject {
         (try? JSONEncoder().encode(currentConfig())) ?? Data()
     }
 
-    /// Replaces the current routing state with `config` and persists it.
+    /// Replaces the current routing state with `config` and persists it. Sets
+    /// `isReplacingConfig` for the whole sequence of field assignments so observers of the
+    /// individual `@Published` properties (which fire one at a time) can skip reconciling
+    /// against a state that's only partially updated, then reconcile once against the
+    /// consistent result via `configReplaced`.
     func applyConfig(_ config: RoutingConfig) {
+        isReplacingConfig = true
         sources = config.sources
         outputChannels = config.outputChannels
         routes = config.routes
         outputDestinations = config.outputDestinations
         effectsPreset = config.effectsPreset
         noiseSuppression = config.noiseSuppression
+        isReplacingConfig = false
         save()
+        configReplaced.send(())
     }
 
     /// Decodes and replaces the current routing state from JSON data.

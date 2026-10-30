@@ -36,16 +36,19 @@ final class SceneLoader: ObservableObject {
 
     /// Applies `config` as the running configuration: starts routes present only in `config`,
     /// stops routes present only in the current state, and retargets (channel mix only, no
-    /// restart) routes present in both but mixed differently.
+    /// restart) routes present in both but mixed differently. See `SceneLoadPlanner` for the
+    /// device normalization/diffing logic.
     @discardableResult
     func load(_ config: RoutingConfig) -> SceneDiff {
-        let old = RoutingDesiredState.compute(from: routingState.currentConfig())
-        let new = RoutingDesiredState.compute(from: config)
-        let diff = SceneDiff.diff(from: old, to: new)
-
-        apply(diff)
-        routingState.applyConfig(config)
-        return diff
+        let plan = SceneLoadPlanner.plan(
+            loading: config, over: routingState.currentConfig(), presentDevices: audioDeviceManager.systemDevices
+        )
+        for change in plan.deviceChanges {
+            SceneNotifier.shared.deviceFallback(sourceName: change.sourceName, toDeviceName: change.newName)
+        }
+        apply(plan.diff)
+        routingState.applyConfig(plan.normalizedConfig)
+        return plan.diff
     }
 
     private func apply(_ diff: SceneDiff) {

@@ -61,7 +61,7 @@ final class RoutingSync: ObservableObject {
         routingState.$sources
             .dropFirst()
             .sink { [weak self] newSources in
-                guard let self else { return }
+                guard let self, !self.routingState.isReplacingConfig else { return }
                 self.syncAudioRouting(sources: newSources, routes: self.routingState.routes)
             }
             .store(in: &cancellables)
@@ -69,8 +69,19 @@ final class RoutingSync: ObservableObject {
         routingState.$routes
             .dropFirst()
             .sink { [weak self] newRoutes in
-                guard let self else { return }
+                guard let self, !self.routingState.isReplacingConfig else { return }
                 self.syncAudioRouting(sources: self.routingState.sources, routes: newRoutes)
+            }
+            .store(in: &cancellables)
+
+        // Fires once after `RoutingState.applyConfig` (scene load) finishes assigning every
+        // field, so reconciliation sees the complete, consistent target state instead of a
+        // partial one (new sources paired with not-yet-updated routes, etc.) that would read a
+        // kept route as removed and restart it, losing DSP state for no reason.
+        routingState.configReplaced
+            .sink { [weak self] in
+                guard let self else { return }
+                self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes)
             }
             .store(in: &cancellables)
 
@@ -78,7 +89,7 @@ final class RoutingSync: ObservableObject {
         audioDeviceManager.$systemDevices
             .dropFirst()
             .sink { [weak self] devices in
-                guard let self else { return }
+                guard let self, !self.routingState.isReplacingConfig else { return }
                 self.rebindMissingDeviceSources(devices: devices)
                 self.syncAudioRouting(sources: self.routingState.sources, routes: self.routingState.routes)
             }
@@ -109,7 +120,19 @@ final class RoutingSync: ObservableObject {
             .map { NoisePush(settings: $0, sources: $1) }
             .removeDuplicates()
             .dropFirst()
-            .sink { [weak self] in self?.push($0) }
+            .sink { [weak self] in
+                guard let self, !self.routingState.isReplacingConfig else { return }
+                self.push($0)
+            }
+            .store(in: &cancellables)
+
+        // Reconcile noise suppression once more against the final state after a scene load,
+        // same reasoning as the routing reconcile above.
+        routingState.configReplaced
+            .sink { [weak self] in
+                guard let self else { return }
+                self.push(NoisePush(settings: self.routingState.noiseSuppression, sources: self.routingState.sources))
+            }
             .store(in: &cancellables)
     }
 
@@ -152,6 +175,9 @@ final class RoutingSync: ObservableObject {
     /// Starts/stops audio routing based on which sources are enabled, not muted, and have routes
     private func syncAudioRouting(sources: [AudioSource], routes: [AudioRoute]) {
         let routedSourceIDs = Set(routes.map(\.sourceId))
+        let inputDeviceChannelCounts = Dictionary(
+            audioDeviceManager.systemDevices.map { ($0.uid, $0.inputChannelCount) }, uniquingKeysWith: { a, _ in a }
+        )
 
         for source in sources {
             let hasRoutes = routedSourceIDs.contains(source.id)
@@ -159,9 +185,16 @@ final class RoutingSync: ObservableObject {
 
             // Push the per-source channel mix matrix so the engine knows how to
             // fan source channels into output channels (handles mono→stereo, cross-routing).
+            // Clamped to the bound device's real channel count so a route built for a wider
+            // device still reads somewhere valid on a narrower fallback device (see
+            // `RoutingDesiredState.clampedChannel`).
+            let deviceChannelCount = source.isAppCapture ? nil : inputDeviceChannelCounts[source.deviceUID]
             let sourceRoutes: [(srcCh: Int, dstCh: Int)] = routes
                 .filter { $0.sourceId == source.id }
-                .map { (srcCh: $0.sourceChannelId, dstCh: $0.outputChannelId) }
+                .map { (
+                    srcCh: RoutingDesiredState.clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount),
+                    dstCh: $0.outputChannelId
+                ) }
             let mixUID = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
             if !mixUID.isEmpty {
                 audioRouter.setChannelMix(sourceDeviceUID: mixUID, routes: sourceRoutes)

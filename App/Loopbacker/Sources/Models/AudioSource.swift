@@ -86,6 +86,19 @@ struct AudioSource: Identifiable, Equatable, Codable {
 
     var isAppCapture: Bool { sourceType == .appCapture }
 
+    /// Adds `entry` to `fallbackDevices`, seeding the list with the device this source is
+    /// *currently* bound to first if the list was empty. Without that seed, the first fallback
+    /// the user adds would silently outrank the device the source is actually using today --
+    /// the next enumeration could switch away from a working interface it was never told about,
+    /// and never switch back since the working device was never in the preference list at all.
+    mutating func addFallbackDevice(_ entry: DeviceFallbackEntry) {
+        if fallbackDevices.isEmpty && !deviceUID.isEmpty {
+            fallbackDevices.append(DeviceFallbackEntry(uid: deviceUID, name: name))
+        }
+        guard !fallbackDevices.contains(where: { $0.uid == entry.uid }) else { return }
+        fallbackDevices.append(entry)
+    }
+
     enum CodingKeys: String, CodingKey {
         case id, name, icon, channels, isEnabled, isPassThrough, isMuted, deviceUID
         case monitorOutputUID, monitorOutputName, sourceType, appBundleID, noiseSuppression, denoiseMonitor
