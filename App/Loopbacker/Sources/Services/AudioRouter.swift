@@ -312,6 +312,12 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             } else if let appAudioProcessor {
                 appAudioProcessor.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
             }
+            // Mute/push-to-talk gate (Control slice): only the route that actually feeds the
+            // virtual mic, right after the FX chain -- never the monitor route (you hearing
+            // yourself should stay live even while the outgoing mic is muted).
+            if isVoiceInput, !isMonitor {
+                MicGate.shared.process(mixBuffer, frames: Int(frames), stride: Int(outputChannels))
+            }
             computePeak(from: mixBuffer, channels: outputChannels, frames: frames, into: outMeterLevelsPtr)
             ring.write(mixBuffer, frames: frames)
         }

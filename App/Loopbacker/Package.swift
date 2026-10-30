@@ -113,7 +113,10 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("Accelerate")
+                .linkedFramework("Accelerate"),
+                // Global mute/push-to-talk hotkey (Control slice): RegisterEventHotKey, no
+                // Accessibility permission needed.
+                .linkedFramework("Carbon")
             ]
         ),
         .testTarget(
