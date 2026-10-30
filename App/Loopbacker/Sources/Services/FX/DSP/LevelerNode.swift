@@ -109,12 +109,17 @@ final class LevelerNode: FXNode, @unchecked Sendable {
                 energy = kl * kl
             }
 
-            // Add exactly what the ring stores, so the running sum can't drift from it.
-            let old = Double(windowBuffer[windowWrite])
-            windowBuffer[windowWrite] = energy
-            windowWrite = (windowWrite + 1) % windowFrames
-            windowSum = max(0, fxFlush(windowSum - old + Double(energy)))
-            if windowFilled < windowFrames { windowFilled += 1 }
+            // Measure speech only, the way BS.1770's gate drops quiet blocks: pauses between
+            // words would otherwise pull the window down and the leveler would push talk above
+            // its target. Filters above still run continuously so their state stays correct.
+            if voiced {
+                // Add exactly what the ring stores, so the running sum can't drift from it.
+                let old = Double(windowBuffer[windowWrite])
+                windowBuffer[windowWrite] = energy
+                windowWrite = (windowWrite + 1) % windowFrames
+                windowSum = max(0, fxFlush(windowSum - old + Double(energy)))
+                if windowFilled < windowFrames { windowFilled += 1 }
+            }
 
             let meanSquare = windowSum / Double(max(windowFilled, 1))
             // BS.1770: LUFS = -0.691 + 10*log10(mean square).
