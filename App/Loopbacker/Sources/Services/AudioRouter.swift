@@ -1050,17 +1050,21 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Must run on `queue`. Frees `instance` once `ctx`'s own IO thread has completed a full
     /// block since the slot it came from was cleared -- an acquisition-safe acknowledgement
     /// (see `RouteContext.ioGeneration`'s doc comment) instead of a fixed deadline a stalled
-    /// callback could still be running past. Polls at a short interval rather than guessing a
-    /// wait time; a genuinely stalled IO thread means the device died, in which case `instance`
-    /// simply outlives the app rather than risking a use-after-free.
-    private func releaseOnceQuiescent<T: AnyObject & Sendable>(_ instance: T?, generationAtDetach: UInt64, ctx: RouteContext) {
+    /// callback could still be running past. A route that has been stopped (no longer in
+    /// `voiceContexts`) can't be inside a callback: `stopRoutingInternal` removes it and calls
+    /// `AudioOutputUnitStop` in the same `queue` turn, so it's freed at once. While the device
+    /// is stalled (e.g. asleep) the poll backs off to 1 s rather than spinning.
+    private func releaseOnceQuiescent<T: AnyObject & Sendable>(_ instance: T?, generationAtDetach: UInt64,
+                                                              ctx: RouteContext, attempt: Int = 0) {
         guard instance != nil else { return }
-        guard ctx.ioGeneration.load(ordering: .acquiring) == generationAtDetach else {
+        let advanced = ctx.ioGeneration.load(ordering: .acquiring) != generationAtDetach
+        guard !advanced, voiceContexts.contains(where: { $0 === ctx }) else {
             withExtendedLifetime(instance) {}
             return
         }
-        queue.asyncAfter(deadline: .now() + 0.005) { [weak self] in
-            self?.releaseOnceQuiescent(instance, generationAtDetach: generationAtDetach, ctx: ctx)
+        let delay = min(1.0, 0.005 * pow(2, Double(min(attempt, 8))))
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.releaseOnceQuiescent(instance, generationAtDetach: generationAtDetach, ctx: ctx, attempt: attempt + 1)
         }
     }
 
