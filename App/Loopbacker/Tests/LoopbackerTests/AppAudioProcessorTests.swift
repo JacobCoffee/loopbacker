@@ -78,7 +78,7 @@ struct AppAudioProcessorTests {
 
         // VoiceBus is a process-wide singleton. Other suites run real `FXChain`s whose VAD
         // keeps calling `VoiceBus.update` for as long as they're processing, so a single
-        // they're processing, so a single quiet-then-release attempt can be re-pinned mid-flight
+        // quiet-then-release attempt can be re-pinned mid-flight
         // by a concurrently-running suite. Retry the whole settle-and-verify step until it
         // succeeds (bounded, so a genuine regression still fails the test).
         var finalGain: Float = -1
