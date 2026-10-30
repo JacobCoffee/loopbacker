@@ -29,7 +29,7 @@ final class DriftCompensatedRing {
     private let mask: UInt32
     /// Fill above this means the writer is about to lap the reader's interpolation window.
     private let overrunThreshold: UInt32
-    private let sampleRate: Double
+    let sampleRate: Double
     private let storage: UnsafeMutablePointer<Float>
 
     // Written by the writer, read by both.

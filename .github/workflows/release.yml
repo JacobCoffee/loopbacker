@@ -71,6 +71,10 @@ jobs:
           cp App/Loopbacker/Resources/RNNoise-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/Airwindows-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/YSFX-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/WDL-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/CWebRTCAEC/LICENSE-webrtc-audio-processing.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/CWebRTCAEC/LICENSE-abseil.txt Loopbacker.app/Contents/Resources/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
           xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
             --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
@@ -125,6 +129,8 @@ jobs:
         if: steps.secrets.outputs.has_cert != 'true'
         run: |
           echo "::notice::No signing certificate found — using ad-hoc signature"
+          codesign --force --sign - \
+            Loopbacker.app/Contents/Resources/Loopbacker.driver
           codesign --force --options runtime \
             --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
             --sign - \
