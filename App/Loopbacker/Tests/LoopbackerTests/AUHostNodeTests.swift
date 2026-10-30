@@ -139,25 +139,33 @@ struct AUHostNodeTests {
         #expect(node.latencySamples > 0)
     }
 
-    @Test("Processes block sizes 1...4096 from a background thread without blowing up")
+    @Test("Processes block sizes 1...4096 on one instance, in increasing and random order, with no render errors")
     func variedBlockSizesOffMainThread() async throws {
-        // Apple's in-process V2 bridge has a quirk (seen with every built-in effect we tried):
-        // once a render call at size N succeeds, a later call at a size > N fails with
-        // kAudio_ParamError, forever, even though `maximumFramesToRender` was set once up
-        // front. We rely on our own pass-through-on-error path for this, not a workaround:
-        // the real assertion here is that varying sizes never crash or produce non-finite
-        // output, matching every other real host's experience with this AU family.
-        let node = try await AUHostNode.load(ref: BuiltIn.dynamicsProcessor, state: nil, sampleRate: sampleRate)
-        let sizes = [1, 2, 3, 7, 32, 63, 64, 127, 128, 255, 256, 511, 1023, 2047, 4095, 4096]
+        let node = try await AUHostNode.load(ref: BuiltIn.delay, state: nil, sampleRate: sampleRate)
+        node.params.set(try paramIndex(node, named: "Dry/Wet Mix"), 0) // pure dry: output must equal input exactly
+        let increasing = [1, 2, 3, 7, 32, 63, 64, 127, 128, 255, 256, 511, 1023, 2047, 4095, 4096]
+        // Deterministic shuffle (xorshift), so a HAL-style jump from a small block straight to
+        // a large one is exercised too, not just a monotonic ramp.
+        var state: UInt64 = 0x2545_F491_4F6C_DD1D
+        func nextIndex(_ bound: Int) -> Int {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17
+            return Int(state % UInt64(bound))
+        }
+        var random = increasing
+        for i in stride(from: random.count - 1, to: 0, by: -1) { random.swapAt(i, nextIndex(i + 1)) }
+
         await Task.detached {
             var frame = 0
-            for size in sizes {
+            for size in increasing + random {
                 let output = render(node, frames: size) { sineWave(frequency: 220, amplitude: 0.7, frame: $0 + frame) }
                 #expect(output.left.allSatisfy { $0.isFinite })
                 #expect(output.right.allSatisfy { $0.isFinite })
+                let expected = (0..<size).map { sineWave(frequency: 220, amplitude: 0.7, frame: $0 + frame) }
+                for i in 0..<size { #expect(abs(output.left[i] - expected[i]) < 1e-5) }
                 frame += size
             }
         }.value
+        #expect(node.renderErrorCount == 0)
     }
 
     @Test("A mono-channel block is summed/duplicated across a stereo-negotiated plugin")
