@@ -11,6 +11,9 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
     @StateObject private var fxEngine: FXEngine
+    // Comms slice's system audio tap (far-end reference for echo cancellation); owned here so
+    // it's one instance for the app's lifetime, matching the other engine singletons above.
+    @StateObject private var systemAudioTap: SystemAudioTap
     // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
     // routes start and menu-bar edits reach the engine even if the main window never opens.
     @StateObject private var routingSync: RoutingSync
@@ -28,6 +31,7 @@ struct LoopbackerApp: App {
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
         _fxEngine = StateObject(wrappedValue: FXEngine(audioRouter: audioRouter))
+        _systemAudioTap = StateObject(wrappedValue: SystemAudioTap())
         _routingSync = StateObject(wrappedValue: RoutingSync(
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
@@ -52,6 +56,7 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
                 .environmentObject(fxEngine)
+                .environmentObject(systemAudioTap)
                 .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
