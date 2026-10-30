@@ -48,13 +48,16 @@ struct CallDuckSettingsDecodeTests {
         #expect(decoded.trigger == .both)
     }
 
+    /// A file of this test's own: the default file is shared by every test in the process.
+    private func scratchFile() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("call-duck-\(UUID().uuidString).json")
+    }
+
     @Test("CallDuckSettings.load() with no saved file returns suggested defaults, disabled")
     @MainActor
     func loadWithNoFileReturnsDefaults() {
-        // `CallDuckSettings.load()` reads from `AppDataDirectory.url`, already routed to a
-        // temp directory for this test process (see `AppDataDirectory`'s own doc comment) --
-        // no real app data is touched.
-        let settings = CallDuckSettings.load()
+        let settings = CallDuckSettings.load(from: scratchFile())
         #expect(settings.listenDuckEnabled == false)
         #expect(settings.listenDuckTrigger == .callVoices)
         #expect(settings.extraCallAppBundleIDs.isEmpty)
@@ -62,20 +65,19 @@ struct CallDuckSettingsDecodeTests {
 
     @Test("CallDuckSettings round-trips a full save/load cycle")
     @MainActor
-    func saveLoadRoundTrips() async throws {
+    func saveLoadRoundTrips() throws {
         let settings = CallDuckSettings()
         settings.listenDuckEnabled = true
         settings.listenDuckBundleIDs = ["com.spotify.client"]
         settings.listenDuckAmountDB = -14
         settings.listenDuckTrigger = .both
         settings.extraCallAppBundleIDs = ["com.google.Chrome"]
-        settings.save()
+        let url = scratchFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+        settings.save(to: url)
+        CallDuckSettings.waitForPendingSaves()
 
-        // `save()` writes asynchronously on a serial queue; give it a moment, matching
-        // `PresetAutoSwitchStatePersistenceTests`'s own approach to the same pattern.
-        try await Task.sleep(for: .milliseconds(200))
-
-        let reloaded = CallDuckSettings.load()
+        let reloaded = CallDuckSettings.load(from: url)
         #expect(reloaded.listenDuckEnabled == true)
         #expect(reloaded.listenDuckBundleIDs == ["com.spotify.client"])
         #expect(reloaded.listenDuckAmountDB == -14)

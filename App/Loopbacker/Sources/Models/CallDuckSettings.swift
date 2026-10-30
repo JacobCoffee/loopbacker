@@ -58,7 +58,7 @@ final class CallDuckSettings: ObservableObject {
 
     // MARK: - Persistence
 
-    private static let fileURL: URL = AppDataDirectory.url.appendingPathComponent("call-duck-settings.json")
+    nonisolated static let defaultFileURL: URL = AppDataDirectory.url.appendingPathComponent("call-duck-settings.json")
 
     private struct Persisted: Codable {
         var extraCallAppBundleIDs: Set<String>
@@ -99,12 +99,13 @@ final class CallDuckSettings: ObservableObject {
     /// must finish their atomic file replacements in submission order.
     private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.callduck.save", qos: .utility)
 
-    func save() {
+    /// `url` is for tests: every test process shares one `AppDataDirectory`, so parallel tests
+    /// writing the default file would see each other's settings.
+    func save(to url: URL = CallDuckSettings.defaultFileURL) {
         let snapshot = Persisted(
             extraCallAppBundleIDs: extraCallAppBundleIDs, listenDuckEnabled: listenDuckEnabled,
             listenDuckBundleIDs: listenDuckBundleIDs, listenDuckAmountDB: listenDuckAmountDB,
             listenDuckTrigger: listenDuckTrigger)
-        let url = Self.fileURL
         Self.saveQueue.async {
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -116,8 +117,13 @@ final class CallDuckSettings: ObservableObject {
         }
     }
 
-    static func load() -> CallDuckSettings {
-        guard let data = try? Data(contentsOf: fileURL),
+    /// Blocks until every `save()` queued so far has been written.
+    static func waitForPendingSaves() {
+        saveQueue.sync {}
+    }
+
+    static func load(from url: URL = CallDuckSettings.defaultFileURL) -> CallDuckSettings {
+        guard let data = try? Data(contentsOf: url),
               let persisted = try? JSONDecoder().decode(Persisted.self, from: data) else {
             return CallDuckSettings()
         }
