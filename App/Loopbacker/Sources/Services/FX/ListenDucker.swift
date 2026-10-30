@@ -108,6 +108,8 @@ final class ListenDucker: ObservableObject {
     private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
     private var config = Config()
     private var tappedBundleIDs: [String] = []
+    private var callApps: Set<String> = []
+    private let processListObserver = AudioProcessListObserver()
     private var tappedOutputUID: String?
 
     private let ioContext: UnsafeMutablePointer<ListenDuckerIOContext>
@@ -138,20 +140,39 @@ final class ListenDucker: ObservableObject {
     /// `duckAmountDB`/`trigger` push straight into the lock-free atomics the IOProc reads, no
     /// rebuild needed.
     func updateConfig(_ newValue: Config, excludingCallApps callApps: Set<String>) {
-        let sanitized = Self.sanitizedBundleIDs(requested: newValue.bundleIDs, excludingCallApps: callApps)
-        let needsRebuild = newValue.isEnabled != config.isEnabled || sanitized != tappedBundleIDs
+        self.callApps = callApps
+        let expanded = tapBundleIDs(for: newValue.bundleIDs)
+        let needsRebuild = newValue.isEnabled != config.isEnabled || expanded != tappedBundleIDs
         config = newValue
         ioContext.pointee.duckAmountDBBits.pointee.store(newValue.duckAmountDB.bitPattern, ordering: .relaxed)
         ioContext.pointee.triggerBits.pointee.store(newValue.trigger == .both ? 1 : 0, ordering: .relaxed)
         if newValue.isEnabled {
             installDefaultOutputListenerIfNeeded()
-            if needsRebuild { rebuild(sanitizedBundleIDs: sanitized) }
+            processListObserver.start { [weak self] in self?.processListChanged() }
+            if needsRebuild { rebuild(sanitizedBundleIDs: expanded) }
         } else {
             removeDefaultOutputListener()
+            processListObserver.stop()
             teardown()
             state = .stopped
             tappedBundleIDs = []
         }
+    }
+
+    /// The picked apps plus the helper processes that actually play their audio (Chrome and
+    /// Edge play from `….helper`, Firefox from `plugin-container`), minus call apps and their
+    /// helpers so a call is never ducked.
+    private func tapBundleIDs(for requested: [String]) -> [String] {
+        let apps = Set(Self.sanitizedBundleIDs(requested: requested, excludingCallApps: callApps))
+        let callProcesses = AudioProcessResolver.tapBundleIDs(for: callApps)
+        return AudioProcessResolver.tapBundleIDs(for: apps).subtracting(callProcesses).sorted()
+    }
+
+    /// A ducked app started or stopped a helper that plays audio: retap if the set changed.
+    private func processListChanged() {
+        guard config.isEnabled else { return }
+        let expanded = tapBundleIDs(for: config.bundleIDs)
+        if expanded != tappedBundleIDs { rebuild(sanitizedBundleIDs: expanded) }
     }
 
     /// Apps the user asked to duck, minus Loopbacker's own process and anything currently

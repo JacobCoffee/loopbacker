@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Ducking and leveling for app-capture routes (game, music, browser), separate from the voice
@@ -28,6 +29,18 @@ struct AppAudioSection: View {
         Set(CallAppAdviceCatalog.all.map(\.id)).union(callDuckSettings.extraCallAppBundleIDs)
     }
 
+    /// Running apps a person would recognize, one row each. `availableApps` also lists every
+    /// helper and agent (AutoFill, loginwindow, Open and Save Panel Service…), many times over.
+    private var pickableApps: [CaptureApp] {
+        let regular = Set(NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap(\.bundleIdentifier))
+        var seen = Set<String>()
+        return appCaptureService.availableApps
+            .filter { regular.contains($0.id) && $0.id != Bundle.main.bundleIdentifier && seen.insert($0.id).inserted }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
             Text("App Audio").font(.title3.weight(.semibold))
@@ -40,7 +53,7 @@ struct AppAudioSection: View {
                         .frame(width: 28, height: 28)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Ducking").font(.headline)
-                        Text("Pulls game/music/browser audio down while you're talking.")
+                        Text("Lowers app audio routed into your virtual mic, so the call hears it under the voices. For your own headphones, use Duck What I Hear below.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -104,7 +117,7 @@ struct AppAudioSection: View {
     /// voices, or both. Only shown while ducking is on.
     private var triggerPicker: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Trigger").font(.caption).foregroundStyle(.secondary)
+            Text("Duck when").font(.caption).foregroundStyle(.secondary)
             Picker("Trigger", selection: binding(\.trigger)) {
                 Text("My voice").tag(CallDuckTrigger.myVoice)
                 Text("Call voices").tag(CallDuckTrigger.callVoices)
@@ -203,19 +216,17 @@ struct AppAudioSection: View {
         .glassPanel(cornerRadius: Metrics.panelRadius, tint: callDuckSettings.listenDuckEnabled ? Color.loopbacker.opacity(0.08) : nil)
         // The app list is only filled when something asks for it; without this the picker
         // said no app was playing while Spotify was.
-        .task(id: callDuckSettings.listenDuckEnabled) {
-            if callDuckSettings.listenDuckEnabled { await appCaptureService.refreshApps() }
+        .task(id: callDuckSettings.listenDuckEnabled || appAudio.duckingEnabled) {
+            if callDuckSettings.listenDuckEnabled || appAudio.duckingEnabled { await appCaptureService.refreshApps() }
         }
     }
 
     private var appPicker: some View {
-        let candidates = appCaptureService.availableApps.filter {
-            !currentCallAppBundleIDs.contains($0.id) && $0.id != Bundle.main.bundleIdentifier
-        }
+        let candidates = pickableApps.filter { !currentCallAppBundleIDs.contains($0.id) }
         return VStack(alignment: .leading, spacing: 6) {
             Text("Apps to duck").font(.caption).foregroundStyle(.secondary)
             if candidates.isEmpty {
-                Text("No other apps are producing audio right now.")
+                Text("No apps are running right now.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -241,6 +252,7 @@ struct AppAudioSection: View {
                         }
                     }
                     .toggleStyle(.checkbox)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
@@ -258,7 +270,9 @@ struct AppAudioSection: View {
                     statusExplainer(icon: "person.slash", text: "No call app (Zoom, Discord, Teams, Slack) is running right now.", tint: .secondary)
                 case .failed(let error):
                     statusExplainer(icon: "exclamationmark.triangle.fill", text: error.errorDescription ?? "The call audio monitor failed to start.", tint: .orange)
-                case .running, .stopped:
+                case .running:
+                    statusExplainer(icon: "waveform", text: "Listening for voices in \(callAudioMonitor.listeningTo.formatted(.list(type: .and))).", tint: .secondary)
+                case .stopped:
                     EmptyView()
                 }
             }
@@ -266,23 +280,24 @@ struct AppAudioSection: View {
         }
     }
 
-    /// Browsers and other non-catalog apps only become a far-end "call" source once the user
-    /// explicitly adds them here (see `CallAudioMonitor`'s class doc for why: a browser tab
-    /// running a web call can't be told apart from any other tab). Only running apps are
-    /// offered, and never a currently-ducked app (that would make "duck what I hear" and "this
-    /// is a call" contradict each other for the same app).
+    /// Built-in call apps are always on and listed first so it's clear Discord, Zoom and the
+    /// rest are already covered. Other running apps (a browser running Meet) can be added; an
+    /// app being ducked on the user's own output can't also be a call.
     private var extraCallAppPicker: some View {
-        let candidates = appCaptureService.availableApps.filter {
-            !CallAppAdviceCatalog.all.map(\.id).contains($0.id)
-                && !callDuckSettings.listenDuckBundleIDs.contains($0.id)
-                && $0.id != Bundle.main.bundleIdentifier
+        let builtIn = CallAppAdviceCatalog.all
+        let builtInIDs = Set(builtIn.map(\.id))
+        let candidates = pickableApps.filter {
+            !builtInIDs.contains($0.id) && !callDuckSettings.listenDuckBundleIDs.contains($0.id)
         }
-        return DisclosureGroup("Also treat a running app as a call (e.g. a browser tab)") {
-            if candidates.isEmpty {
-                Text("No other apps are producing audio right now.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+        return DisclosureGroup("Call apps") {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(builtIn, id: \.id) { app in
+                    Toggle(isOn: .constant(true)) {
+                        Text("\(app.appName) (built in)").font(.caption)
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(true)
+                }
                 ForEach(candidates) { app in
                     Toggle(isOn: Binding(
                         get: { callDuckSettings.extraCallAppBundleIDs.contains(app.id) },
@@ -299,7 +314,11 @@ struct AppAudioSection: View {
                     }
                     .toggleStyle(.checkbox)
                 }
+                Text("Add a browser if your meetings run in it. It can't also be in Apps to duck.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .font(.caption)
     }

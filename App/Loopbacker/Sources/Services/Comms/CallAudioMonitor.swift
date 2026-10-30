@@ -157,6 +157,8 @@ enum CallAudioMonitorState: Sendable, Equatable {
 @MainActor
 final class CallAudioMonitor: ObservableObject {
     @Published private(set) var state: CallAudioMonitorState = .stopped
+    /// Names of the call apps the tap covers right now, for the status row.
+    @Published private(set) var listeningTo: [String] = []
     @Published private(set) var permission: SystemAudioTapPermission = .unknown
 
     private var tapID: AudioObjectID = 0
@@ -165,6 +167,7 @@ final class CallAudioMonitor: ObservableObject {
     private var wantsMonitor = false
     private var workspaceObservers: [NSObjectProtocol] = []
     private var tappedBundleIDs: Set<String> = []
+    private let processListObserver = AudioProcessListObserver()
 
     private let vad: VoiceActivityDetector?
     private let ioContext: UnsafeMutablePointer<CallMonitorIOContext>
@@ -195,12 +198,14 @@ final class CallAudioMonitor: ObservableObject {
         guard state != .running else { return }
         wantsMonitor = true
         installWorkspaceObserversIfNeeded()
+        processListObserver.start { [weak self] in self?.rebuild() }
         rebuild()
     }
 
     func stop() {
         wantsMonitor = false
         removeWorkspaceObservers()
+        processListObserver.stop()
         teardown()
         state = .stopped
     }
@@ -210,7 +215,9 @@ final class CallAudioMonitor: ObservableObject {
     /// for an app that turned out not to be a call app -- since it no-ops when the set matches.
     private func rebuild() {
         guard wantsMonitor else { return }
-        let bundleIDs = Self.runningCallAppBundleIDs(extra: extraCallAppBundleIDs())
+        let callApps = Self.runningCallAppBundleIDs(extra: extraCallAppBundleIDs())
+        // Discord, Slack and Teams play call audio from helper processes, not the app itself.
+        let bundleIDs = AudioProcessResolver.tapBundleIDs(for: callApps)
         guard bundleIDs != tappedBundleIDs || state != .running else { return }
         teardown()
 
@@ -278,6 +285,8 @@ final class CallAudioMonitor: ObservableObject {
         }
 
         tappedBundleIDs = bundleIDs
+        listeningTo = CallAppAdviceCatalog.all.filter { callApps.contains($0.id) }.map(\.appName)
+            + callApps.subtracting(CallAppAdviceCatalog.all.map(\.id)).sorted().map(Self.appName)
         state = .running
         callMonitorLogger.info("Call audio monitor running for \(bundleIDs.count) app(s) (tap \(newTapID), aggregate \(newAggregateID))")
     }
@@ -297,6 +306,7 @@ final class CallAudioMonitor: ObservableObject {
             tapID = 0
         }
         tappedBundleIDs = []
+        listeningTo = []
         ioContext.pointee.hysteresis = CallVoiceHysteresis()
         CallVoiceBus.update(level: 0, talking: false)
     }
@@ -324,6 +334,10 @@ final class CallAudioMonitor: ObservableObject {
         let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
         let candidates = Set(CallAppAdviceCatalog.all.map(\.id)).union(extra)
         return candidates.intersection(running)
+    }
+
+    private static func appName(_ bundleID: String) -> String {
+        NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID }?.localizedName ?? bundleID
     }
 
     // MARK: - App launch/quit
