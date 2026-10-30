@@ -5,7 +5,10 @@ import Testing
 /// Numerically verifies every factory preset against a synthetic voice at three input levels,
 /// through a real `FXChain` (with its own VAD) -- not just that the preset's params look
 /// plausible, but that running audio through it behaves the way the preset promises.
-@Suite("FactoryPresets", .serialized)
+///
+/// Runs in optimized builds only (`swift test -c release`, which CI uses): unoptimized DSP
+/// takes ~9 minutes for the 51 runs, versus ~10 s optimized.
+@Suite("FactoryPresets", .serialized, .enabled(if: TestBuild.isOptimized, "needs `swift test -c release`"))
 struct FactoryPresetsTests {
     private static let sampleRate: Float = 48_000
     private static let inputLevels: [Float] = [-30, -20, -10]

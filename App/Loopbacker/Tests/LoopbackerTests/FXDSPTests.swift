@@ -319,8 +319,9 @@ struct LevelerNodeTests {
         let amp = amplitude(forLUFS: -30, frequency: 400)
         let tone = sine(400, seconds: 4, amplitude: amp)
         let output = run(node, tone, voiceProbability: 1)
-        let outAmp = rms(output.suffix(9600))
-        let measuredLUFS = -0.691 + 10 * log10(outAmp * outAmp * 2)
+        // A 400 Hz tone sits where K-weighting is ~0 dB, so its loudness is its mean square.
+        let outRMS = rms(output.suffix(9600))
+        let measuredLUFS = -0.691 + 10 * log10(outRMS * outRMS)
         #expect(abs(measuredLUFS - (-18)) < 1, "measured \(measuredLUFS) LUFS")
     }
 

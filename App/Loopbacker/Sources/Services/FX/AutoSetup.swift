@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 
 /// Measurements from a recording plus a preset tuned from them.
@@ -43,7 +44,7 @@ enum AutoSetup {
         }
 
         let speechMask = speechMask(for: samples, sampleRate: sampleRate)
-        let noiseFloor = rmsDBFS(samples, where: { !speechMask[$0] })
+        let noiseFloor = noiseFloorDBFS(samples, sampleRate: sampleRate)
         let speechLUFS = kWeightedIntegratedLUFS(samples, where: { speechMask[$0] }, sampleRate: sampleRate)
         let peak = peakDBFS(samples)
         let sibilance = sibilanceDB(samples, where: { speechMask[$0] }, sampleRate: sampleRate)
@@ -181,15 +182,24 @@ enum AutoSetup {
         return mask
     }
 
-    private static func rmsDBFS(_ samples: [Float], where predicate: (Int) -> Bool) -> Float {
-        var sum: Double = 0
-        var count = 0
-        for i in 0..<samples.count where predicate(i) {
-            sum += Double(samples[i] * samples[i])
-            count += 1
+    /// The 10th percentile of 20 ms frame RMS over the whole recording. A low percentile ignores
+    /// speech, its onsets and decays at the voice detector's edges, and keyboard clicks, so the
+    /// estimate doesn't rise with how loudly the user spoke.
+    private static func noiseFloorDBFS(_ samples: [Float], sampleRate: Float) -> Float {
+        let frame = max(1, Int(0.02 * sampleRate))
+        var levels: [Float] = []
+        levels.reserveCapacity(samples.count / frame)
+        var start = 0
+        while start + frame <= samples.count {
+            var meanSquare: Float = 0
+            samples.withUnsafeBufferPointer { vDSP_measqv($0.baseAddress! + start, 1, &meanSquare, vDSP_Length(frame)) }
+            levels.append(meanSquare)
+            start += frame
         }
-        guard count > 0 else { return -80 }
-        return fxLinearToDB(Float(sqrt(sum / Double(count))))
+        guard !levels.isEmpty else { return -80 }
+        levels.sort()
+        let p10 = levels[levels.count / 10]
+        return max(-100, fxLinearToDB(sqrtf(p10)))
     }
 
     private static func peakDBFS(_ samples: [Float]) -> Float {
@@ -200,11 +210,8 @@ enum AutoSetup {
 
     /// Ungated BS.1770 integrated loudness (`-0.691 + 10*log10(meanSquare)`) over the samples
     /// where `predicate` holds, K-weighted continuously across the whole recording so the
-    /// filters' own history stays correct. Doubles the squared term to match `LevelerNode`'s own
-    /// per-sample mono convention (it sums both "channels'" squared K-weighted energy and only
-    /// divides by 1 for mono content, since its `right` is a duplicate of `left` rather than an
-    /// independent channel) -- so a `target` here means the same thing it does to the leveler
-    /// actually levelling this mono recording, not a plain single-channel BS.1770 reading.
+    /// filters' own history stays correct. Mono, matching `LevelerNode`'s per-channel average,
+    /// so a `target` means the same thing here as it does to the leveler.
     private static func kWeightedIntegratedLUFS(_ samples: [Float], where predicate: (Int) -> Bool,
                                                 sampleRate: Float) -> Float {
         var shelf = FXBiquadState()
@@ -215,7 +222,7 @@ enum AutoSetup {
             var k = Float(shelf.process(Double(samples[i]), kShelf))
             k = Float(hp.process(Double(k), kHighpass))
             if predicate(i) {
-                sumSquares += 2 * Double(k * k)
+                sumSquares += Double(k * k)
                 count += 1
             }
         }

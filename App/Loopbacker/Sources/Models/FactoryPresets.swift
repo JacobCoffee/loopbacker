@@ -3,6 +3,15 @@ import Foundation
 /// Grouping shown in the preset picker.
 enum FactoryPresetCategory: String, CaseIterable, Sendable {
     case business, gaming, streaming, creative
+
+    var title: String {
+        switch self {
+        case .business: "Business"
+        case .gaming: "Gaming"
+        case .streaming: "Streaming"
+        case .creative: "Creative"
+        }
+    }
 }
 
 /// A shipped, curated voice-chain configuration plus the noise suppression / echo cancellation

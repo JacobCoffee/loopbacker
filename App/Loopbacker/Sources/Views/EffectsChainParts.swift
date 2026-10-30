@@ -13,12 +13,26 @@ struct ChainSlotTile: View {
     let toggle: () -> Void
     let select: () -> Void
     var namespace: Namespace.ID
+    /// Live 0...1 processing activity (gate openness, GR normalized, de-esser activity, ...),
+    /// drawn as a small glowing dot next to the power button. Nil hides it.
+    var activity: Float? = nil
+    /// Hosted stages only: the plugin failed to load. Shown as a warning badge; `select` still
+    /// opens the detail panel so the user can remove/replace it.
+    var loadError: String? = nil
+    var isHosted: Bool = false
+    var onDuplicate: (() -> Void)? = nil
+    var onRemove: (() -> Void)? = nil
+    var onReset: (() -> Void)? = nil
+    var onOpenEditor: (() -> Void)? = nil
+    var onMoveUp: (() -> Void)? = nil
+    var onMoveDown: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: icon)
+            Image(systemName: loadError != nil ? "exclamationmark.triangle.fill" : icon)
                 .font(.body.weight(.medium))
-                .foregroundStyle(enabled ? AnyShapeStyle(.loopbacker) : AnyShapeStyle(.secondary))
+                .foregroundStyle(loadError != nil ? AnyShapeStyle(Color.signalWarm)
+                                 : (enabled ? AnyShapeStyle(.loopbacker) : AnyShapeStyle(.secondary)))
                 .frame(width: 22)
 
             Text(name)
@@ -27,6 +41,13 @@ struct ChainSlotTile: View {
                 .lineLimit(1)
 
             Spacer(minLength: 4)
+
+            if let activity, enabled, loadError == nil {
+                Circle()
+                    .fill(Color.loopbacker.opacity(0.35 + Double(activity) * 0.65))
+                    .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
+            }
 
             Button(action: toggle) {
                 Image(systemName: "power")
@@ -52,12 +73,33 @@ struct ChainSlotTile: View {
             Button(action: toggle) {
                 Label(enabled ? "Bypass \(name)" : "Enable \(name)", systemImage: "power")
             }
+            if let onMoveUp {
+                Button(action: onMoveUp) { Label("Move Up", systemImage: "arrow.up") }
+            }
+            if let onMoveDown {
+                Button(action: onMoveDown) { Label("Move Down", systemImage: "arrow.down") }
+            }
+            if let onDuplicate {
+                Button(action: onDuplicate) { Label("Duplicate", systemImage: "plus.square.on.square") }
+            }
+            if isHosted, let onOpenEditor {
+                Button(action: onOpenEditor) { Label("Open Plugin Window", systemImage: "macwindow") }
+            }
+            if let onReset {
+                Button(action: onReset) { Label("Reset", systemImage: "arrow.counterclockwise") }
+            }
+            if let onRemove {
+                Divider()
+                Button(role: .destructive, action: onRemove) { Label("Remove", systemImage: "trash") }
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(name)
-        .accessibilityValue(enabled ? "Active" : "Bypassed")
+        .accessibilityValue(loadError != nil ? "Failed to load: \(loadError!)" : (enabled ? "Active" : "Bypassed"))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityAction { select() }
+        .accessibilityAction(named: "Move Up") { onMoveUp?() }
+        .accessibilityAction(named: "Move Down") { onMoveDown?() }
     }
 }
 
@@ -74,7 +116,7 @@ struct ChainTerminalTile: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .glassEffect(.regular, in: .capsule)
+            .glassMaterial(Capsule())
             .glassEffectID(label, in: namespace)
             .accessibilityElement(children: .combine)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -90,6 +132,7 @@ struct SignalLineConnector: View {
     var active: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     private let length: CGFloat = 12
 
@@ -101,7 +144,19 @@ struct SignalLineConnector: View {
                 .shadow(color: active ? Color.loopbacker.opacity(0.6) : .clear, radius: 3)
 
             if active && !reduceMotion {
-                LoopingDot(color: .loopbacker, diameter: 4, loop: .fall)
+                // `LoopingDot` is an `NSViewRepresentable` driven by `CAAnimation` so the
+                // repeating fall animation never re-enters the SwiftUI view graph; that AppKit
+                // bridge doesn't render in a headless offscreen snapshot, so snapshot captures
+                // fall back to a plain static dot that still conveys "signal is flowing" without
+                // the animation.
+                if snapshotRendering {
+                    Circle()
+                        .fill(Color.loopbacker)
+                        .frame(width: 4, height: 4)
+                        .offset(y: length / 2 - 2)
+                } else {
+                    LoopingDot(color: .loopbacker, diameter: 4, loop: .fall)
+                }
             }
         }
         .frame(width: 22, height: length)
@@ -120,6 +175,7 @@ struct QuickPresetsRow: View {
     }
 
     let presets: [Preset]
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     var body: some View {
         if !presets.isEmpty {
@@ -128,15 +184,22 @@ struct QuickPresetsRow: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(presets, id: \.name) { preset in
-                            Button(preset.name, action: preset.apply)
-                                .buttonStyle(.glass)
-                                .tint(nil)
-                                .controlSize(.small)
-                        }
+                let row = HStack(spacing: 6) {
+                    ForEach(presets, id: \.name) { preset in
+                        Button(preset.name, action: preset.apply)
+                            .buttonStyle(.glass)
+                            .tint(nil)
+                            .controlSize(.small)
                     }
+                }
+
+                // `ScrollView` renders blank offscreen (confirmed repro); the plain row wraps
+                // instead of scrolling in render tests, which is fine at the Advanced panel's
+                // 760pt width.
+                if snapshotRendering {
+                    row
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) { row }
                 }
             }
         }
@@ -212,29 +275,48 @@ struct EQBandRow: View {
     @EnvironmentObject var routingState: RoutingState
     let nodeID: UUID
     let band: EQBandConfig
+    /// Hidden when there's only one band left: the chain always needs at least one EQ band.
+    var canRemove: Bool = true
+    var onRemove: (() -> Void)? = nil
 
-    private var gainBinding: Binding<Float> {
+    private func bandBinding<T>(_ keyPath: WritableKeyPath<EQBandConfig, T>) -> Binding<T> {
         Binding(
-            get: { band.gainDB },
+            get: { band[keyPath: keyPath] },
             set: { newValue in
                 guard let nodeIdx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == nodeID }),
                       var bands = routingState.effectsPreset.nodes[nodeIdx].eqBands,
                       let bandIdx = bands.firstIndex(where: { $0.id == band.id }) else { return }
-                bands[bandIdx].gainDB = newValue
+                bands[bandIdx][keyPath: keyPath] = newValue
                 routingState.effectsPreset.nodes[nodeIdx].eqBands = bands
                 routingState.save()
             }
         )
     }
 
+    private var hasGain: Bool { band.type != .highpass && band.type != .lowpass }
+
     var body: some View {
-        HStack(spacing: 12) {
-            Text(Self.bandTypeLabel(band.type))
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(Color.loopbacker)
-                .frame(width: 30)
-                .padding(.vertical, 3)
-                .background(Color.loopbacker.opacity(0.1), in: RoundedRectangle(cornerRadius: 4))
+        HStack(spacing: 10) {
+            Toggle(isOn: bandBinding(\.enabled)) { EmptyView() }
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .accessibilityLabel("\(Self.bandTypeLabel(band.type)) band enabled")
+
+            Menu {
+                ForEach(EQBandConfig.BandType.allCases, id: \.self) { type in
+                    Button(Self.bandTypeLabel(type)) { bandBinding(\.type).wrappedValue = type }
+                }
+            } label: {
+                Text(Self.bandTypeLabel(band.type))
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Color.loopbacker)
+                    .frame(width: 30)
+                    .padding(.vertical, 3)
+                    .background(Color.loopbacker.opacity(0.1), in: RoundedRectangle(cornerRadius: 4))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Band type, currently \(Self.bandTypeLabel(band.type))")
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("Freq")
@@ -246,8 +328,8 @@ struct EQBandRow: View {
             }
             .frame(width: 54, alignment: .leading)
 
-            if band.type != .highpass {
-                Slider(value: gainBinding, in: -12...12) {
+            if hasGain {
+                Slider(value: bandBinding(\.gainDB), in: -12...12) {
                     Text("Gain")
                 }
                 .tint(.loopbacker)
@@ -257,17 +339,33 @@ struct EQBandRow: View {
                     .font(.caption.weight(.semibold).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 56, alignment: .trailing)
+
+                Text("Q \(String(format: "%.2f", band.q))")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             } else {
-                Text("High Pass Filter")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Picker("Slope", selection: bandBinding(\.slopeDBPerOctave)) {
+                    Text("12 dB/oct").tag(12)
+                    Text("24 dB/oct").tag(24)
+                    Text("48 dB/oct").tag(48)
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .font(.caption)
                 Spacer()
             }
 
-            Text("Q \(String(format: "%.2f", band.q))")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.tertiary)
+            if canRemove, let onRemove {
+                Button(action: onRemove) {
+                    Image(systemName: "minus.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this band")
+                .accessibilityLabel("Remove \(Self.bandTypeLabel(band.type)) band")
+            }
         }
+        .opacity(band.enabled ? 1 : 0.5)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: Metrics.innerRadius - 4))

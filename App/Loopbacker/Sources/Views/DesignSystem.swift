@@ -90,13 +90,69 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Snapshot rendering (offscreen test/preview support)
+
+private struct SnapshotRenderingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// True only inside offscreen render tests/previews. `.glassEffect`/`GlassEffectContainer`
+    /// render blank without a live window-server compositor (confirmed empirically: an
+    /// `ImageRenderer` or windowless `NSHostingView` snapshot of any Liquid Glass view is a
+    /// blank rect), so every call through `glassPanel`/`glassMaterial` swaps the real material
+    /// for a flat, opaque approximation of it while this is true. Layout (corner radius,
+    /// padding, the tint opacity a real tint would carry) never changes — only the material.
+    var snapshotRendering: Bool {
+        get { self[SnapshotRenderingKey.self] }
+        set { self[SnapshotRenderingKey.self] = newValue }
+    }
+}
+
 // MARK: - Glass panel
 
+private struct GlassMaterialModifier<S: Shape>: ViewModifier {
+    @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.colorScheme) private var colorScheme
+    let shape: S
+    let tint: Color?
+    let interactive: Bool
+
+    func body(content: Content) -> some View {
+        if snapshotRendering {
+            // `Color(nsColor: .windowBackgroundColor)` is a dynamic `NSColor` provider that
+            // resolves against the "current drawing appearance" — a real window's `drawRect`
+            // sets that automatically, but an offscreen `ImageRenderer`/`CGContext` draw never
+            // does, so it always renders its light variant regardless of `.preferredColorScheme`
+            // (confirmed empirically). `colorScheme` itself, read from the environment like any
+            // other SwiftUI value, isn't affected by that and reliably tracks the render target,
+            // so the flat-fill base is driven from it directly instead of going through AppKit.
+            let base = colorScheme == .dark ? Color(white: 0.16) : Color(white: 0.95)
+            content.background {
+                ZStack {
+                    shape.fill(base)
+                    shape.fill(.quaternary)
+                    if let tint { shape.fill(tint) }
+                }
+            }
+        } else {
+            content.glassEffect(Glass.regular.tint(tint).interactive(interactive), in: shape)
+        }
+    }
+}
+
 extension View {
+    /// The Liquid Glass material for an arbitrary shape (e.g. a capsule terminal tile), with the
+    /// same offscreen-safe fallback as `glassPanel`. Every `.glassEffect` call in the Effects UI
+    /// routes through this (or `glassPanel`) instead of calling it directly.
+    func glassMaterial<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
+        modifier(GlassMaterialModifier(shape: shape, tint: tint, interactive: interactive))
+    }
+
     /// A Liquid Glass panel for content that floats on a canvas. Put sibling panels inside one
     /// `GlassEffectContainer` so their glass blends and morphs together.
     func glassPanel(cornerRadius: CGFloat = Metrics.panelRadius, tint: Color? = nil, interactive: Bool = false) -> some View {
-        glassEffect(Glass.regular.tint(tint).interactive(interactive), in: .rect(cornerRadius: cornerRadius))
+        glassMaterial(RoundedRectangle(cornerRadius: cornerRadius), tint: tint, interactive: interactive)
     }
 }
 

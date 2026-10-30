@@ -165,7 +165,7 @@ enum SyntheticVoiceGenerator {
         for i in 0..<frames {
             var k = Float(shelfState.process(Double(raw[i]), shelfCoeffs))
             k = Float(hpState.process(Double(k), hpCoeffs))
-            sumSquares += 2 * Double(k * k)
+            sumSquares += Double(k * k)
         }
         let rawLUFS = Float(-0.691 + 10 * log10(max(sumSquares / Double(frames), 1e-12)))
         let scale = fxDBToLinear(peakDBFS - rawLUFS)

@@ -7,9 +7,11 @@ audio path, and `PRODUCT.md` / `DESIGN.md` before touching UI.
 ## Build and test
 
 ```bash
-make bundle                            # driver + app → build/Loopbacker.app
-cd App/Loopbacker && swift test        # DSP tests (noise suppression, meters); CI runs these
+make bundle                                    # driver + app → build/Loopbacker.app
+cd App/Loopbacker && swift test                # fast; skips the factory-preset matrix
+cd App/Loopbacker && swift test -c release     # everything; what CI runs
 cd App/Loopbacker && swift build -c release
+LOOPBACKER_RENDER_SNAPSHOTS=1 swift test --filter EffectsRenderTests  # Effects page PNGs in /tmp
 ```
 
 - Code that runs in a CoreAudio IO callback must not allocate, lock, call Objective-C, or block.

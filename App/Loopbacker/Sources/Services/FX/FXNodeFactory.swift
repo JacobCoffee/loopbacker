@@ -28,7 +28,7 @@ enum FXNodeFactory {
 
         node.apply(config.params)
         if let eqNode = node as? EQNode {
-            eqNode.setBands(config.eqBands ?? EQBandConfig.broadcastMasculine)
+            eqNode.setBands(config.eqBands ?? EQBandConfig.broadcast)
         }
         return (node, loadError)
     }

@@ -30,9 +30,8 @@ func runFXChain(_ nodes: [FXNodeConfig], sampleRate: Float, input: [Float], chun
 
 /// BS.1770-style K-weighted integrated loudness (`-0.691 + 10*log10(meanSquare)`), ungated,
 /// computed only over `ranges` but with the K-weighting filters run continuously across all of
-/// `samples` so their history stays correct across gaps. Doubles the squared term to match
-/// `LevelerNode`'s own per-sample mono convention (see `AutoSetup.kWeightedIntegratedLUFS`), so
-/// a leveler's `target` param means the same thing here as it does to the leveler itself.
+/// `samples` so their history stays correct across gaps. Mono, matching `LevelerNode`'s
+/// per-channel average, so a leveler's `target` param means the same thing here.
 func measuredLUFS(_ samples: [Float], ranges: [Range<Int>], sampleRate: Float) -> Float {
     let shelf = FXBiquadCoeffs.make(type: .highshelf, frequency: 1681.9744509555319, q: 0.7071752369554196,
                                     gainDB: 3.999843853973347, sampleRate: Double(sampleRate))
@@ -48,7 +47,7 @@ func measuredLUFS(_ samples: [Float], ranges: [Range<Int>], sampleRate: Float) -
         k = Float(hpState.process(Double(k), hp))
         while rangeIdx < ranges.count, i >= ranges[rangeIdx].upperBound { rangeIdx += 1 }
         if rangeIdx < ranges.count, ranges[rangeIdx].contains(i) {
-            sumSquares += 2 * Double(k * k)
+            sumSquares += Double(k * k)
             count += 1
         }
     }

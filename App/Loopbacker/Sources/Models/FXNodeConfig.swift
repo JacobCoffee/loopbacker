@@ -107,9 +107,9 @@ struct EQBandConfig: Codable, Equatable, Identifiable, Sendable {
         slopeDBPerOctave = (try? c.decode(Int.self, forKey: .slopeDBPerOctave)) ?? 12
     }
 
-    /// "Masculine Voice + Broadcast Sound" from EasyEffects (gist jtrv/47542c8b): the EQ of
-    /// the original Broadcast preset.
-    static let broadcastMasculine: [EQBandConfig] = [
+    /// The original Broadcast preset's EQ, from EasyEffects' "Masculine Voice + Broadcast
+    /// Sound" (gist jtrv/47542c8b): rumble cut, mud and box cuts, presence and air lifts.
+    static let broadcast: [EQBandConfig] = [
         EQBandConfig(id: 0, type: .highpass, frequencyHz: 80, gainDB: 0, q: 0.7),
         EQBandConfig(id: 1, type: .peaking, frequencyHz: 220, gainDB: -2, q: 0.7),
         EQBandConfig(id: 2, type: .peaking, frequencyHz: 350, gainDB: -2, q: 1.2),

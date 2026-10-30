@@ -38,11 +38,11 @@ struct EffectsPreset: Codable, Equatable {
         self.appAudio = appAudio
     }
 
-    /// Gate(Voice mode) → EQ(Broadcast Masculine) → Compressor → De-Esser → Limiter, the rest
+    /// Gate(Voice mode) → EQ(Broadcast) → Compressor → De-Esser → Limiter, the rest
     /// of the chain disabled-by-omission. Off by default until the user enables it.
     static let defaultNodes: [FXNodeConfig] = [
         FXNodeConfig(kind: .gate),
-        FXNodeConfig(kind: .eq, eqBands: EQBandConfig.broadcastMasculine),
+        FXNodeConfig(kind: .eq, eqBands: EQBandConfig.broadcast),
         FXNodeConfig(kind: .compressor),
         FXNodeConfig(kind: .deEsser),
         FXNodeConfig(kind: .limiter),
@@ -87,7 +87,7 @@ struct EffectsPreset: Codable, Equatable {
             gateEnabled: dec(.gateEnabled, true), gateMode: 0,
             gateThresholdDB: dec(.gateThresholdDB, -36), gateAttackMs: dec(.gateAttackMs, 5),
             gateReleaseMs: dec(.gateReleaseMs, 250), gateReductionDB: dec(.gateReductionDB, -12),
-            eqBands: dec(.eqBands, EQBandConfig.broadcastMasculine),
+            eqBands: dec(.eqBands, EQBandConfig.broadcast),
             compressorEnabled: dec(.compressorEnabled, true), compressorThresholdDB: dec(.compressorThresholdDB, -18),
             compressorRatio: dec(.compressorRatio, 3), compressorAttackMs: dec(.compressorAttackMs, 15),
             compressorReleaseMs: dec(.compressorReleaseMs, 200), compressorMakeupDB: dec(.compressorMakeupDB, 3),
@@ -120,7 +120,7 @@ struct EffectsPreset: Codable, Equatable {
     private static func v2Nodes(
         gateEnabled: Bool = true, gateMode: Float = 0, gateThresholdDB: Float = -36, gateAttackMs: Float = 5,
         gateReleaseMs: Float = 250, gateReductionDB: Float = -12,
-        eqBands: [EQBandConfig] = EQBandConfig.broadcastMasculine,
+        eqBands: [EQBandConfig] = EQBandConfig.broadcast,
         compressorEnabled: Bool = true, compressorThresholdDB: Float = -18, compressorRatio: Float = 3,
         compressorAttackMs: Float = 15, compressorReleaseMs: Float = 200, compressorMakeupDB: Float = 3,
         deEsserEnabled: Bool = true, deEsserFrequencyHz: Float = 6000, deEsserReductionDB: Float = -6,

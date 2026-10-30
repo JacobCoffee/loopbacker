@@ -58,14 +58,14 @@ struct AutoSetupTests {
         #expect(abs(correction) <= 4, "the tilt correction must stay within +/-4 dB")
     }
 
-    @Test("Noise floor is measured from pauses, roughly independent of the speech level")
+    @Test("Noise floor is measured from pauses, independent of the speech level")
     func noiseFloorIndependentOfSpeechLevel() {
         let base = FactoryPresets.preset(id: "meeting-natural")!.preset
         let quiet = AutoSetup.analyze(recording(voice(speechPeakDBFS: -30, seed: 1)), base: base, noise: NoiseSuppressionSettings())
         let loud = AutoSetup.analyze(recording(voice(speechPeakDBFS: -10, seed: 1)), base: base, noise: NoiseSuppressionSettings())
-        // Not exact: the VAD's own confidence (and so which frames count as "speech" vs.
-        // "noise") shifts a little with how loud the speech itself is.
-        #expect(abs(quiet.noiseFloorDBFS - loud.noiseFloorDBFS) < 15)
+        // Same room noise, speech 20 dB apart: the estimate must not follow the speech.
+        #expect(abs(quiet.noiseFloorDBFS - loud.noiseFloorDBFS) < 2,
+                "quiet \(quiet.noiseFloorDBFS) dBFS, loud \(loud.noiseFloorDBFS) dBFS")
     }
 
     @Test("The gate threshold sits between the noise floor and the speech level")

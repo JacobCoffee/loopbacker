@@ -95,18 +95,24 @@ final class LevelerNode: FXNode, @unchecked Sendable {
             let l = block.left[i]
             let r = block.channels == 2 ? block.right[i] : l
 
-            // K-weight each channel, then combine per BS.1770's mean-square sum (mono voice:
-            // equal weight per channel).
+            // K-weight each channel, then combine per BS.1770's mean-square sum, averaged over
+            // channels so a voice reads the same mono or fanned to L+R.
             var kl = Float(shelfStateL.process(Double(l), shelfCoeffs))
             kl = Float(hpStateL.process(Double(kl), hpCoeffs))
-            var kr = Float(shelfStateR.process(Double(r), shelfCoeffs))
-            kr = Float(hpStateR.process(Double(kr), hpCoeffs))
-            let energy = Double(kl * kl + kr * kr) / Double(block.channels)
+            let energy: Float
+            if block.channels == 2 {
+                var kr = Float(shelfStateR.process(Double(r), shelfCoeffs))
+                kr = Float(hpStateR.process(Double(kr), hpCoeffs))
+                energy = 0.5 * (kl * kl + kr * kr)
+            } else {
+                energy = kl * kl
+            }
 
+            // Add exactly what the ring stores, so the running sum can't drift from it.
             let old = Double(windowBuffer[windowWrite])
-            windowBuffer[windowWrite] = Float(energy)
+            windowBuffer[windowWrite] = energy
             windowWrite = (windowWrite + 1) % windowFrames
-            windowSum = fxFlush(windowSum - old + energy)
+            windowSum = max(0, fxFlush(windowSum - old + Double(energy)))
             if windowFilled < windowFrames { windowFilled += 1 }
 
             let meanSquare = windowSum / Double(max(windowFilled, 1))
