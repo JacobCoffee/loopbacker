@@ -67,22 +67,48 @@ struct RuleEngineTests {
     func manualOverrideResume() {
         let rules = [rule("Zoom", .appLaunched(bundleID: "com.zoom.xos", appName: "Zoom"), scene: "Call")]
         let paused = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"])
+        let pausedRuleID = RuleEngine.resolve(rules: rules, signals: paused)?.id
 
         // Identical signals: never resume.
-        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: paused, rules: rules))
+        #expect(!RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: paused, rules: rules))
 
         // Cmd-tabbing back to an app that was already running (frontmost changes, but the
         // resolved rule doesn't) must not override the user's manual pick.
         let frontmostChanged = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"], frontmostBundleID: "com.zoom.xos")
-        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: frontmostChanged, rules: rules))
+        #expect(!RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: frontmostChanged, rules: rules))
 
         // An unrelated device connecting (no rule references it) must not resume either.
         let unrelatedDevice = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"], connectedDeviceUIDs: ["unrelated-uid"])
-        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: unrelatedDevice, rules: rules))
+        #expect(!RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: unrelatedDevice, rules: rules))
 
         // Zoom quitting changes which rule resolves (Zoom rule -> nil): must resume.
         let zoomQuit = RuleEngine.Signals(runningBundleIDs: [])
-        #expect(RuleEngine.shouldResume(pausedSignals: paused, currentSignals: zoomQuit, rules: rules))
+        #expect(RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: zoomQuit, rules: rules))
+    }
+
+    @Test("Disabling or deleting the triggering rule while paused still resumes once its condition goes away")
+    func resumeAfterTriggeringRuleEditedWhilePaused() {
+        var zoomRule = rule("Zoom", .appLaunched(bundleID: "com.zoom.xos", appName: "Zoom"), scene: "Call")
+        var rules = [zoomRule]
+        let paused = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"])
+        // Captured once at pause time, as the real caller does -- not recomputed later against
+        // a rule list that may have since changed.
+        let pausedRuleID = RuleEngine.resolve(rules: rules, signals: paused)?.id
+        #expect(pausedRuleID == zoomRule.id)
+
+        // Disable the triggering rule while paused: both `resolve(pausedSignals)` and
+        // `resolve(currentSignals)` against the live (mutated) rule list would now return nil,
+        // so a naive re-resolve-both-sides comparison would never resume. The captured id must
+        // still differ from the new (nil) resolution once Zoom quits.
+        zoomRule.isEnabled = false
+        rules = [zoomRule]
+        let stillRunning = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"])
+        #expect(RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: stillRunning, rules: rules))
+
+        // Deleting the rule entirely while paused: current resolution is nil against an empty
+        // list too, and must still differ from the captured id.
+        rules = []
+        #expect(RuleEngine.shouldResume(pausedRuleID: pausedRuleID, currentSignals: stillRunning, rules: rules))
     }
 }
 

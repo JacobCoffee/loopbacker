@@ -75,8 +75,9 @@ final class AutomationRulesEngine: ObservableObject {
         let signals = currentSignals
 
         if rulesState.isPaused {
-            guard let paused = rulesState.pausedSignals,
-                  RuleEngine.shouldResume(pausedSignals: paused, currentSignals: signals, rules: rulesState.rules) else {
+            guard RuleEngine.shouldResume(
+                pausedRuleID: rulesState.pausedResolvedRuleID, currentSignals: signals, rules: rulesState.rules
+            ) else {
                 return
             }
             rulesState.resume()
@@ -100,9 +101,10 @@ final class AutomationRulesEngine: ObservableObject {
     }
 
     /// Called when the user manually loads a scene from the Scenes UI: pauses automation until
-    /// the signals that were true at pause time change.
+    /// the rule that resolves differs from whichever rule (if any) was active at pause time.
     func pauseForManualSelection(sceneName: String) {
-        rulesState.pauseForManualSelection(signals: currentSignals)
+        let resolvedID = RuleEngine.resolve(rules: rulesState.rules, signals: currentSignals)?.id
+        rulesState.pauseForManualSelection(resolvedRuleID: resolvedID)
         activeRule = nil
         lastAppliedSceneName = sceneName
     }

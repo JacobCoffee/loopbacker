@@ -27,13 +27,15 @@ enum RuleEngine {
         rules.first { $0.isEnabled && matches($0.trigger, signals: signals) }
     }
 
-    /// Whether a rules engine paused for manual scene selection should resume: true once which
-    /// rule (if any) would now resolve differs from the one that would have resolved at pause
-    /// time. Comparing resolved identity (not raw signal equality) means an unrelated signal
-    /// change -- cmd-tabbing back to an app that was already running, a device unrelated to any
-    /// rule connecting -- doesn't override the user's manual pick.
-    static func shouldResume(pausedSignals: Signals, currentSignals: Signals, rules: [AutomationRule]) -> Bool {
-        resolve(rules: rules, signals: pausedSignals)?.id != resolve(rules: rules, signals: currentSignals)?.id
+    /// Whether a rules engine paused for manual scene selection should resume: true once the
+    /// rule that resolves now differs from `pausedRuleID` (the rule, if any, that was active at
+    /// pause time, captured once by the caller rather than re-resolved here). Comparing against
+    /// a captured id -- not re-running `resolve` against the paused signals and the CURRENT rule
+    /// list -- means editing, disabling, or deleting the triggering rule while paused still
+    /// resumes correctly once its condition goes away, instead of both sides resolving to nil
+    /// and getting stuck paused forever (persisted across relaunch).
+    static func shouldResume(pausedRuleID: UUID?, currentSignals: Signals, rules: [AutomationRule]) -> Bool {
+        resolve(rules: rules, signals: currentSignals)?.id != pausedRuleID
     }
 }
 
