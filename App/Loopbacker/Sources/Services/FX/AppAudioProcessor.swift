@@ -15,6 +15,10 @@ final class AppAudioProcessor: @unchecked Sendable {
         var duckAmountDB: Float = -12
         var duckAttackMs: Float = 40
         var duckReleaseMs: Float = 600
+        /// What counts as "someone's talking" for ducking: the user's own mic, far-end call
+        /// voices (`CallVoiceBus`, published by `CallAudioMonitor`), or both. Default
+        /// `.myVoice` is the original (only) behavior.
+        var trigger: CallDuckTrigger = .myVoice
         var levelerEnabled = false
         var levelerTarget: Float = -20
     }
@@ -29,6 +33,10 @@ final class AppAudioProcessor: @unchecked Sendable {
     private let duckAmountDBBits = Atomic<UInt32>(Float(-12).bitPattern)
     private let duckAttackMsBits = Atomic<UInt32>(Float(40).bitPattern)
     private let duckReleaseMsBits = Atomic<UInt32>(Float(600).bitPattern)
+    /// `CallDuckTrigger.rawValue` is a `String`, not a fixed-width type an `Atomic` can hold
+    /// lock-free; stored as a small explicit code instead (`triggerCode`/`trigger(forCode:)`
+    /// below), not relying on `allCases` order.
+    private let triggerCodeBits = Atomic<UInt8>(0)
     private let levelerEnabledBits = Atomic<Bool>(false)
 
     // IO thread only.
@@ -56,9 +64,26 @@ final class AppAudioProcessor: @unchecked Sendable {
         duckAmountDBBits.store(newValue.duckAmountDB.bitPattern, ordering: .relaxed)
         duckAttackMsBits.store(newValue.duckAttackMs.bitPattern, ordering: .relaxed)
         duckReleaseMsBits.store(newValue.duckReleaseMs.bitPattern, ordering: .relaxed)
+        triggerCodeBits.store(Self.triggerCode(newValue.trigger), ordering: .relaxed)
         levelerEnabledBits.store(newValue.levelerEnabled, ordering: .relaxed)
         if let targetIndex = leveler.index(ofParam: "target") {
             leveler.params.set(targetIndex, newValue.levelerTarget)
+        }
+    }
+
+    private static func triggerCode(_ trigger: CallDuckTrigger) -> UInt8 {
+        switch trigger {
+        case .myVoice: 0
+        case .callVoices: 1
+        case .both: 2
+        }
+    }
+
+    private static func trigger(forCode code: UInt8) -> CallDuckTrigger {
+        switch code {
+        case 1: .callVoices
+        case 2: .both
+        default: .myVoice
         }
     }
 
@@ -79,6 +104,7 @@ final class AppAudioProcessor: @unchecked Sendable {
             duckAmountDB: Float(bitPattern: duckAmountDBBits.load(ordering: .relaxed)),
             duckAttackMs: Float(bitPattern: duckAttackMsBits.load(ordering: .relaxed)),
             duckReleaseMs: Float(bitPattern: duckReleaseMsBits.load(ordering: .relaxed)),
+            trigger: Self.trigger(forCode: triggerCodeBits.load(ordering: .relaxed)),
             levelerEnabled: levelerEnabled
         )
 
@@ -93,14 +119,16 @@ final class AppAudioProcessor: @unchecked Sendable {
 
     private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames: Int, stride: Int,
                               cfg: (duckingEnabled: Bool, duckAmountDB: Float, duckAttackMs: Float,
-                                    duckReleaseMs: Float, levelerEnabled: Bool)) {
+                                    duckReleaseMs: Float, trigger: CallDuckTrigger, levelerEnabled: Bool)) {
         let mono = FXBlockIO.deinterleave(buf, frames: frames, stride: stride, left: leftScratch, right: rightScratch)
 
         if cfg.duckingEnabled {
             let attackC = fxTimeCoeff(ms: cfg.duckAttackMs, sampleRate: sampleRate)
             let releaseC = fxTimeCoeff(ms: cfg.duckReleaseMs, sampleRate: sampleRate)
             let duckedGain = fxDBToLinear(cfg.duckAmountDB)
-            let target: Float = VoiceBus.probability() > 0.5 ? duckedGain : 1
+            let userTalking = cfg.trigger.dependsOnMyVoice && VoiceBus.probability() > 0.5
+            let callTalking = cfg.trigger.dependsOnCallVoices && CallVoiceBus.isTalking()
+            let target: Float = (userTalking || callTalking) ? duckedGain : 1
             for i in 0..<frames {
                 let c = target < duckGain ? attackC : releaseC
                 duckGain = target + c * (duckGain - target)
@@ -108,6 +136,8 @@ final class AppAudioProcessor: @unchecked Sendable {
                 rightScratch[i] = mono ? leftScratch[i] : rightScratch[i] * duckGain
             }
         }
+
+
 
         if cfg.levelerEnabled {
             let sidechain = FXSidechain(voiceProbability: 1)

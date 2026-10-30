@@ -97,4 +97,85 @@ struct AppAudioProcessorTests {
         }
         #expect(abs(finalGain - 0.5) < 0.01)
     }
+
+    @Test("Default trigger (myVoice) ignores CallVoiceBus entirely -- unchanged old behavior")
+    func defaultTriggerIgnoresCallVoiceBus() {
+        let processor = AppAudioProcessor(sampleRate: Self.sampleRate)
+        processor.updateConfig(.init(duckingEnabled: true, duckAmountDB: -12, duckAttackMs: 1, duckReleaseMs: 1,
+                                     levelerEnabled: false)) // trigger defaults to .myVoice
+        CallVoiceBus.update(level: 1, talking: true)
+        defer { CallVoiceBus.update(level: 0, talking: false) }
+
+        // VoiceBus is a process-wide singleton other suites' real FXChains also publish to (see
+        // `duckingReleases` above) -- retry the settle-and-verify step, same reasoning, bounded
+        // so a genuine regression (far-end "talking" ducking the default trigger) still fails.
+        var finalGain: Float = -1
+        for _ in 0..<50 {
+            var attempts = 0
+            while VoiceBus.probability() > 0.1, attempts < 2000 {
+                VoiceBus.update(0)
+                attempts += 1
+            }
+            let frames = 4800
+            var buffer = [Float](repeating: 0.5, count: frames * 2)
+            buffer.withUnsafeMutableBufferPointer { ptr in
+                processor.process(ptr.baseAddress!, frames: frames, stride: 2)
+            }
+            finalGain = buffer[(frames - 1) * 2]
+            if abs(finalGain - 0.5) < 0.01 { break }
+        }
+        // Far-end "talking" alone must not duck when the trigger is still the default.
+        #expect(abs(finalGain - 0.5) < 0.01)
+    }
+
+    @Test(".callVoices trigger ducks on CallVoiceBus even while VoiceBus is silent")
+    func callVoicesTriggerDucksOnFarEndTalking() {
+        let processor = AppAudioProcessor(sampleRate: Self.sampleRate)
+        processor.updateConfig(.init(duckingEnabled: true, duckAmountDB: -12, duckAttackMs: 1, duckReleaseMs: 600,
+                                     trigger: .callVoices, levelerEnabled: false))
+        VoiceBus.update(0)
+        CallVoiceBus.update(level: 1, talking: true)
+        defer { CallVoiceBus.update(level: 0, talking: false) }
+
+        let frames = 4800
+        var buffer = [Float](repeating: 0.5, count: frames * 2)
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            processor.process(ptr.baseAddress!, frames: frames, stride: 2)
+        }
+        #expect(abs(buffer[(frames - 1) * 2] - 0.5 * fxDBToLinear(-12)) < 0.01)
+    }
+
+    @Test(".callVoices trigger does not duck on VoiceBus (user talking) alone")
+    func callVoicesTriggerIgnoresMyVoice() {
+        let processor = AppAudioProcessor(sampleRate: Self.sampleRate)
+        processor.updateConfig(.init(duckingEnabled: true, duckAmountDB: -12, duckAttackMs: 1, duckReleaseMs: 600,
+                                     trigger: .callVoices, levelerEnabled: false))
+        CallVoiceBus.update(level: 0, talking: false)
+        VoiceBus.update(1)
+        defer { VoiceBus.update(0) }
+
+        let frames = 4800
+        var buffer = [Float](repeating: 0.5, count: frames * 2)
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            processor.process(ptr.baseAddress!, frames: frames, stride: 2)
+        }
+        #expect(abs(buffer[(frames - 1) * 2] - 0.5) < 0.01)
+    }
+
+    @Test(".both trigger ducks on either VoiceBus or CallVoiceBus alone")
+    func bothTriggerDucksOnEither() {
+        let processor = AppAudioProcessor(sampleRate: Self.sampleRate)
+        processor.updateConfig(.init(duckingEnabled: true, duckAmountDB: -12, duckAttackMs: 1, duckReleaseMs: 600,
+                                     trigger: .both, levelerEnabled: false))
+        VoiceBus.update(0)
+        CallVoiceBus.update(level: 1, talking: true)
+        defer { CallVoiceBus.update(level: 0, talking: false) }
+
+        let frames = 4800
+        var buffer = [Float](repeating: 0.5, count: frames * 2)
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            processor.process(ptr.baseAddress!, frames: frames, stride: 2)
+        }
+        #expect(abs(buffer[(frames - 1) * 2] - 0.5 * fxDBToLinear(-12)) < 0.01)
+    }
 }

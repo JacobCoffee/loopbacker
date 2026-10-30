@@ -116,6 +116,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// signature; see `ProcessingGroupKey`), mirrored into `fxChainsSnapshot` for cross-thread
     /// reads (`FXEngine`). Queue only.
     private var fxChainsByDevice: [ProcessingGroupKey: FXChain] = [:]
+    /// "Duck what I hear" triggers on the user's voice too, so mic VAD must run. Queue only.
+    private var listenDuckNeedsMyVoice = false
     private let fxChainsLock = NSLock()
     private var fxChainsSnapshot: [ProcessingGroupKey: FXChain] = [:]
     private let queue = DispatchQueue(label: "com.jacobcoffee.loopbacker.audiorouter", qos: .userInteractive)
@@ -741,6 +743,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 duckAmountDB: self.currentEffectsPreset.appAudio.duckAmountDB,
                 duckAttackMs: self.currentEffectsPreset.appAudio.duckAttackMs,
                 duckReleaseMs: self.currentEffectsPreset.appAudio.duckReleaseMs,
+                trigger: self.currentEffectsPreset.appAudio.trigger,
                 levelerEnabled: self.currentEffectsPreset.appAudio.levelerEnabled,
                 levelerTarget: self.currentEffectsPreset.appAudio.levelerTarget))
 
@@ -903,14 +906,31 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             let nodes = preset.nodes
             for chain in self.fxChainsByDevice.values {
                 chain.setMasterEnabled(preset.isEnabled)
-                chain.setDetectVoiceWhileOff(preset.appAudio.duckingEnabled)
+                chain.setDetectVoiceWhileOff(self.needsVoiceWhileOff(preset))
                 Task { await chain.updateConfigs(nodes) }
             }
             let appConfig = AppAudioProcessor.Config(
                 duckingEnabled: preset.appAudio.duckingEnabled, duckAmountDB: preset.appAudio.duckAmountDB,
                 duckAttackMs: preset.appAudio.duckAttackMs, duckReleaseMs: preset.appAudio.duckReleaseMs,
+                trigger: preset.appAudio.trigger,
                 levelerEnabled: preset.appAudio.levelerEnabled, levelerTarget: preset.appAudio.levelerTarget)
             for ctx in self.activeRoutes.values { ctx.appAudioProcessor?.updateConfig(appConfig) }
+        }
+    }
+
+    /// Must run on `queue`. Mic voice detection has to keep running while effects are off
+    /// whenever something ducks on "my voice": app-audio ducking, or "Duck what I hear".
+    private func needsVoiceWhileOff(_ preset: EffectsPreset) -> Bool {
+        (preset.appAudio.duckingEnabled && preset.appAudio.trigger != .callVoices) || listenDuckNeedsMyVoice
+    }
+
+    /// "Duck what I hear" reads `VoiceBus`, which only updates while some voice chain runs VAD.
+    func setListenDuckNeedsMyVoice(_ needed: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.listenDuckNeedsMyVoice != needed else { return }
+            self.listenDuckNeedsMyVoice = needed
+            let detect = self.needsVoiceWhileOff(self.currentEffectsPreset)
+            for chain in self.fxChainsByDevice.values { chain.setDetectVoiceWhileOff(detect) }
         }
     }
 
@@ -939,7 +959,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         }
         let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
         chain.setMasterEnabled(currentEffectsPreset.isEnabled)
-        chain.setDetectVoiceWhileOff(currentEffectsPreset.appAudio.duckingEnabled)
+        chain.setDetectVoiceWhileOff(needsVoiceWhileOff(currentEffectsPreset))
         ctx.attachFXChain(chain)
         ctx.fxGroupKey = key
         fxChainsByDevice[key] = chain

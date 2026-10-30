@@ -2,20 +2,60 @@ import Foundation
 
 // MARK: - App-capture processing
 
+/// What makes `AppAudioFX` duck app-capture audio: the user's own mic (original, default
+/// behavior -- existing presets decode to this unchanged), the far-end voices of people in a
+/// call (`CallVoiceBus`, published by `CallAudioMonitor`), or both. Shared with
+/// `ListenDuckSettings` (Part B, "duck what I hear"), whose picker only ever shows
+/// `.callVoices`/`.both` since ducking your own output while nobody else is talking has no
+/// use case there.
+enum CallDuckTrigger: String, Codable, CaseIterable, Sendable {
+    case myVoice
+    case callVoices
+    case both
+
+    var dependsOnMyVoice: Bool { self == .myVoice || self == .both }
+    var dependsOnCallVoices: Bool { self == .callVoices || self == .both }
+}
+
 /// Ducking and leveling applied to app-capture routes (game, music, browser), separate from the
 /// voice chain's `nodes`: app captures never run the voice chain (see
 /// `RouteContext.isVoiceInput`). Owned by `AppAudioProcessor` on each app-capture route.
 struct AppAudioFX: Codable, Equatable {
     var duckingEnabled = false
-    /// How far app audio is pulled down while you're talking.
+    /// How far app audio is pulled down while the trigger is active.
     var duckAmountDB: Float = -12
     var duckAttackMs: Float = 40
     var duckReleaseMs: Float = 600
+    /// What counts as "someone's talking": the user's own mic (default, matches every preset
+    /// saved before this existed), far-end call voices, or both. `CallDuckTrigger.myVoice` is
+    /// exactly the old (only) behavior, so old presets and the factory presets below are
+    /// unaffected until a user opts in.
+    var trigger: CallDuckTrigger = .myVoice
     var levelerEnabled = false
     /// Target loudness (LUFS) the leveler holds app audio at.
     var levelerTarget: Float = -20
 
     static let duckAmountRange: ClosedRange<Float> = -30...0
+
+    private enum CodingKeys: String, CodingKey {
+        case duckingEnabled, duckAmountDB, duckAttackMs, duckReleaseMs, trigger, levelerEnabled, levelerTarget
+    }
+
+    init() {}
+
+    /// Tolerant decode: `trigger` didn't exist before this feature, so any JSON saved earlier
+    /// (or by an older build re-importing a preset) is missing the key entirely. Falls back to
+    /// `.myVoice`, preserving the exact ducking behavior those presets had.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        duckingEnabled = (try? c.decode(Bool.self, forKey: .duckingEnabled)) ?? false
+        duckAmountDB = (try? c.decode(Float.self, forKey: .duckAmountDB)) ?? -12
+        duckAttackMs = (try? c.decode(Float.self, forKey: .duckAttackMs)) ?? 40
+        duckReleaseMs = (try? c.decode(Float.self, forKey: .duckReleaseMs)) ?? 600
+        trigger = (try? c.decode(CallDuckTrigger.self, forKey: .trigger)) ?? .myVoice
+        levelerEnabled = (try? c.decode(Bool.self, forKey: .levelerEnabled)) ?? false
+        levelerTarget = (try? c.decode(Float.self, forKey: .levelerTarget)) ?? -20
+    }
 }
 
 // MARK: - Effects Preset (v2: an ordered node graph)

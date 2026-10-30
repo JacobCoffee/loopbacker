@@ -883,6 +883,101 @@ turned on and not opted out (`AudioSource.echoCancellation`).
 Runs upstream of the voice `FXChain` in the capture pipeline (noise suppression → echo
 cancellation → effects chain → mic gate), independent of it.
 
+## Call-Aware Ducking
+
+Two independent features share one far-end detector: Part A ducks app audio *feeding the
+virtual mic* while people in a call are talking (in addition to the existing while-you're-
+talking trigger); Part B, "Duck what I hear", ducks apps like Spotify on the *user's own
+output* while a call is live. Neither is on by default; both require System Audio Recording
+permission the first time they're turned on, same TCC gate as Echo Cancellation.
+
+### Far-end detection: `CallAudioMonitor`
+
+`CallAudioMonitor` (`Services/Comms/CallAudioMonitor.swift`) taps only the running call apps'
+own audio -- never a global or device-scoped tap, unlike `SystemAudioTap` -- so a Spotify track
+playing at the same time as a call never reads as "the call is talking".
+
+- **Scoping.** `CATapDescription.bundleIDs` (macOS 26+) names processes by bundle ID directly,
+  skipping PID-to-`AudioObjectID` translation. The set is `CallAppAdviceCatalog`'s fixed catalog
+  (Zoom, Discord, Teams, Slack) plus any bundle IDs the user added in settings
+  (`CallDuckSettings.extraCallAppBundleIDs`) -- browsers are excluded from the catalog since a
+  tab running a web call can't be told apart from any other tab, so one only becomes a far-end
+  source once the user explicitly adds it. `processRestoreEnabled` lets the tap survive a
+  listed app quitting and relaunching without a rebuild; a *new* call app starting triggers one
+  via `NSWorkspace.didLaunchApplicationNotification`/`didTerminateApplicationNotification`.
+  Mono mixdown, no sample-rate conversion to a fixed reference (unlike `SystemAudioTap`, which
+  feeds AEC3 a precisely-timed reference) -- only a VAD decision is needed, not the waveform.
+- **Detection.** The IOProc (`callAudioMonitorIOProc`) runs `VoiceActivityDetector` (the same
+  RNNoise-based detector `FXChain`'s gate uses) on each hop, then feeds the raw probability
+  through `CallVoiceHysteresis`, a pure value type: a one-pole smoothing filter, an immediate
+  attack past 0.6, and a 500 ms hold below 0.3 before releasing -- a Schmitt-trigger gap plus
+  hold so "someone's talking" doesn't flutter on a word boundary or a single noisy frame.
+  Published to `CallVoiceBus` (`level()`/`isTalking()`), the far-end equivalent of `VoiceBus`.
+- **Demand.** `RoutingSync` starts/stops the monitor based on whether any feature currently
+  reads `CallVoiceBus` (Part A's trigger set to call voices/both on the active preset, or Part B
+  enabled) -- same reasoning as `SystemAudioTap`: the tap costs a coreaudiod round trip and a
+  TCC-gated process tap, so it shouldn't run with nothing consuming its signal.
+- **Thread contract.** `start`/`stop`/`rebuild` run on the main actor. The IOProc touches only
+  `IOContext`'s raw pointers/atomics and the `VoiceActivityDetector` via `Unmanaged.fromOpaque`
+  (no retain/release) -- no allocation, locks, or other Swift reference counting.
+
+### Part A: trigger choice
+
+`AppAudioFX.trigger` (`CallDuckTrigger`: `.myVoice`/`.callVoices`/`.both`) selects what
+`AppAudioProcessor` ducks on, read alongside the existing duck amount/attack/release. Default
+`.myVoice` is byte-for-byte the original (only) behavior; decoding is per-field tolerant
+(`AppAudioFX.init(from:)`), so every preset saved before this feature existed, and the factory
+presets, are unaffected. `AppAudioProcessor.processChunk` combines `VoiceBus.probability() >
+0.5` and `CallVoiceBus.isTalking()` per the trigger, otherwise unchanged from before.
+
+### Part B: `ListenDucker` ("Duck what I hear")
+
+`ListenDucker` (`Services/FX/ListenDucker.swift`) taps the user-selected apps
+(`CallDuckSettings.listenDuckBundleIDs`, global, not per-preset -- what the user hears doesn't
+depend on which voice preset is active) with `muteBehavior = .mutedWhenTapped`, then replays
+them to the current default output through a private aggregate device combining the tap with
+that output device as a sub-device (`kAudioAggregateDeviceSubDeviceListKey` +
+`kAudioAggregateDeviceTapListKey`, unlike `SystemAudioTap`'s tap-only aggregate, which never
+needs to drive real hardware).
+
+- **Mute/replay.** The instant Loopbacker reads a `mutedWhenTapped` tap, the tapped apps go
+  silent on the real device; this class's whole replay path exists to put their audio back,
+  gain-controlled. Stopping the tap (disabled, app removed from the set, default output
+  changed, or the process exiting) hands playback back to the real device automatically --
+  coreaudiod enforces the mute as a property of the tap being *read*, not something
+  `ListenDucker` tracks or must restore itself, so a crash can't leave it stuck muted.
+- **Gain.** `ListenDuckGainRamp`, a pure value type, ramps per-sample toward either 1 (full
+  volume) or the configured ducked linear gain over a fixed ~10 ms one-pole time constant --
+  long enough to avoid a zipper/click, short enough to feel responsive. The IOProc
+  (`listenDuckerIOProc`) copies the tap's input into the aggregate's output through this ramp;
+  the trigger (far-end call voices, optionally also the user's own mic --
+  `CallDuckTrigger.callVoices`/`.both`, the same type Part A uses) is evaluated from
+  `CallVoiceBus`/`VoiceBus` every callback.
+- **App-set sanitizing.** `ListenDucker.sanitizedBundleIDs` strips Loopbacker's own bundle ID
+  and anything currently counted as a call app (catalog + `extraCallAppBundleIDs`) from the
+  requested set before a tap is ever built -- ducking a call app on the user's own output would
+  duck the call itself.
+- **Default output tracking.** A `kAudioHardwarePropertyDefaultOutputDevice` listener (same
+  pattern as `SystemAudioTap`'s) rebuilds the aggregate when the default output changes (e.g.
+  headphones plugged in); if there's no physical default output, or it's one of Loopbacker's
+  own virtual devices, the state is `.noPhysicalOutput` and nothing taps until it changes back.
+- **Added latency.** Replaying through an aggregate device's own IOProc round-trip adds roughly
+  one IO buffer's worth of latency versus the app rendering straight to the output device --
+  the same order of magnitude as the output latency `AudioRouter.estimateStreamDelayMs` already
+  accounts for elsewhere, plus the tap's own capture-to-delivery delay. Not independently
+  benchmarked (no physical device in this harness); a ducked app's audio lands slightly later
+  than before Part B existed, by design, not a bug.
+- **Thread contract.** Same as `CallAudioMonitor`/`SystemAudioTap`: lifecycle on the main actor,
+  the IOProc touches only raw pointers/atomics/the preallocated `ListenDuckGainRamp`.
+
+### Known limitation
+
+A call running inside a browser tab (Google Meet, Webex, FaceTime Web) can't be distinguished
+from any other audio that browser plays -- there's no per-tab audio API this taps into. The
+user can mark the whole browser as "this is a call" in settings, but that then means a *music*
+tab in the same browser also counts as far-end speech, and the browser itself can no longer be
+picked as a "Duck what I hear" target (see `ListenDucker.sanitizedBundleIDs` above).
+
 ## Scenes and Routing
 
 Scenes save/load a full `RoutingConfig` (sources, routes, output destinations, effects preset,

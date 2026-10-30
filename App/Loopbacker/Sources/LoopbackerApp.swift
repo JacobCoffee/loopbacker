@@ -23,8 +23,10 @@ struct LoopbackerApp: App {
     @StateObject private var presetAutoSwitcher: PresetAutoSwitcher
     @StateObject private var appUpdater: AppUpdater
     @StateObject private var automationRulesState: AutomationRulesState
-    // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
-    // routes start and menu-bar edits reach the engine even if the main window never opens.
+    // Call-ducking (far-end detection + "Duck what I hear"): global settings and the two
+    // engine pieces, same ownership pattern as `systemAudioTap` below -- constructed here so
+    // they live for the app's whole lifetime even if the main window never opens.
+    @StateObject private var callDuckSettings: CallDuckSettings
     @StateObject private var routingSync: RoutingSync
     // Applies scenes as a diff against the running config, shared with the automation engine
     // and the Scenes UI.
@@ -39,6 +41,9 @@ struct LoopbackerApp: App {
         let audioRouter = AudioRouter()
         let appCaptureService = AppCaptureService()
         let systemAudioTap = SystemAudioTap()
+        let callAudioMonitor = CallAudioMonitor()
+        let listenDucker = ListenDucker()
+        let callDuckSettings = CallDuckSettings.load()
         let micControl = MicControl()
         let presetAutoSwitchState = PresetAutoSwitchState.load()
         let automationRulesState = AutomationRulesState.load()
@@ -66,12 +71,16 @@ struct LoopbackerApp: App {
         _appUpdater = StateObject(wrappedValue: AppUpdater.shared)
         _automationRulesState = StateObject(wrappedValue: automationRulesState)
         _sceneLoader = StateObject(wrappedValue: sceneLoader)
+        _callDuckSettings = StateObject(wrappedValue: callDuckSettings)
         _routingSync = StateObject(wrappedValue: RoutingSync(
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
             audioRouter: audioRouter,
             appCaptureService: appCaptureService,
-            systemAudioTap: systemAudioTap
+            systemAudioTap: systemAudioTap,
+            callAudioMonitor: callAudioMonitor,
+            listenDucker: listenDucker,
+            callDuckSettings: callDuckSettings
         ))
         ControlCenter.shared.configure(micControl: micControl, routingState: routingState, audioRouter: audioRouter)
         micControl.refreshHotkeyRegistration()
@@ -103,6 +112,9 @@ struct LoopbackerApp: App {
                 .environmentObject(fxEngine)
                 .environmentObject(hostedPluginStateCapture)
                 .environmentObject(routingSync.systemAudioTap)
+                .environmentObject(routingSync.callAudioMonitor)
+                .environmentObject(routingSync.listenDucker)
+                .environmentObject(callDuckSettings)
                 .environmentObject(micControl)
                 .environmentObject(presetAutoSwitchState)
                 .environmentObject(presetAutoSwitcher)
