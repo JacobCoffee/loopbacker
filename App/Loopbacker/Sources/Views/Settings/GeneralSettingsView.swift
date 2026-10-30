@@ -1,13 +1,14 @@
 import SwiftUI
 
 /// General settings: launch-at-login (reusing `LoginItem`, already surfaced in the menu bar
-/// panel/toolbar), the Airwindows plugin library toggle, and the muted overlay's visibility and
-/// screen corner.
+/// panel/toolbar), the Airwindows plugin library toggle, the `loopbacker://` URL command
+/// opt-in, and the muted overlay's visibility and screen corner.
 struct GeneralSettingsView: View {
     @EnvironmentObject var micControl: MicControl
     @ObservedObject private var loginItem = LoginItem.shared
 
     @AppStorage("AirwindowsLibrary.isEnabled") private var airwindowsEnabled = true
+    @AppStorage("Automation.allowURLCommands") private var allowURLCommands = false
     @AppStorage("MutedOverlay.isEnabled") private var overlayEnabled = true
     @AppStorage("MutedOverlay.corner") private var overlayCornerRaw = MutedOverlayCorner.bottomTrailing.rawValue
 
@@ -40,6 +41,20 @@ struct GeneralSettingsView: View {
             Section("Plugins") {
                 Toggle("Show Airwindows Effects", isOn: $airwindowsEnabled)
                     .help("Airwindows adds ~500 free effects to the plugin browser; turn off to declutter it")
+            }
+
+            Section("Remote Control") {
+                Toggle("Allow Other Apps to Control Loopbacker", isOn: $allowURLCommands)
+                    .help(
+                        "Lets other apps and web pages send loopbacker:// commands (unmute, change effects, "
+                        + "apply presets, load scenes). Off by default; muting the mic always works either way."
+                    )
+                Text(
+                    "Shortcuts/Siri actions aren't affected by this — running one is already something you "
+                    + "chose to do."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section("Muted Overlay") {

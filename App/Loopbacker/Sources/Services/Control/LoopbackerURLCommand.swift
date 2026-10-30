@@ -51,6 +51,25 @@ enum LoopbackerURLCommand: Equatable {
         }
     }
 }
+/// Settings › General → "Allow other apps to control Loopbacker" (default off). Any local
+/// process (`open loopbacker://unmute`), or a web page after one browser confirmation (which
+/// Chrome can remember), could otherwise silently unmute the live mic, change effects, or —
+/// via a factory preset that recommends echo cancellation — start system-wide output capture
+/// with no TCC grant of its own (LB-URL-001). `mute` is always allowed regardless of this
+/// setting: muting the mic can't itself leak anything.
+///
+/// App Intents (`Intents/`) are deliberately NOT gated by this setting: a Shortcut only runs
+/// when the user (or an automation they configured) explicitly invokes it through the Shortcuts
+/// app, Siri, or a Shortcuts automation — that invocation is its own consent gate, unlike an
+/// arbitrary `open` or an embedded web page link.
+enum LoopbackerURLSettings {
+    private static let allowKey = "Automation.allowURLCommands"
+
+    static var allowCommands: Bool {
+        get { UserDefaults.standard.object(forKey: allowKey) as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: allowKey) }
+    }
+}
 
 /// Dispatches parsed URL commands through `ControlCenter`. Separate from parsing so the pure
 /// parser stays trivially testable while this side carries the (untestable-without-the-app)
@@ -69,13 +88,29 @@ enum URLCommandRouter {
             urlCommandLogger.log("Ignoring unrecognized URL: \(url.absoluteString, privacy: .public)")
             return
         }
+        guard command == .mute || LoopbackerURLSettings.allowCommands else {
+            urlCommandLogger.log(
+                """
+                Ignoring URL command (\(String(describing: command), privacy: .public)): \
+                "Allow other apps to control Loopbacker" is off in Settings \u{203A} General
+                """
+            )
+            return
+        }
         switch command {
-        case .mute: ControlCenter.shared.setMuted(true)
-        case .unmute: ControlCenter.shared.setMuted(false)
-        case .toggleMute: ControlCenter.shared.toggleMute()
+        case .mute:
+            ControlCenter.shared.setMuted(true)
+        case .unmute:
+            ControlCenter.shared.setMuted(false)
+            MutedOverlayController.shared.showNotice("Mic unmuted by URL command")
+        case .toggleMute:
+            ControlCenter.shared.toggleMute()
         case .preset(let id):
+            let willEnableEcho = FactoryPresets.preset(id: id)?.echoCancellation == true
             if !ControlCenter.shared.applyPreset(id: id) {
                 urlCommandLogger.log("Ignoring URL preset command for unknown preset id '\(id, privacy: .public)'")
+            } else if willEnableEcho {
+                MutedOverlayController.shared.showNotice("Echo cancellation enabled by URL command")
             }
         case .scene(let name):
             if !ControlCenter.shared.loadScene(name: name) {
