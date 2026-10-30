@@ -19,11 +19,14 @@ private let aecLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category
 /// fills — the same buffering shape as `NoiseSuppressor`.
 ///
 /// Each hop also pulls `hop` frames of far-end reference from `reference` (a
-/// `DriftCompensatedRing` fed by `SystemAudioTap`'s IOProc) and feeds it to AEC3's
+/// `DriftCompensatedRing.Reader` bound to a `SystemAudioTap`'s ring) and feeds it to AEC3's
 /// `ProcessReverseStream` before running `ProcessStream` on the mic hop. Unlike MDF, AEC3
 /// estimates and tracks the render/capture delay itself (`set_stream_delay_ms` only supplies a
-/// starting point), so it isn't limited by `reference`'s own ring latency the way MDF was —
-/// AEC3 handles delays up to roughly 500 ms on its own.
+/// starting point), so it isn't limited by the reference ring's own latency the way MDF was —
+/// AEC3 handles delays up to roughly 500 ms on its own. Each `EchoCanceller` owns its own
+/// `Reader` (via `DriftCompensatedRing.makeReader()`), so multiple cancellers on different
+/// capture devices reading the same `SystemAudioTap.ring` each track that far-end timeline
+/// independently instead of racing one shared cursor.
 ///
 /// Double-talk (simultaneous far-end echo + near-end speech) note: AEC3's suppressor is more
 /// aggressive than MDF's was at suppressing near-end speech when the echo and near-end are
@@ -34,9 +37,9 @@ private let aecLogger = Logger(subsystem: "com.jacobcoffee.loopbacker", category
 /// table and what was tried.
 ///
 /// Thread contract:
-/// - `process` runs on the capture device's IO thread. It is the sole reader of `reference`
-///   (`DriftCompensatedRing`'s single-reader contract) and touches no Swift reference types
-///   other than itself; the per-hop calls into the shim's `webrtc_aec3_process_reverse_stream`/
+/// - `process` runs on the capture device's IO thread. It is the sole reader of its own
+///   `DriftCompensatedRing.Reader` and touches no Swift reference types other than itself; the
+///   per-hop calls into the shim's `webrtc_aec3_process_reverse_stream`/
 ///   `webrtc_aec3_process_stream` reach into `webrtc::AudioProcessing`'s steady-state
 ///   processing path, which (verified with an interposed malloc over 2000 process() calls)
 ///   does not allocate — all working buffers are sized at `webrtc_aec3_create`/`Initialize`
@@ -63,11 +66,18 @@ final class EchoCanceller: @unchecked Sendable {
     /// Declared latency: a hop must fill before any of it can be emitted.
     let latencySamples = EchoCanceller.hop - 1
 
-    private let reference: DriftCompensatedRing
+    private let reference: DriftCompensatedRing.Reader
     private let state: OpaquePointer
 
     private let enabled = Atomic<Bool>(false)
     private var wetGain: Float = 0
+    /// IO thread only: true once the FIFO has emitted real AEC3 output at least once since
+    /// construction or the last `reset()`. Before that, `fifo` still holds its startup
+    /// zero-fill over the first `hop - 1` reads (the declared `latencySamples`), so the
+    /// crossfade in `processChunk` must not start ramping toward wet yet -- blending toward
+    /// silence there would mute the live mic almost completely for ~10 ms on every attach,
+    /// then abruptly jump to real output once a hop actually lands.
+    private var primed = false
     private var hopFill = 0
     private var fifoRead = 0
     private var fifoWrite: Int
@@ -104,8 +114,9 @@ final class EchoCanceller: @unchecked Sendable {
     private let fifo: UnsafeMutablePointer<Float>
     private let cachedBlock: UnsafeMutablePointer<Float>
 
-    /// An echo canceller reading its far-end reference from `reference`, or nil (logged) if the
-    /// vendored AEC3 implementation can't be initialized.
+    /// An echo canceller reading its far-end reference from a new `Reader` on `reference`
+    /// (its own independent cursor -- see `DriftCompensatedRing`'s multi-reader doc comment),
+    /// or nil (logged) if the vendored AEC3 implementation can't be initialized.
     static func make(reference: DriftCompensatedRing) -> EchoCanceller? {
         guard reference.sampleRate == Double(Self.sampleRate) else {
             aecLogger.error("Echo cancellation needs a 48 kHz reference; tap runs at \(reference.sampleRate) Hz")
@@ -116,10 +127,10 @@ final class EchoCanceller: @unchecked Sendable {
             return nil
         }
         webrtc_aec3_set_stream_delay_ms(state, Self.initialDelayMs)
-        return EchoCanceller(reference: reference, state: state)
+        return EchoCanceller(reference: reference.makeReader(), channels: reference.channels, state: state)
     }
 
-    private init(reference: DriftCompensatedRing, state: OpaquePointer) {
+    private init(reference: DriftCompensatedRing.Reader, channels: Int, state: OpaquePointer) {
         self.reference = reference
         self.state = state
 
@@ -130,7 +141,7 @@ final class EchoCanceller: @unchecked Sendable {
         fifoWrite = lead
 
         func rounded(_ bytes: Int, to alignment: Int) -> Int { (bytes + alignment - 1) / alignment * alignment }
-        let refChannels = max(reference.channels, 1)
+        let refChannels = max(channels, 1)
         let floatCounts = [Self.hop, Self.hop, Self.hop * refChannels, fifoSize, Self.maxBlock]
         let total = rounded(
             floatCounts.reduce(0) { $0 + rounded($1 * MemoryLayout<Float>.size, to: 64) },
@@ -179,6 +190,7 @@ final class EchoCanceller: @unchecked Sendable {
         webrtc_aec3_set_stream_delay_ms(state, delay)
         appliedDelayMs = delay
         wetGain = 0
+        primed = false
         hopFill = 0
         fifoRead = 0
         fifoWrite = EchoCanceller.hop - 1
@@ -253,6 +265,7 @@ final class EchoCanceller: @unchecked Sendable {
     private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames n: Int) {
         let want = enabled.load(ordering: .relaxed)
         var g = wetGain
+        let lead = EchoCanceller.hop - 1
         for i in 0..<n {
             let dry = buf[i]
             hopIn[hopFill] = dry
@@ -261,10 +274,14 @@ final class EchoCanceller: @unchecked Sendable {
                 runHop()
                 hopFill = 0
             }
+            // The FIFO's first `lead` reads are still startup zero-fill (see `primed`'s doc
+            // comment); once `fifoRead` reaches `lead`, every subsequent read is genuine AEC3
+            // output.
+            if !primed, fifoRead >= lead { primed = true }
             let wet = fifo[fifoRead & fifoMask]
             fifoRead += 1
 
-            let target: Float = want ? 1 : 0
+            let target: Float = (want && primed) ? 1 : 0
             g = target > g ? min(target, g + Self.fadeStep) : max(target, g - Self.fadeStep)
             buf[i] = g * wet + (1 - g) * dry
         }
