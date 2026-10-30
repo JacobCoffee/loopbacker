@@ -22,17 +22,26 @@ struct NoiseSuppressionSettings: Codable, Equatable {
     /// How far noise may be pulled down. Easing off (e.g. -12 dB) keeps some room tone;
     /// -60 dB is effectively full removal.
     var maxReductionDB: Float = -60
+    /// Wave-2 interim stand-in for the Comms slice's contract addition
+    /// (`NoiseSuppressionSettings.echoCancellation: Bool`, decoded with a default of false for
+    /// old configs). The Presets slice needs it to compile `EffectsPresetLibrary.apply`, which
+    /// carries a `FactoryPreset`'s echo cancellation recommendation into routing state; the
+    /// integration owner should reconcile this with the Comms slice's own identical addition
+    /// (both add the same field with the same default) and keep whichever lands second.
+    var echoCancellation = false
 
     static let reductionRange: ClosedRange<Float> = -60 ... -6
 
-    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .fastenhancer, maxReductionDB: Float = -60) {
+    init(isEnabled: Bool = false, engine: NoiseSuppressionEngine = .fastenhancer, maxReductionDB: Float = -60,
+         echoCancellation: Bool = false) {
         self.isEnabled = isEnabled
         self.engine = engine
         self.maxReductionDB = maxReductionDB
+        self.echoCancellation = echoCancellation
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isEnabled, engine, maxReductionDB
+        case isEnabled, engine, maxReductionDB, echoCancellation
     }
 
     init(from decoder: Decoder) throws {
@@ -41,5 +50,6 @@ struct NoiseSuppressionSettings: Codable, Equatable {
         // Configs from before 4.4 have no engine key; DPDFNet was the only engine then.
         engine = (try? container.decode(NoiseSuppressionEngine.self, forKey: .engine)) ?? .dpdfnet
         maxReductionDB = (try? container.decode(Float.self, forKey: .maxReductionDB)) ?? -60
+        echoCancellation = (try? container.decode(Bool.self, forKey: .echoCancellation)) ?? false
     }
 }

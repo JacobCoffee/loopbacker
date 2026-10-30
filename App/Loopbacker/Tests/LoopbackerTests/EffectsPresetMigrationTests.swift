@@ -142,7 +142,7 @@ struct EffectsPresetMigrationTests {
 
     @Test("v2 JSON round-trips without re-migrating")
     func v2RoundTrip() throws {
-        let original = EffectsPreset.broadcastVoice
+        let original = EffectsPreset(isEnabled: true)
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(EffectsPreset.self, from: data)
         #expect(decoded == original)
