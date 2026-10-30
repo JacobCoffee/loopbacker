@@ -44,6 +44,7 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/RNNoise-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt $(APP_CONTENTS)/Resources/
+	cp App/Loopbacker/Resources/Airwindows-LICENSE.txt $(APP_CONTENTS)/Resources/
 	xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile $(APP_CONTENTS)/Resources \
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
