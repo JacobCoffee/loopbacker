@@ -32,7 +32,7 @@ struct OutputRoutingView: View {
                         EmptyStateView(
                             title: "No Output Routes",
                             message: "Click + to add an output route",
-                            symbol: "arrow.right.circle.dashed"
+                            symbol: "speaker.wave.2.circle"
                         )
                         .frame(maxWidth: .infinity)
                     }
