@@ -76,13 +76,25 @@ struct AppAudioProcessorTests {
         }
         #expect(abs(buffer[(4800 - 1) * 2] - 0.5 * fxDBToLinear(-12)) < 0.01)
 
-        // VoiceBus decays geometrically (×0.97) per update with no real floor until it goes
-        // stale; drive enough updates to pull it well under the ducking threshold.
-        for _ in 0..<80 { VoiceBus.update(0) }
-        var buffer2 = [Float](repeating: 0.5, count: 4800 * 2)
-        buffer2.withUnsafeMutableBufferPointer { ptr in
-            processor.process(ptr.baseAddress!, frames: 4800, stride: 2)
+        // VoiceBus is a process-wide singleton. Other suites run real `FXChain`s whose VAD
+        // (even the scaffolding stand-in) keeps calling `VoiceBus.update(1)` for as long as
+        // they're processing, so a single quiet-then-release attempt can be re-pinned mid-flight
+        // by a concurrently-running suite. Retry the whole settle-and-verify step until it
+        // succeeds (bounded, so a genuine regression still fails the test).
+        var finalGain: Float = -1
+        for _ in 0..<50 {
+            var attempts = 0
+            while VoiceBus.probability() > 0.1, attempts < 2000 {
+                VoiceBus.update(0)
+                attempts += 1
+            }
+            var buffer2 = [Float](repeating: 0.5, count: 4800 * 2)
+            buffer2.withUnsafeMutableBufferPointer { ptr in
+                processor.process(ptr.baseAddress!, frames: 4800, stride: 2)
+            }
+            finalGain = buffer2[(4800 - 1) * 2]
+            if abs(finalGain - 0.5) < 0.01 { break }
         }
-        #expect(abs(buffer2[(4800 - 1) * 2] - 0.5) < 0.01)
+        #expect(abs(finalGain - 0.5) < 0.01)
     }
 }

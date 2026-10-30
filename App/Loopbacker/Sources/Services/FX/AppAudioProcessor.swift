@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Ducking and leveling for an app-capture route (game, music, browser), run inline on that
 /// route's IO thread. Kept out of `FXChain`: app-capture routes never run the voice chain (see
@@ -20,8 +21,15 @@ final class AppAudioProcessor: @unchecked Sendable {
 
     private let sampleRate: Float
     private let leveler: LevelerNode
-    private let configLock = NSLock()
-    private var config = Config()
+
+    // Lock-free config, same pattern as `FXParamStore`: any thread writes a field, the IO
+    // thread reads every field at the top of each block. A torn read across fields lasts at
+    // most one block and is inaudible, matching the rest of the codebase's RT parameter contract.
+    private let duckingEnabledBits = Atomic<Bool>(false)
+    private let duckAmountDBBits = Atomic<UInt32>(Float(-12).bitPattern)
+    private let duckAttackMsBits = Atomic<UInt32>(Float(40).bitPattern)
+    private let duckReleaseMsBits = Atomic<UInt32>(Float(600).bitPattern)
+    private let levelerEnabledBits = Atomic<Bool>(false)
 
     // IO thread only.
     private var duckGain: Float = 1
@@ -44,9 +52,11 @@ final class AppAudioProcessor: @unchecked Sendable {
 
     /// Any thread.
     func updateConfig(_ newValue: Config) {
-        configLock.lock()
-        config = newValue
-        configLock.unlock()
+        duckingEnabledBits.store(newValue.duckingEnabled, ordering: .relaxed)
+        duckAmountDBBits.store(newValue.duckAmountDB.bitPattern, ordering: .relaxed)
+        duckAttackMsBits.store(newValue.duckAttackMs.bitPattern, ordering: .relaxed)
+        duckReleaseMsBits.store(newValue.duckReleaseMs.bitPattern, ordering: .relaxed)
+        levelerEnabledBits.store(newValue.levelerEnabled, ordering: .relaxed)
         if let targetIndex = leveler.index(ofParam: "target") {
             leveler.params.set(targetIndex, newValue.levelerTarget)
         }
@@ -56,10 +66,16 @@ final class AppAudioProcessor: @unchecked Sendable {
     /// (the voice-pair slots the virtual mic carries app audio in) are touched.
     func process(_ buffer: UnsafeMutablePointer<Float>, frames: Int, stride: Int) {
         guard frames > 0, stride > 0 else { return }
-        configLock.lock()
-        let cfg = config
-        configLock.unlock()
-        guard cfg.duckingEnabled || cfg.levelerEnabled else { return }
+        let duckingEnabled = duckingEnabledBits.load(ordering: .relaxed)
+        let levelerEnabled = levelerEnabledBits.load(ordering: .relaxed)
+        guard duckingEnabled || levelerEnabled else { return }
+        let cfg = (
+            duckingEnabled: duckingEnabled,
+            duckAmountDB: Float(bitPattern: duckAmountDBBits.load(ordering: .relaxed)),
+            duckAttackMs: Float(bitPattern: duckAttackMsBits.load(ordering: .relaxed)),
+            duckReleaseMs: Float(bitPattern: duckReleaseMsBits.load(ordering: .relaxed)),
+            levelerEnabled: levelerEnabled
+        )
 
         var offset = 0
         while offset < frames {
@@ -69,7 +85,9 @@ final class AppAudioProcessor: @unchecked Sendable {
         }
     }
 
-    private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames: Int, stride: Int, cfg: Config) {
+    private func processChunk(_ buf: UnsafeMutablePointer<Float>, frames: Int, stride: Int,
+                              cfg: (duckingEnabled: Bool, duckAmountDB: Float, duckAttackMs: Float,
+                                    duckReleaseMs: Float, levelerEnabled: Bool)) {
         let mono = FXBlockIO.deinterleave(buf, frames: frames, stride: stride, left: leftScratch, right: rightScratch)
 
         if cfg.duckingEnabled {

@@ -15,25 +15,44 @@ import Synchronization
 /// the kind and plugin didn't change, and loading hosted nodes before publishing), then publish
 /// it with one atomic pointer swap. The swap itself is declicked: the IO thread fades the
 /// outgoing graph's last block to silence, then fades the incoming graph in from silence over
-/// its first block. The outgoing graph is freed off the IO thread, once the IO thread has
-/// provably finished using it (`ChainGraph.retired`).
+/// its first block.
 ///
 /// Param-only edits (values, `enabled`, EQ bands) skip the rebuild entirely and push straight
 /// into the live instances' `FXParamStore` (and `EQNode.setBands`). Toggling a node's `enabled`
 /// still crossfades smoothly against a dry tap delayed by that node's own latency, so the
 /// overall chain latency never changes when a node is bypassed.
 ///
+/// ## Graph ownership
+/// `graphPtr` is a purely observational, non-owning `Unmanaged` pointer: the IO thread reads it
+/// with `takeUnretainedValue()` and never retains or releases through it. The single strong
+/// owner of every graph that hasn't been freed yet is `ownedGraphs`, guarded by `configLock` and
+/// touched only off the IO thread. A superseded graph is dropped from `ownedGraphs` -- and so
+/// deinited, off the IO thread, on a background utility queue/task -- only once the IO thread
+/// has observed the swap and marked the old graph `retired` (polled, with no timeout: if the IO
+/// proc stalls the poll simply keeps waiting) or once `ioStopped()` proves the IO proc can never
+/// touch it again. `ioStopped()` must be called by the owning router once every audio unit
+/// feeding this chain has actually stopped (not on a timer); `deinit` calls it too, so a chain
+/// that's simply dropped always frees its graphs off the IO thread rather than leaking.
+///
 /// Thread contract: `process` runs on the capture device's IO thread, one call at a time (a
-/// busy flag enforces this, matching `NoiseSuppressor`). `updateConfigs`, `liveNode`,
-/// `nodeLoadErrors`, `totalLatencySamples`, `captureHostedStates`, `setABBypass` and `record`
-/// may be called from any thread (the structural path hops to a background `Task`).
+/// busy flag enforces this, matching `NoiseSuppressor`) and never retains a `ChainGraph`.
+/// `updateConfigs` serializes through an internal actor, so concurrent calls (a slow hosted-plugin
+/// load racing a fast param edit) can't publish out of order: only the latest requested configs
+/// ever end up applied, and a build in flight when a newer request arrives is superseded rather
+/// than published. `liveNode`, `nodeLoadErrors`, `totalLatencySamples`, `captureHostedStates`,
+/// `setABBypass`, `ioStopped` and `record` may be called from any thread.
 final class FXChain: @unchecked Sendable {
     let sampleRate: Float
     let captureDeviceUID: String
 
-    /// 10 ms at 48 kHz, used for both the per-node bypass crossfade and the NoiseSuppressor-style
-    /// cache invalidation granularity.
+    /// 10 ms at 48 kHz, used for the per-node bypass crossfade, the A/B crossfade, and the
+    /// NoiseSuppressor-style cache invalidation granularity.
     private static let crossfadeStep: Float = 1.0 / 480.0
+    /// Capacity of the chain-level A/B dry delay ring: generous headroom (~340 ms) over any
+    /// realistic sum of built-in + hosted stage latencies, plus one block. If a graph's total
+    /// latency ever exceeded this, the A/B dry tap would wrap and read stale samples instead of
+    /// crashing (bounded by the `&` mask below); it's never resized at runtime (RT-safety).
+    private static let abDryCapacity = FXBlockIO.nextPowerOfTwo(atLeast: 16_384 + FXBlock.maxFrames)
 
     private let vad = VoiceActivityDetector()
     private let recorder: FXRecorder
@@ -43,12 +62,33 @@ final class FXChain: @unchecked Sendable {
     private let graphPtr = Atomic<Unmanaged<ChainGraph>?>(nil)
     private let abBypassFlag = Atomic<Bool>(false)
     private let voiceProbabilityBits = Atomic<UInt32>(Float(0).bitPattern)
+
+    // MARK: Graph ownership + config state (guarded by configLock; never touched on the IO thread)
+
     private let configLock = NSLock()
     private var currentConfigs: [FXNodeConfig] = []
+    private var latestGraph: ChainGraph?
+    private var ownedGraphs: [ObjectIdentifier: ChainGraph] = [:]
+    private var releaseTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var isTornDown = false
+
+    /// Serializes `updateConfigs`: only ever one build/publish in flight, and a build superseded
+    /// by a newer request while it awaits (e.g. a hosted-plugin load) is simply never reached --
+    /// `apply` runs again with the newest request once the stale one returns.
+    private lazy var configWorker = ConfigCoalescer { [weak self] configs in
+        await self?.applyConfigs(configs)
+    }
 
     // MARK: IO-thread sharing (mirrors NoiseSuppressor)
 
     private let busy = Atomic<Bool>(false)
+    /// Mirrors `isTornDown`, but as a plain atomic `process` can check with a single cheap load
+    /// before touching any graph state. Set first (before the `configLock`-guarded teardown),
+    /// so any `process` call chronologically after `ioStopped()` returns is guaranteed to see
+    /// it and bail out before dereferencing `activeGraphRef`/`graphPtr`, even though genuinely
+    /// concurrent calls (which the real contract forbids -- `ioStopped` is only called once no
+    /// more `process` calls can happen) aren't ordered by this alone.
+    private let tornDownFlag = Atomic<Bool>(false)
     private var cachedStart: Float64 = -1
     private var cachedFrames = 0
     private let cachedInterleaved: UnsafeMutablePointer<Float>
@@ -62,11 +102,21 @@ final class FXChain: @unchecked Sendable {
     private let vadMono: UnsafeMutablePointer<Float>
     private let rawMonoScratch: UnsafeMutablePointer<Float>
     private let processedMonoScratch: UnsafeMutablePointer<Float>
+    /// Chain-level dry delay ring feeding the A/B bypass: the unprocessed input, so bypassing
+    /// can be compared against a copy delayed by the *current* graph's total latency instead of
+    /// an undelayed one (which would otherwise shift A/B timing by the chain's own latency).
+    private let abDryLeft: UnsafeMutablePointer<Float>
+    private let abDryRight: UnsafeMutablePointer<Float>
 
     // MARK: IO-thread only state (never touched off the IO thread)
 
-    private var activeGraph: ChainGraph?
+    /// Non-owning: the IO thread's view of which graph it's currently driving. Always either
+    /// nil or a pointer into an object `ownedGraphs` is still holding strongly.
+    private var activeGraphRef: Unmanaged<ChainGraph>?
+    private var activeTotalLatency = 0
     private var pendingFadeIn = false
+    private var abDryWrite = 0
+    private var abCrossfade: Float = 1 // 1 = normal chain output, 0 = fully bypassed (dry)
     private var inputRMSEnergy: Float = 0
     private var outputRMSEnergy: Float = 0
     private var abRatioSmoothed: Float = 1
@@ -86,14 +136,22 @@ final class FXChain: @unchecked Sendable {
         vadMono = .allocate(capacity: n)
         rawMonoScratch = .allocate(capacity: n)
         processedMonoScratch = .allocate(capacity: n)
-        for p in [cachedInterleaved] { p.initialize(repeating: 0, count: n * 2) }
+        abDryLeft = .allocate(capacity: Self.abDryCapacity)
+        abDryRight = .allocate(capacity: Self.abDryCapacity)
+        cachedInterleaved.initialize(repeating: 0, count: n * 2)
         for p in [scratchLeft, scratchRight, dryLeftScratch, dryRightScratch, vadMono, rawMonoScratch, processedMonoScratch] {
             p.initialize(repeating: 0, count: n)
         }
+        abDryLeft.initialize(repeating: 0, count: Self.abDryCapacity)
+        abDryRight.initialize(repeating: 0, count: Self.abDryCapacity)
     }
 
     deinit {
-        if let current = graphPtr.load(ordering: .acquiring) { current.release() }
+        // Never let a graph (or the hosted-plugin nodes inside it) deinit as a side effect of
+        // this object's own deinit running on whatever thread dropped the last reference --
+        // route it through the same off-IO-thread, background-queue teardown path `ioStopped`
+        // uses for a live chain.
+        ioStopped()
         cachedInterleaved.deallocate()
         scratchLeft.deallocate()
         scratchRight.deallocate()
@@ -102,16 +160,62 @@ final class FXChain: @unchecked Sendable {
         vadMono.deallocate()
         rawMonoScratch.deallocate()
         processedMonoScratch.deallocate()
+        abDryLeft.deallocate()
+        abDryRight.deallocate()
+    }
+
+    // MARK: - Teardown
+
+    /// Call once every audio unit feeding this chain has actually stopped (`AudioOutputUnitStop`
+    /// returned for every voice route sharing it) -- never on a timer. Proves the IO proc can't
+    /// touch this chain's graphs again, so it's safe to free every graph it still owns right
+    /// now instead of waiting for an acknowledgement that will never come. Idempotent; safe to
+    /// call from any thread. `deinit` also calls this, so a chain that's simply dropped (no
+    /// explicit teardown) still frees off the IO thread rather than leaking.
+    func ioStopped() {
+        // Set first: any `process` call chronologically after this point bails before touching
+        // graph state at all, so it can never dereference what we're about to free below.
+        tornDownFlag.store(true, ordering: .releasing)
+
+        configLock.lock()
+        guard !isTornDown else { configLock.unlock(); return }
+        isTornDown = true
+        let tasks = releaseTasks
+        releaseTasks.removeAll()
+        let graphs = Array(ownedGraphs.values)
+        ownedGraphs.removeAll()
+        latestGraph = nil
+        configLock.unlock()
+
+        // Clear the observational pointer too: the IO thread must never dereference a graph
+        // after this point, even one it hasn't yet acknowledged swapping away from (`runGraph`
+        // treats a nil `graphPtr` as "fade out and go idle", never touching the old graph
+        // again once it does).
+        graphPtr.store(nil, ordering: .releasing)
+
+        for (_, task) in tasks { task.cancel() }
+        // `graphs` may contain hosted (AU/JSFX) nodes whose deinit can block (ObjC teardown,
+        // file I/O); never run that on the caller's thread (the router's queue, or whatever
+        // thread drops the last reference to this chain) or the main thread.
+        guard !graphs.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            withExtendedLifetime(graphs) {}
+        }
     }
 
     // MARK: - Configuration (off the IO thread)
 
-    /// Applies `configs` (the preset's ordered `nodes`), deciding internally whether this is a
-    /// param-only update (same ids, kinds and plugin refs, in the same order -- values, EQ
-    /// bands and enabled flags pushed straight into the live instances) or a structural one (a
-    /// new graph built and published). Call from any non-IO-thread context; structural builds
-    /// hop to a background `Task` on their own.
+    /// Applies `configs` (the preset's ordered `nodes`). Serialized and coalesced by
+    /// `configWorker`: if a build is already in flight when this is called, it just registers
+    /// `configs` as the latest request and returns -- the in-flight build's result is discarded
+    /// in favor of a fresh build from `configs` once it finishes.
     func updateConfigs(_ configs: [FXNodeConfig]) async {
+        await configWorker.request(configs)
+    }
+
+    /// Runs on `configWorker`: never concurrent with itself. Decides param-only vs. structural
+    /// and applies it.
+    private func applyConfigs(_ configs: [FXNodeConfig]) async {
         let previous = snapshotConfigs()
 
         if Self.isParamOnly(old: previous, new: configs) {
@@ -125,8 +229,8 @@ final class FXChain: @unchecked Sendable {
         storeConfigs(configs)
     }
 
-    /// Synchronous wrappers so the lock is never taken directly inside `updateConfigs`'s async
-    /// body (`NSLock` is unavailable from async contexts).
+    /// Synchronous wrappers so the lock is never taken directly inside an async body (`NSLock`
+    /// is unavailable from async contexts).
     private func snapshotConfigs() -> [FXNodeConfig] {
         configLock.lock()
         defer { configLock.unlock() }
@@ -177,36 +281,93 @@ final class FXChain: @unchecked Sendable {
         return ChainGraph(slots: slots)
     }
 
-    /// Publishes `newGraph` with one atomic swap, then waits (off the IO thread) for the
-    /// outgoing graph to be marked retired by the IO thread before releasing it. Bounded by a
-    /// timeout so a route that never processes another block again (e.g. torn down right after
-    /// a structural edit) can't leak it forever.
+    /// Publishes `newGraph`: registers it as the sole strong owner in `ownedGraphs`, then
+    /// stores a non-owning pointer the IO thread can observe. The previously-latest graph (if
+    /// any) is handed to `scheduleRelease`, which waits for the IO thread's acknowledgement
+    /// (`retired`) before dropping it -- never a timeout.
     private func publish(_ newGraph: ChainGraph) {
-        let previous = graphPtr.exchange(.passRetained(newGraph), ordering: .acquiringAndReleasing)
-        guard let previous else { return }
-        Task.detached(priority: .utility) {
-            let old = previous.takeUnretainedValue()
-            let deadline = DispatchTime.now() + 3
-            while !old.retired.load(ordering: .acquiring), DispatchTime.now() < deadline {
+        configLock.lock()
+        guard !isTornDown else {
+            // The chain was torn down while this build was in flight; don't resurrect it.
+            configLock.unlock()
+            return
+        }
+        let previous = latestGraph
+        latestGraph = newGraph
+        ownedGraphs[ObjectIdentifier(newGraph)] = newGraph
+        configLock.unlock()
+
+        graphPtr.store(.passUnretained(newGraph), ordering: .releasing)
+
+        if let previous { scheduleRelease(of: previous) }
+    }
+
+    /// Waits (polling, no timeout) for the IO thread to mark `graph` retired, then drops the
+    /// chain's strong reference to it off the IO thread. If the chain is torn down
+    /// (`ioStopped`) while waiting, the poll notices and returns without touching `graph` again
+    /// -- `ioStopped` already force-freed it.
+    private func scheduleRelease(of graph: ChainGraph) {
+        let id = ObjectIdentifier(graph)
+        let task = Task.detached(priority: .utility) { [weak self] in
+            while !graph.retired.load(ordering: .acquiring) {
+                guard let self, !self.checkTornDown() else { return }
                 try? await Task.sleep(nanoseconds: 2_000_000)
             }
-            previous.release()
+            self?.dropOwnership(of: graph, id: id)
         }
+        configLock.lock()
+        if isTornDown {
+            // Lost the race with `ioStopped` between the check in `publish` and here; it
+            // already owns (or already freed) every graph. Cancel the no-op task we just made.
+            configLock.unlock()
+            task.cancel()
+            return
+        }
+        releaseTasks[id] = task
+        configLock.unlock()
+    }
+
+    /// Sync wrapper so `scheduleRelease`'s poll loop (running inside an async `Task`) never
+    /// takes `configLock` directly (`NSLock` is unavailable from async contexts).
+    private func checkTornDown() -> Bool {
+        configLock.lock()
+        defer { configLock.unlock() }
+        return isTornDown
+    }
+
+    private func dropOwnership(of graph: ChainGraph, id: ObjectIdentifier) {
+        configLock.lock()
+        ownedGraphs.removeValue(forKey: id)
+        releaseTasks.removeValue(forKey: id)
+        configLock.unlock()
+        // `graph` (this function's strong parameter) is the last reference once the dictionary
+        // entry above is gone; it deinits when this function returns, on the background
+        // `Task.detached(priority: .utility)` thread that called us -- never the IO thread.
     }
 
     /// Test-only: installs `graph` as both the published and currently-active graph, bypassing
     /// config diffing, node construction and the declick swap. Lets tests drive `process` with
     /// hand-built graphs of fake nodes. Call before the first `process`.
     func debugInstallGraph(_ graph: ChainGraph) {
-        let old = graphPtr.exchange(.passRetained(graph), ordering: .acquiringAndReleasing)
-        old?.release()
-        activeGraph = graph
+        configLock.lock()
+        ownedGraphs[ObjectIdentifier(graph)] = graph
+        latestGraph = graph
+        configLock.unlock()
+        graphPtr.store(.passUnretained(graph), ordering: .releasing)
+        activeGraphRef = .passUnretained(graph)
+        activeTotalLatency = graph.totalLatency
         pendingFadeIn = false
     }
 
-    private var publishedGraph: ChainGraph? { graphPtr.load(ordering: .acquiring)?.takeUnretainedValue() }
+    /// Off the IO thread only: the strongly-held current graph (never races a concurrent
+    /// release, unlike reading `graphPtr` directly, which is reserved for the IO thread).
+    private var publishedGraph: ChainGraph? {
+        configLock.lock()
+        defer { configLock.unlock() }
+        return latestGraph
+    }
 
-    // MARK: - Introspection (main thread, via FXEngine)
+    // MARK: - Introspection (any thread, via FXEngine)
 
     /// The live instance for a node id, from whichever graph is currently published.
     func liveNode(id: UUID) -> (any FXNode)? {
@@ -266,7 +427,7 @@ final class FXChain: @unchecked Sendable {
     /// (pre-noise-suppression) interleaved mix fed to the recorder's "raw" stream.
     func process(_ buffer: UnsafeMutablePointer<Float>, frames: Int, stride: Int,
                 sampleTime: Float64?, rawPreNS: UnsafePointer<Float>?) {
-        guard frames > 0, stride > 0 else { return }
+        guard frames > 0, stride > 0, !tornDownFlag.load(ordering: .acquiring) else { return }
         guard busy.compareExchange(expected: false, desired: true, ordering: .acquiring).exchanged else { return }
         defer { busy.store(false, ordering: .releasing) }
 
@@ -303,6 +464,15 @@ final class FXChain: @unchecked Sendable {
         memcpy(dryLeftScratch, scratchLeft, frames * MemoryLayout<Float>.size)
         memcpy(dryRightScratch, scratchRight, frames * MemoryLayout<Float>.size)
 
+        // Feed the chain-level A/B dry ring with the unprocessed signal before any node runs.
+        let abPushStart = abDryWrite
+        for i in 0..<frames {
+            let idx = (abPushStart + i) & (Self.abDryCapacity - 1)
+            abDryLeft[idx] = scratchLeft[i]
+            abDryRight[idx] = scratchRight[i]
+        }
+        abDryWrite = abPushStart + frames
+
         for i in 0..<frames { vadMono[i] = mono ? scratchLeft[i] : 0.5 * (scratchLeft[i] + scratchRight[i]) }
         let probability = vad?.process(vadMono, frames: frames) ?? 1
         VoiceBus.update(probability)
@@ -317,14 +487,8 @@ final class FXChain: @unchecked Sendable {
             inputRMSEnergy = Self.rmsDecay * inputRMSEnergy + (1 - Self.rmsDecay) * inEnergy
             outputRMSEnergy = Self.rmsDecay * outputRMSEnergy + (1 - Self.rmsDecay) * outEnergy
         }
-        if abBypassFlag.load(ordering: .relaxed) {
-            let targetRatio = inputRMSEnergy > 1e-6 ? outputRMSEnergy / inputRMSEnergy : 1
-            abRatioSmoothed = 0.995 * abRatioSmoothed + 0.005 * targetRatio
-            for i in 0..<frames {
-                scratchLeft[i] = dryLeftScratch[i] * abRatioSmoothed
-                scratchRight[i] = dryRightScratch[i] * abRatioSmoothed
-            }
-        }
+
+        applyABBypass(left: scratchLeft, right: scratchRight, frames: frames, abPushStart: abPushStart)
 
         FXBlockIO.reinterleave(buffer, frames: frames, stride: stride, channels: min(stride, 2),
                                left: scratchLeft, right: scratchRight, mono: mono)
@@ -338,15 +502,46 @@ final class FXChain: @unchecked Sendable {
         }
     }
 
+    /// Crossfades the chain's processed output against a dry tap delayed by `activeTotalLatency`
+    /// -- the current graph's own latency -- so switching A/B doesn't shift timing (an undelayed
+    /// dry tap would compare samples that are `activeTotalLatency` apart in time) and doesn't
+    /// click (the blend ramps over `crossfadeStep` per sample, same cadence as per-node bypass).
+    /// The dry side is scaled by `abRatioSmoothed` so A/B compares tone, not loudness.
+    private func applyABBypass(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
+                               frames: Int, abPushStart: Int) {
+        let target: Float = abBypassFlag.load(ordering: .relaxed) ? 0 : 1
+        guard target != 1 || abCrossfade != 1 else { return } // steady-state not bypassed: nothing to blend
+        let latency = min(activeTotalLatency, Self.abDryCapacity - FXBlock.maxFrames)
+        var fade = abCrossfade
+        for i in 0..<frames {
+            fade = target > fade ? min(target, fade + Self.crossfadeStep) : max(target, fade - Self.crossfadeStep)
+            let readIndex = abPushStart + i - latency
+            let dl: Float = readIndex >= 0 ? abDryLeft[readIndex & (Self.abDryCapacity - 1)] : 0
+            let dr: Float = readIndex >= 0 ? abDryRight[readIndex & (Self.abDryCapacity - 1)] : 0
+            left[i] = fade * left[i] + (1 - fade) * dl * abRatioSmoothed
+            right[i] = fade * right[i] + (1 - fade) * dr * abRatioSmoothed
+        }
+        abCrossfade = fade
+    }
+
     /// Declicks a structural swap: the outgoing graph finishes its last block faded to
-    /// silence, the incoming one starts its first block faded in from silence.
+    /// silence, the incoming one starts its first block faded in from silence. Never retains a
+    /// `ChainGraph`: `activeGraphRef`/`latest` are non-owning `Unmanaged` views into whatever
+    /// `ownedGraphs` (off the IO thread) is holding alive.
     private func runGraph(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
                           frames: Int, mono: Bool, sidechain: FXSidechain) {
-        let latest = graphPtr.load(ordering: .acquiring)?.takeUnretainedValue()
+        let latestRef = graphPtr.load(ordering: .acquiring)
         var processedThisBlock = false
 
-        if let latest, latest !== activeGraph {
-            if let old = activeGraph {
+        // Any change -- a new graph published, OR the chain torn down (`graphPtr` cleared to
+        // nil by `ioStopped`) -- is handled the same way: fade the outgoing graph (if any) to
+        // silence, then adopt whatever's new (possibly nothing). `activeGraphRef` is only ever
+        // read here, right after confirming it still matches what's actually current, so a
+        // torn-down chain's stale pointer is never dereferenced again once this notices the
+        // mismatch.
+        if latestRef?.toOpaque() != activeGraphRef?.toOpaque() {
+            if let oldRef = activeGraphRef {
+                let old = oldRef.takeUnretainedValue()
                 processSlots(old, left: left, right: right, frames: frames, mono: mono, sidechain: sidechain)
                 let n = Float(frames)
                 for i in 0..<frames {
@@ -356,12 +551,14 @@ final class FXChain: @unchecked Sendable {
                 }
                 old.retired.store(true, ordering: .releasing)
                 processedThisBlock = true
-                pendingFadeIn = true
+                pendingFadeIn = latestRef != nil
             }
-            activeGraph = latest
+            activeGraphRef = latestRef
+            activeTotalLatency = latestRef?.takeUnretainedValue().totalLatency ?? 0
         }
 
-        if !processedThisBlock, let graph = activeGraph {
+        if !processedThisBlock, let ref = activeGraphRef {
+            let graph = ref.takeUnretainedValue()
             processSlots(graph, left: left, right: right, frames: frames, mono: mono, sidechain: sidechain)
             if pendingFadeIn {
                 let n = Float(frames)
@@ -373,6 +570,8 @@ final class FXChain: @unchecked Sendable {
                 pendingFadeIn = false
             }
         }
+        // Else: no active graph (a torn-down chain, or one that never got a first config) --
+        // `left`/`right` stay exactly as the caller provided them (dry passthrough).
     }
 
     private func processSlots(_ graph: ChainGraph, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
@@ -416,9 +615,36 @@ final class FXChain: @unchecked Sendable {
     }
 }
 
+/// Serializes and coalesces async requests to a single `apply` worker: concurrent `request`
+/// calls never run `apply` concurrently with itself, and if a newer request arrives while one
+/// is in flight (e.g. awaiting a slow hosted-plugin load), the in-flight one's result is simply
+/// superseded -- `apply` runs again with the newest request once it returns, so only the latest
+/// requested value is ever the one that "wins".
+private actor ConfigCoalescer<Value: Sendable> {
+    private var pending: Value?
+    private var isRunning = false
+    private let apply: @Sendable (Value) async -> Void
+
+    init(apply: @escaping @Sendable (Value) async -> Void) {
+        self.apply = apply
+    }
+
+    func request(_ value: Value) async {
+        pending = value
+        guard !isRunning else { return }
+        isRunning = true
+        while let next = pending {
+            pending = nil
+            await apply(next)
+        }
+        isRunning = false
+    }
+}
+
 /// An immutable, published chain configuration: an ordered list of live node instances plus
 /// the per-node live state (`enabled`, bypass crossfade, dry delay ring) the IO thread mutates
-/// while this graph is active. Built off the IO thread; the IO thread never allocates one.
+/// while this graph is active. Built off the IO thread; the IO thread never allocates one, and
+/// never holds the strong reference that keeps it alive (see `FXChain`'s "Graph ownership" doc).
 final class ChainGraph: @unchecked Sendable {
     /// One stage: a node instance plus the mutable IO-thread state around it. `enabled` is an
     /// atomic so a param-only update can flip it from any thread without touching the node
@@ -464,13 +690,12 @@ final class ChainGraph: @unchecked Sendable {
     var slots: [Slot]
     let totalLatency: Int
     /// Set exactly once by the IO thread, after it has finished the one final (fading) block it
-    /// runs through this graph following a swap. The publisher polls this off the IO thread
-    /// before freeing the graph.
+    /// runs through this graph following a swap. `FXChain.scheduleRelease` polls this (off the
+    /// IO thread, no timeout) before freeing the graph.
     let retired = Atomic<Bool>(false)
 
     init(slots: [Slot]) {
         self.slots = slots
         totalLatency = slots.reduce(0) { $0 + $1.latency }
     }
-
 }

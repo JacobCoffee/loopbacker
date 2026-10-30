@@ -753,7 +753,12 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         guard ctx.isVoiceInput else { return }
         _ = ctx.detachFXChain()
         guard !voiceContexts.contains(where: { $0.captureDeviceUID == ctx.captureDeviceUID }) else { return }
-        fxChainsByDevice.removeValue(forKey: ctx.captureDeviceUID)
+        if let chain = fxChainsByDevice.removeValue(forKey: ctx.captureDeviceUID) {
+            // The last voice route on this device is gone and its audio unit(s) are already
+            // stopped (callers stop them before calling this): the IO proc is provably halted,
+            // so it's safe to free whatever graphs this chain still owns now rather than wait.
+            chain.ioStopped()
+        }
         fxChainsLock.lock()
         fxChainsSnapshot.removeValue(forKey: ctx.captureDeviceUID)
         fxChainsLock.unlock()
@@ -1112,7 +1117,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     private func stopRoutingInternal(sourceDeviceUID: String) {
         guard let ctx = activeRoutes.removeValue(forKey: sourceDeviceUID) else { return }
-        detachFXChain(from: ctx)
 
         // Remove sample rate listener for the capture device
         removeSampleRateListener(deviceID: ctx.captureDeviceID)
@@ -1125,6 +1129,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain: the capture device's IO
+        // callbacks that might still be inside `FXChain.process` have been stopped.
+        detachFXChain(from: ctx)
+
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
@@ -1221,7 +1229,6 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
 
     private func stopOutputRoutingInternal(virtualDeviceUID: String) {
         guard let ctx = activeOutputRoutes.removeValue(forKey: virtualDeviceUID) else { return }
-        detachFXChain(from: ctx)
 
         if let inputUnit = ctx.inputUnit {
             AudioOutputUnitStop(inputUnit)
@@ -1229,6 +1236,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         if let outputUnit = ctx.outputUnit {
             AudioOutputUnitStop(outputUnit)
         }
+        // Only now is it provably safe to detach the voice FX chain (see stopRoutingInternal).
+        detachFXChain(from: ctx)
         let hadInput = ctx.inputUnit != nil
         let hadOutput = ctx.outputUnit != nil
         teardownUnit(&ctx.inputUnit)
