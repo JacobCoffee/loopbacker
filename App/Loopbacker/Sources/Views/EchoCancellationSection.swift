@@ -105,6 +105,12 @@ struct EchoCancellationSection: View {
                 text: "Waiting for an active voice route before starting the system audio tap.",
                 tint: .secondary
             )
+        case .noPhysicalOutput:
+            explainer(
+                icon: "speaker.slash",
+                text: "Your default output isn't a physical speaker right now, so there's nothing to echo-cancel against. This turns back on automatically once you switch to real speakers or headphones.",
+                tint: .secondary
+            )
         case .failed(let error):
             explainer(
                 icon: "exclamationmark.triangle.fill",

@@ -52,6 +52,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// shape as `fxChainsByDevice`/`fxChainsSnapshot`.
     private let echoCancellersLock = NSLock()
     private var echoCancellersSnapshot: [EchoCanceller] = []
+    /// Queue only. Whether `installDefaultOutputChangeListenerIfNeeded` has already installed
+    /// its listener, so a default-output change recomputes attached cancellers' stream delay.
+    private var echoDefaultOutputListenerInstalled = false
 
     // MARK: - Internal state
 
@@ -918,7 +921,34 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.echoReference = ring
+            self.installDefaultOutputChangeListenerIfNeeded()
             self.applyEchoCancellationToAllRoutes()
+        }
+    }
+
+    /// Queue only. The default output device changing (built-in speakers -> USB interface, or
+    /// to/from one of Loopbacker's own virtual devices) can change the HAL latency AEC3's delay
+    /// estimate was built from, same as it changes which device `SystemAudioTap` taps. Installed
+    /// once, the first time there's a reference to echo-cancel against; never removed, since
+    /// `AudioRouter` lives for the app's lifetime same as `SystemAudioTap`.
+    private func installDefaultOutputChangeListenerIfNeeded() {
+        guard !echoDefaultOutputListenerInstalled else { return }
+        echoDefaultOutputListenerInstalled = true
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                  mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue) { [weak self] _, _ in
+            self?.refreshEchoStreamDelays()
+        }
+    }
+
+    /// Must run on `queue`. Recomputes and re-pushes every attached echo canceller's AEC3 delay
+    /// estimate (see `estimateStreamDelayMs`); AEC3 keeps adapting through the gap, same as it
+    /// does for an initial estimate that's merely in the right ballpark.
+    private func refreshEchoStreamDelays() {
+        for ctx in voiceContexts {
+            guard let canceller = ctx.echoOwner else { continue }
+            canceller.setStreamDelay(ms: estimateStreamDelayMs(for: ctx))
         }
     }
 
