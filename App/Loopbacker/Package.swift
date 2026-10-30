@@ -15,9 +15,32 @@ let package = Package(
             name: "CRNNoise",
             path: "CRNNoise"
         ),
+        .target(
+            name: "CAirwindows",
+            path: "CAirwindows",
+            exclude: [
+                "README.md",
+                "LICENSE.md",
+                "awpdoc",
+                "Scripts"
+            ],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .define("_USE_MATH_DEFINES"),
+                // Same suppressions upstream applies to this exact source tree
+                // (CMakeLists.txt): these effects were generated decades apart
+                // by a Perl script, not hand-tuned for -Wall.
+                .unsafeFlags([
+                    "-Wno-unused-function",
+                    "-Wno-unused-value",
+                    "-Wno-unused-but-set-variable",
+                    "-Wno-multichar"
+                ])
+            ]
+        ),
         .executableTarget(
             name: "Loopbacker",
-            dependencies: ["CRNNoise"],
+            dependencies: ["CRNNoise", "CAirwindows"],
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
@@ -32,5 +55,6 @@ let package = Package(
             dependencies: ["Loopbacker"],
             path: "Tests/LoopbackerTests"
         )
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )
