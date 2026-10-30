@@ -122,6 +122,9 @@ struct EffectsRenderTests {
             .environmentObject(context.audioDeviceManager)
             .environmentObject(context.driverInstaller)
             .environmentObject(PresetAutoSwitchState())
+            // GlobalToolbar reads it; its user driver never shows UI, so starting it here is
+            // inert (the test bundle has no update feed).
+            .environmentObject(AppUpdater.shared)
             .environment(context.audioRouter.meters)
             .environment(\.snapshotRendering, true)
             .environment(\.previewMeters, previewMeters)

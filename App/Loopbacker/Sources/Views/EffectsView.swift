@@ -146,6 +146,10 @@ struct EffectsView: View {
 
             noiseSuppressionCard
 
+            // Both modes: echo cancellation is a call setting, not a voice-shaping one, and
+            // Advanced users need to reach it too.
+            EchoCancellationSection()
+
             if !preset.isEnabled {
                 disabledPrompt
             }

@@ -83,8 +83,8 @@ loudness-matches so comparisons are about tone, not volume.
 17 factory presets across four categories -- Business (Meeting – Natural, Presentation/Webinar, Open
 Office, Laptop Mic Rescue), Gaming (Headset, Speakers), Streaming (Stream/Broadcast, Podcast, Late
 Night), and Creative (Chipmunk, Deep Voice, Robot, Telephone, Radio Announcer, Cathedral, Dreamy,
-Space Station). Each business/gaming/streaming preset also dials in noise suppression and echo
-cancellation to match. Save your own presets, import/export as JSON to share with others.
+Space Station). Each business/gaming/streaming preset also dials in noise suppression to match, and
+Speakers – Gaming turns on echo cancellation. Save your own presets, import/export as JSON to share with others.
 
 **Auto Setup** records a few seconds of you talking and silence, measures your noise floor,
 speech loudness, peaks, sibilance, and spectral tilt, and tunes the current preset's built-in

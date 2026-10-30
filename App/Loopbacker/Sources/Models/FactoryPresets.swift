@@ -26,7 +26,10 @@ struct FactoryPreset: Identifiable, Sendable {
     let preset: EffectsPreset
     /// Noise suppression this preset is designed around (engine/reduction), nil = leave as is.
     let noiseSuppression: NoiseSuppressionSettings?
-    /// Echo cancellation recommendation for this preset, nil = leave as is.
+    /// Echo cancellation for this preset, nil = leave as the user set it. Only presets that
+    /// assume speakers set it: turning it on starts a system-audio tap and, the first time,
+    /// macOS's System Audio Recording prompt, which a headphone user picking a call preset
+    /// shouldn't get.
     let echoCancellation: Bool?
 }
 
@@ -76,7 +79,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 60)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .fastenhancer, maxReductionDB: -40),
-        echoCancellation: true
+        echoCancellation: nil
     )
 
     private static let presentationWebinar = FactoryPreset(
@@ -99,7 +102,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 55)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .fastenhancer, maxReductionDB: -45),
-        echoCancellation: true
+        echoCancellation: nil
     )
 
     private static let openOffice = FactoryPreset(
@@ -120,7 +123,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 55)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .dpdfnet, maxReductionDB: -55),
-        echoCancellation: false
+        echoCancellation: nil
     )
 
     private static let laptopMicRescue = FactoryPreset(
@@ -143,7 +146,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 55)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .dpdfnet, maxReductionDB: -55),
-        echoCancellation: true
+        echoCancellation: nil
     )
 
     // MARK: - Gaming
@@ -166,7 +169,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 50)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .fastenhancer, maxReductionDB: -45),
-        echoCancellation: false
+        echoCancellation: nil
     )
 
     private static let speakersGaming = FactoryPreset(
@@ -211,7 +214,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 50)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .fastenhancer, maxReductionDB: -45),
-        echoCancellation: false
+        echoCancellation: nil
     )
 
     private static let podcast = FactoryPreset(
@@ -234,7 +237,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 60)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .fastenhancer, maxReductionDB: -35),
-        echoCancellation: false
+        echoCancellation: nil
     )
 
     private static let lateNight = FactoryPreset(
@@ -256,7 +259,7 @@ enum FactoryPresets {
             limiter: limiterNode(ceiling: -1, release: 65)
         )),
         noiseSuppression: NoiseSuppressionSettings(isEnabled: true, engine: .dpdfnet, maxReductionDB: -50),
-        echoCancellation: false
+        echoCancellation: nil
     )
 
     // MARK: - Creative (the fun ones, re-tuned for the new stages)
@@ -499,7 +502,13 @@ enum EffectsPresetLibrary {
             var applied = factory.preset
             applied.isEnabled = true
             state.effectsPreset = applied
-            if let noise = factory.noiseSuppression { state.noiseSuppression = noise }
+            if let noise = factory.noiseSuppression {
+                // The preset's settings carry echo cancellation's default (off); keep the
+                // user's own choice unless the preset says otherwise below.
+                let echo = state.noiseSuppression.echoCancellation
+                state.noiseSuppression = noise
+                state.noiseSuppression.echoCancellation = echo
+            }
             if let echo = factory.echoCancellation { state.noiseSuppression.echoCancellation = echo }
             state.save()
             return true

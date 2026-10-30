@@ -36,15 +36,21 @@ struct EffectsPresetLibraryTests {
         #expect(Set(named.prefix(factoryCount).map(\.id)) == Set(FactoryPresets.all.map(\.id)))
     }
 
-    @Test("apply(id:) with a factory preset id sets the preset, noise suppression and echo cancellation")
+    @Test("apply(id:) with a factory preset id sets the preset and noise suppression, keeping the user's echo cancellation")
     func appliesFactoryPreset() {
         let state = makeState()
+        state.noiseSuppression.echoCancellation = true
         let factory = FactoryPresets.preset(id: "open-office")!
+        #expect(factory.echoCancellation == nil)
         #expect(EffectsPresetLibrary.apply(id: "open-office", to: state))
         #expect(state.effectsPreset.isEnabled)
         #expect(state.effectsPreset.nodes.count == factory.preset.nodes.count)
         #expect(state.noiseSuppression.engine == factory.noiseSuppression?.engine)
-        #expect(state.noiseSuppression.echoCancellation == factory.echoCancellation)
+        #expect(state.noiseSuppression.echoCancellation, "a preset without an echo setting must not switch it off")
+
+        state.noiseSuppression.echoCancellation = false
+        #expect(EffectsPresetLibrary.apply(id: "speakers-gaming", to: state))
+        #expect(state.noiseSuppression.echoCancellation, "Speakers – Gaming turns echo cancellation on")
     }
 
     @Test("apply(id:) with an unknown id returns false and leaves state untouched")

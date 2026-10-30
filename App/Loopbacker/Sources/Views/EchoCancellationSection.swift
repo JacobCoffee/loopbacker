@@ -47,7 +47,7 @@ struct EchoCancellationSection: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Echo Cancellation")
                     .font(.headline)
-                Text("Removes your own voice from the mic after it plays back through your speakers, so other call participants don't hear themselves echoed.")
+                Text("Removes what your speakers play from your mic, so people on the call don't hear themselves echoed. Not needed with headphones.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

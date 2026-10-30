@@ -44,10 +44,6 @@ struct EffectsSimpleView: View {
             .padding(Metrics.panelPadding)
             .glassPanel(cornerRadius: Metrics.panelRadius)
 
-            EchoCancellationSection()
-                .padding(Metrics.panelPadding)
-                .glassPanel(cornerRadius: Metrics.panelRadius)
-
             autoSetupPanel
         }
     }
