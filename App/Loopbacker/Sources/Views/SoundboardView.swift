@@ -78,9 +78,11 @@ struct SoundboardView: View {
             HStack(spacing: 6) {
                 Image(systemName: "speaker.wave.2")
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 Slider(value: volumeBinding, in: 0...1)
                     .tint(.loopbacker)
                     .frame(width: 120)
+                    .accessibilityLabel("Soundboard Volume")
             }
             .help("Global soundboard volume")
 

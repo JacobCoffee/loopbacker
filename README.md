@@ -94,7 +94,7 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 
 - macOS 26 Liquid Glass design, light and dark, with an in-app appearance override
 - Sidebar with Routing, Effects, Soundboard, and Scenes (⌘1–⌘4), plus every source's live level and on/off switch
-- Routing canvas where cables glow with the signal running through them
+- Routing canvas where cables glow with the signal running through them, or a keyboard- and VoiceOver-navigable connection matrix (toggle in the Routing toolbar; each cell is a labeled, togglable connection, and canvas ports offer VoiceOver "Connect to…"/"Disconnect from…" actions)
 - Effects shown as a vertical insert chain, like a channel strip
 - Menu bar panel with live meters, per-source switches, Reconnect, and Test Tone
 - Audio menu with keyboard shortcuts: Reconnect (⌘R), Stop All Routing (⇧⌘.), Test Tone (⌥⌘T)

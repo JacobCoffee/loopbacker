@@ -11,6 +11,7 @@ struct ContentView: View {
     @SceneStorage("studioSection") private var section: StudioSection = .routing
     @State private var showSourcePicker = false
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
+    @AppStorage(RoutingViewMode.storageKey) private var routingViewMode: RoutingViewMode = .canvas
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
@@ -36,11 +37,18 @@ struct ContentView: View {
     private var detail: some View {
         switch section {
         case .routing:
-            RoutingCanvasView(onAddSource: { showSourcePicker = true })
-                .toolbar {
-                    routingToolbar
-                    GlobalToolbar()
+            Group {
+                switch routingViewMode {
+                case .canvas:
+                    RoutingCanvasView(onAddSource: { showSourcePicker = true })
+                case .matrix:
+                    RoutingMatrixView()
                 }
+            }
+            .toolbar {
+                routingToolbar
+                GlobalToolbar()
+            }
         case .effects:
             EffectsView()
         case .soundboard:
@@ -54,6 +62,17 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var routingToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Picker("Routing View", selection: $routingViewMode) {
+                ForEach(RoutingViewMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .help("Switch between the cable canvas and the keyboard-navigable connection matrix")
+        }
+
         ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 showSourcePicker = true
