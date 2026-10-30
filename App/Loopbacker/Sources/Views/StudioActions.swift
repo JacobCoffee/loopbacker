@@ -47,6 +47,7 @@ struct StudioActions {
     let audioRouter: AudioRouter
     let audioDeviceManager: AudioDeviceManager
     let driverInstaller: DriverInstaller
+    let appUpdater: AppUpdater
 
     /// Tear down and rebuild every route. Fixes glitches after sleep or device changes.
     func reconnect() {
@@ -71,6 +72,24 @@ struct StudioActions {
 
     func toggleDriver() {
         driverInstaller.isInstalled ? driverInstaller.uninstall() : driverInstaller.install()
+    }
+
+    /// Reinstalls the bundled driver over the older installed one. Needs admin and restarts
+    /// coreaudiod, so this is only ever triggered by an explicit user click.
+    func installDriverUpdate() {
+        driverInstaller.install()
+    }
+
+    func checkForUpdates() {
+        appUpdater.checkForUpdates()
+    }
+
+    func installAvailableUpdate() {
+        appUpdater.installAvailableUpdate()
+    }
+
+    func dismissAvailableUpdate() {
+        appUpdater.dismissAvailableUpdate()
     }
 
     /// Route the first enabled stereo source to output channels 1 & 2, adding a source if needed.

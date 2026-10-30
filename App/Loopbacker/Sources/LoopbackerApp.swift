@@ -10,6 +10,7 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardState: SoundboardState
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
+    @StateObject private var appUpdater: AppUpdater
     // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
     // routes start and menu-bar edits reach the engine even if the main window never opens.
     @StateObject private var routingSync: RoutingSync
@@ -26,6 +27,7 @@ struct LoopbackerApp: App {
         _soundboardState = StateObject(wrappedValue: SoundboardState.load())
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
+        _appUpdater = StateObject(wrappedValue: AppUpdater.shared)
         _routingSync = StateObject(wrappedValue: RoutingSync(
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
@@ -36,7 +38,8 @@ struct LoopbackerApp: App {
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
-                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller,
+                      appUpdater: appUpdater)
     }
 
     var body: some Scene {
@@ -49,13 +52,17 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardState)
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
+                .environmentObject(appUpdater)
                 .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1180, height: 760)
         .commands {
-            StudioCommands(actions: actions, driverInstalled: driverInstaller.isInstalled)
+            StudioCommands(actions: actions, driverInstalled: driverInstaller.isInstalled,
+                           driverUpdateAvailable: driverInstaller.updateAvailable,
+                           availableAppUpdateVersion: appUpdater.availableUpdate?.displayVersion,
+                           canCheckForUpdates: appUpdater.canCheckForUpdates)
         }
 
         MenuBarExtra {
@@ -65,6 +72,7 @@ struct LoopbackerApp: App {
                 .environmentObject(driverInstaller)
                 .environmentObject(audioRouter)
                 .environmentObject(appCaptureService)
+                .environmentObject(appUpdater)
                 .environment(audioRouter.meters)
         } label: {
             Image(systemName: "waveform.path")
@@ -78,12 +86,24 @@ struct LoopbackerApp: App {
 struct StudioCommands: Commands {
     let actions: StudioActions
     let driverInstalled: Bool
+    let driverUpdateAvailable: Bool
+    let availableAppUpdateVersion: String?
+    let canCheckForUpdates: Bool
 
     @FocusedBinding(\.studioSection) private var section: StudioSection?
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {}
+
+        CommandGroup(after: .appInfo) {
+            Divider()
+            Button("Check for Updates…") { actions.checkForUpdates() }
+                .disabled(!canCheckForUpdates)
+            if let version = availableAppUpdateVersion {
+                Button("Update to \(version)…") { actions.installAvailableUpdate() }
+            }
+        }
 
         CommandGroup(before: .sidebar) {
             ForEach(StudioSection.allCases) { item in
@@ -115,6 +135,10 @@ struct StudioCommands: Commands {
             Button("Copy Debug Snapshot") { actions.copyDebugSnapshot() }
             Divider()
             Button(driverInstalled ? "Uninstall Driver…" : "Install Driver…") { actions.toggleDriver() }
+            if driverUpdateAvailable {
+                Button("Install Driver Update…") { actions.installDriverUpdate() }
+                    .help("Needs admin and briefly drops audio while coreaudiod restarts")
+            }
             Button("Quit and Stop Routing") { AppDelegate.forceQuit() }
                 .keyboardShortcut("q", modifiers: [.command, .option])
         }
@@ -151,6 +175,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if Self.shouldReallyQuit {
+            // Install on quit: a downloaded update waiting for the user is applied now rather than
+            // lost; Sparkle's helper finishes after this process exits.
+            AppUpdater.shared.installPendingUpdateOnQuit()
             DefaultDeviceRestorer.shared.restoreDefaultsIfNeeded()
             return .terminateNow
         }

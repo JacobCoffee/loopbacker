@@ -10,6 +10,9 @@ let package = Package(
     products: [
         .executable(name: "Loopbacker", targets: ["Loopbacker"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.1")
+    ],
     targets: [
         .target(
             name: "CRNNoise",
@@ -17,14 +20,18 @@ let package = Package(
         ),
         .executableTarget(
             name: "Loopbacker",
-            dependencies: ["CRNNoise"],
+            dependencies: [
+                "CRNNoise",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("Accelerate")
+                .linkedFramework("Accelerate"),
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .testTarget(
