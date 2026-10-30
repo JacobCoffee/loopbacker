@@ -2,29 +2,20 @@ import Foundation
 import Testing
 @testable import Loopbacker
 
-/// `PresetAutoSwitchState.save()` writes to the same file the real app uses (its path isn't
-/// injectable); every test here captures the file's original bytes and restores them in `defer`
-/// so a real run of the app never loses its automation rules because the test suite ran.
+/// `PresetAutoSwitchState` persists under `AppDataDirectory`, which in a test process is a
+/// private temp folder, never the installed app's Application Support.
 @MainActor
 @Suite("PresetAutoSwitchState persistence", .serialized)
 struct PresetAutoSwitchStatePersistenceTests {
-    private var fileURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("preset-auto-switch.json")
+    @Test("Tests never write the installed app's data folder")
+    func testProcessDataIsPrivate() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        #expect(!AppDataDirectory.url.standardizedFileURL.path.hasPrefix(appSupport.standardizedFileURL.path))
+        #expect(RoutingState.defaultConfigDirectoryURL == AppDataDirectory.url)
     }
 
     @Test("Rapid consecutive saves land in submission order, not completion-race order")
     func savesLandInSubmissionOrder() async throws {
-        let original = try? Data(contentsOf: fileURL)
-        defer {
-            if let original {
-                try? original.write(to: fileURL, options: .atomic)
-            } else {
-                try? FileManager.default.removeItem(at: fileURL)
-            }
-        }
-
         let state = PresetAutoSwitchState()
         for i in 0..<20 {
             state.fallbackPresetID = "preset-\(i)"
@@ -39,15 +30,6 @@ struct PresetAutoSwitchStatePersistenceTests {
 
     @Test("Adding then immediately deleting a rule doesn't resurrect it on next launch")
     func addThenDeleteDoesNotResurrect() async throws {
-        let original = try? Data(contentsOf: fileURL)
-        defer {
-            if let original {
-                try? original.write(to: fileURL, options: .atomic)
-            } else {
-                try? FileManager.default.removeItem(at: fileURL)
-            }
-        }
-
         let state = PresetAutoSwitchState()
         let rule = PresetAutoSwitchRule(appBundleID: "com.example.app", appName: "Example", presetID: "p1", presetName: "P1")
         state.addRule(rule)

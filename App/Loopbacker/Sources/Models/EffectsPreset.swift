@@ -168,12 +168,8 @@ struct EffectsPreset: Codable, Equatable {
 // MARK: - Effects Preset Manager (file-based, shareable)
 
 struct EffectsPresetManager {
-    private static let presetsDirectoryURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("effects-presets", isDirectory: true)
-    }()
+    private static let presetsDirectoryURL: URL =
+        AppDataDirectory.url.appendingPathComponent("effects-presets", isDirectory: true)
 
     static func save(name: String, preset: EffectsPreset) {
         do {

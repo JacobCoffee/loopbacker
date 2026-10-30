@@ -44,6 +44,10 @@ enum Metrics {
     static let panelSpacing: CGFloat = 14
     /// Outer margin of a detail canvas.
     static let canvasMargin: CGFloat = 24
+    /// Room a glass panel's shadow needs around it. A `ScrollView` clips to its bounds, so glass
+    /// panels flush against its edges get their shadows cut off into hard grey rectangles: pad
+    /// the scrolled content by this and pull the scroll view out by the same amount.
+    static let glassShadowInset: CGFloat = 20
 }
 
 // MARK: - Appearance override

@@ -386,10 +386,7 @@ class RoutingState: ObservableObject {
 
     // MARK: - Persistence
 
-    static let defaultConfigDirectoryURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Loopbacker", isDirectory: true)
-    }()
+    static var defaultConfigDirectoryURL: URL { AppDataDirectory.url }
 
     private var configFileURL: URL {
         persistenceDirectory.appendingPathComponent("config.json")
@@ -522,12 +519,8 @@ class RoutingState: ObservableObject {
 // MARK: - Preset Manager
 
 struct PresetManager {
-    private static let presetsDirectoryURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("presets", isDirectory: true)
-    }()
+    private static let presetsDirectoryURL: URL =
+        AppDataDirectory.url.appendingPathComponent("presets", isDirectory: true)
 
     /// Save a named preset from the given data.
     static func save(name: String, data: Data) {

@@ -66,11 +66,7 @@ final class HostedPluginQuarantine: @unchecked Sendable {
     private var sweepTask: Task<Void, Never>?
 
     private convenience init() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        self.init(directory: support
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("crash-sentinels", isDirectory: true))
+        self.init(directory: AppDataDirectory.url.appendingPathComponent("crash-sentinels", isDirectory: true))
     }
 
     /// Testing seam: an instance rooted at an arbitrary directory, so tests can exercise

@@ -90,12 +90,7 @@ final class PresetAutoSwitchState: ObservableObject {
 
     // MARK: - Persistence
 
-    private static let fileURL: URL = {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("Loopbacker", isDirectory: true)
-            .appendingPathComponent("preset-auto-switch.json")
-    }()
+    private static let fileURL: URL = AppDataDirectory.url.appendingPathComponent("preset-auto-switch.json")
 
     private struct Persisted: Codable {
         var rules: [PresetAutoSwitchRule]

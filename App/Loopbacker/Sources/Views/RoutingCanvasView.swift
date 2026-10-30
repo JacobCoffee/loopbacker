@@ -57,9 +57,12 @@ struct RoutingCanvasView: View {
                     }
                     outputRoutingSection
                 }
+                .padding(Metrics.glassShadowInset)
                 .padding(.bottom, Metrics.canvasMargin)
             }
-            .frame(minWidth: 300, idealWidth: 360, maxWidth: 420)
+            .frame(minWidth: 300 + 2 * Metrics.glassShadowInset, idealWidth: 360 + 2 * Metrics.glassShadowInset,
+                   maxWidth: 420 + 2 * Metrics.glassShadowInset)
+            .padding(-Metrics.glassShadowInset)
         }
     }
 
@@ -98,7 +101,9 @@ struct RoutingCanvasView: View {
                             }
                         }
                     }
+                    .padding(Metrics.glassShadowInset)
                 }
+                .padding(-Metrics.glassShadowInset)
             }
         }
     }
