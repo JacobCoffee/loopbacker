@@ -21,6 +21,10 @@ struct MenuBarPanel: View {
             header
                 .padding(.bottom, 12)
             sourcesList
+            if routingState.sources.contains(where: { $0.isEnabled && !$0.isMuted }) {
+                LoudnessPanelView(compact: true)
+                    .padding(.top, 10)
+            }
             Divider()
                 .padding(.vertical, 12)
             noiseSuppressionRow

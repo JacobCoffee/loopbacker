@@ -26,6 +26,10 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
     /// Live meter levels for the UI; written by the 30 Hz meter timer on the main thread.
     let meters = MeterLevels()
 
+    /// Live loudness readings for each measured virtual device; same visibility-gated 30 Hz
+    /// publish path as `meters`.
+    let loudness = LoudnessLevels()
+
     /// Current effects preset — applied to new routes and propagated to existing ones
     var currentEffectsPreset = EffectsPreset()
     /// Noise suppression settings, opted-out capture devices, and devices whose monitor stays
@@ -123,9 +127,17 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         /// at worst produce one block with a half-applied matrix, which is inaudible.
         let mixMatrix: UnsafeMutablePointer<Float>
 
+        /// Loudness meter for what this route hands to its playback device, read directly off
+        /// the ring-read buffer in `outputRenderCallback` -- i.e. what the AUHAL output unit is
+        /// about to send, no new CoreAudio IO client. Only set for routes that feed a Loopbacker
+        /// virtual device (`measuresLoudness`); output routes to physical devices (monitoring)
+        /// don't need a loudness reading. Allocated in `init` (not the RT thread), real-time
+        /// safe to call from the callback.
+        let loudnessMeter: LoudnessMeter?
+
         init(captureDeviceUID: String, captureDeviceID: AudioObjectID, playbackDeviceID: AudioObjectID,
              playbackDeviceUID: String = "", inputChannels: UInt32, outputChannels: UInt32,
-             sampleRate: Float64, isVoiceInput: Bool = false) {
+             sampleRate: Float64, isVoiceInput: Bool = false, measuresLoudness: Bool = false) {
             self.captureDeviceUID = captureDeviceUID
             self.captureDeviceID = captureDeviceID
             self.playbackDeviceID = playbackDeviceID
@@ -134,6 +146,9 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             self.outputChannels = outputChannels
             self.sampleRate = sampleRate
             self.isVoiceInput = isVoiceInput
+            self.loudnessMeter = measuresLoudness
+                ? LoudnessMeter(sampleRate: sampleRate, channelCount: Int(outputChannels))
+                : nil
 
             meterLevelsPtr = .allocate(capacity: Int(inputChannels))
             meterLevelsPtr.initialize(repeating: 0.0, count: Int(inputChannels))
@@ -513,7 +528,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 playbackDeviceUID: "LoopbackerDevice_UID",
                 inputChannels: captureChannels,
                 outputChannels: micChannels,
-                sampleRate: sampleRate
+                sampleRate: sampleRate,
+                measuresLoudness: true
             )
             ctx.effectsChain?.updatePreset(self.currentEffectsPreset)
 
@@ -827,6 +843,19 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
         let sourceLevels = newSourceLevels
         let outputLevels = newOutputLevels
         let routesEmpty = activeRoutes.isEmpty
+        // Group loudness-measuring routes by their destination device, taking the loudest feed
+        // when more than one route targets the same virtual device at once (see
+        // `RouteContext.loudnessMeter`'s doc comment).
+        var newLoudness: [String: LoudnessReading] = [:]
+        for ctx in activeRoutes.values {
+            guard let meter = ctx.loudnessMeter else { continue }
+            var reading = newLoudness[ctx.playbackDeviceUID] ?? LoudnessReading()
+            reading.momentaryLUFS = max(reading.momentaryLUFS, meter.momentaryLUFS)
+            reading.shortTermLUFS = max(reading.shortTermLUFS, meter.shortTermLUFS)
+            reading.integratedLUFS = max(reading.integratedLUFS, meter.integratedLUFS())
+            reading.truePeakDBTP = max(reading.truePeakDBTP, meter.truePeakDBTP)
+            newLoudness[ctx.playbackDeviceUID] = reading
+        }
         MainActor.assumeIsolated {
             // Closing the main window only hides it: SwiftUI keeps its view graph alive, and each
             // publish re-renders the cables and meters of a window nobody sees. Publish only while
@@ -854,6 +883,23 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
                 meters.clearOutputs()
             } else {
                 meters.updateOutputs(outputLevels)
+            }
+            for deviceUID in loudness.readings.keys where newLoudness[deviceUID] == nil {
+                loudness.clear(deviceUID: deviceUID)
+            }
+            for (deviceUID, reading) in newLoudness {
+                loudness.update(deviceUID: deviceUID, reading)
+            }
+        }
+    }
+
+    /// Resets integrated loudness (on demand, from the UI's reset button) for every route
+    /// currently feeding the given virtual device.
+    func resetIntegratedLoudness(deviceUID: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            for ctx in self.activeRoutes.values where ctx.playbackDeviceUID == deviceUID {
+                ctx.loudnessMeter?.resetIntegrated()
             }
         }
     }
@@ -931,7 +977,8 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             inputChannels: inputChannels,
             outputChannels: micChannels,
             sampleRate: sampleRate,
-            isVoiceInput: true
+            isVoiceInput: true,
+            measuresLoudness: true
         )
         ctx.effectsChain?.updatePreset(currentEffectsPreset)
         applyNoiseSuppression(to: ctx)
@@ -1679,6 +1726,11 @@ private func outputRenderCallback(
 
     // Read from the ring buffer into the output
     ctx.readFromRing(outputBuffer, frames: inNumberFrames)
+
+    // Measure loudness of exactly what's about to reach the playback device, for routes that
+    // feed a Loopbacker virtual device (see `RouteContext.loudnessMeter`'s doc comment for why
+    // this is per-route rather than a true cross-route sum).
+    ctx.loudnessMeter?.process(outputBuffer, frames: Int(inNumberFrames), channels: Int(ctx.outputChannels))
 
     return noErr
 }
