@@ -116,6 +116,7 @@ jobs:
             Loopbacker.app/Contents/Resources/Loopbacker.driver
 
           codesign --force --options runtime \
+            --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app
 
@@ -123,9 +124,9 @@ jobs:
         if: steps.secrets.outputs.has_cert != 'true'
         run: |
           echo "::notice::No signing certificate found — using ad-hoc signature"
-          codesign --force --sign - \
-            Loopbacker.app/Contents/Resources/Loopbacker.driver
-          codesign --force --sign - \
+          codesign --force --options runtime \
+            --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
+            --sign - \
             Loopbacker.app
 
       # ── Notarization ─────────────────────────────────────────────
