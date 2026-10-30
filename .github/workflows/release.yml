@@ -70,6 +70,7 @@ jobs:
           cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/RNNoise-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt Loopbacker.app/Contents/Resources/
+          cp App/Loopbacker/Resources/SpeexDSP-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
           xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
             --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \

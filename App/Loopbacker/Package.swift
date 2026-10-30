@@ -15,9 +15,21 @@ let package = Package(
             name: "CRNNoise",
             path: "CRNNoise"
         ),
+        .target(
+            name: "CSpeexAEC",
+            path: "CSpeexAEC",
+            exclude: ["LICENSE"],
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("include"),
+                .define("FLOATING_POINT"),
+                .define("USE_KISS_FFT"),
+                .define("EXPORT", to: "")
+            ]
+        ),
         .executableTarget(
             name: "Loopbacker",
-            dependencies: ["CRNNoise"],
+            dependencies: ["CRNNoise", "CSpeexAEC"],
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
