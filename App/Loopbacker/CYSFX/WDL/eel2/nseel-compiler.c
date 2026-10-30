@@ -5182,6 +5182,20 @@ had_error:
   freeBlocks(&ctx->blocks_head_code,1);
   freeBlocks(&ctx->blocks_head_data,0);
 
+#if defined(__APPLE__) && !defined(EEL_DOESNT_NEED_EXEC_PERMS)
+  // Loopbacker patch (LB-JIT-001): eel_set_blocks_allow_execute(...,1) above only runs when
+  // compilation succeeded (the `if (startpts || ...)` branch at the top of this function). A
+  // compile that fails after __newBlock_align has already mapped at least one code block (e.g.
+  // a syntax error in a later section/function) leaves this thread's JIT pages writable
+  // (pthread_jit_write_protect_np(0), set on allocation) with no matching restore -- the
+  // blocks themselves are freed just above, but the per-thread write-protect flag is not a
+  // page-table bit, so freeing the mapping does not reset it. Swift's cooperative-pool threads
+  // are reused across unrelated script compiles, so a thread left writable here could still
+  // modify every other script's already-compiled JIT code until it next compiles successfully.
+  // Restore write-protect unconditionally, on every exit path, regardless of outcome.
+  pthread_jit_write_protect_np(1);
+#endif
+
   if (handle)
   {
     handle->compile_flags = compile_flags;

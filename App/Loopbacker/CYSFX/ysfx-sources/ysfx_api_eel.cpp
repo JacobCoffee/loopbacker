@@ -145,13 +145,36 @@ const char *ysfx_string_access_unlocked(ysfx_t *fx, ysfx_real id, WDL_FastString
 }
 
 //------------------------------------------------------------------------------
-// NOTE(jpc) implement this? I guess probably not.
-//     DSP and UI should not mutex each other.
+// Loopbacker patch (LB-JSFX-002): upstream leaves these as empty stubs ("DSP and UI should
+// not mutex each other"), but EEL2 itself relies on them for more than DSP/UI coordination:
+// lazy RAM/gmem block allocation (WDL/eel2/nseel-ram.c), the process-wide global-variable list
+// and VM refcount, and function-table sorting (WDL/eel2/nseel-compiler.c) are all guarded only
+// by these two calls, with no synchronization of their own. Loopbacker runs one ysfx
+// instance's code on three threads with no host-side lock otherwise: `@sample` on the IO
+// thread, `@gfx` on the main thread's timer, and `@serialize` (via ysfx_save_state) from
+// JSFXNode.captureState on the main actor while the graph is live -- an empty stub here is a
+// real data race the first time two of them touch a RAM/gmem block at once. A single
+// process-wide recursive mutex is the fix: WDL already ships one (WDL_Mutex, pthread
+// PTHREAD_MUTEX_RECURSIVE on this platform, included above via WDL/mutex.h) -- recursive
+// because some of the guarded call sites can nest. The IO thread only reaches these paths when
+// it allocates (lazy RAM first-touch); ysfx's own prealloc/`@init` warm-up (see
+// CYSFX/README.md) is what keeps that off the IO thread in the common case, not this mutex --
+// JSFXNode additionally serializes `ysfx_save_state` against `process()` with its own
+// IO-thread-never-blocks try-lock (see JSFXNode.swift) so this mutex is never contended from
+// the IO thread under that coordination; it exists for correctness of the EEL2-internal paths
+// themselves, not as this host's real-time-safety guarantee.
+static WDL_Mutex &ysfx_host_mutex()
+{
+    static WDL_Mutex mutex;
+    return mutex;
+}
 
 void NSEEL_HOSTSTUB_EnterMutex()
 {
+    ysfx_host_mutex().Enter();
 }
 
 void NSEEL_HOSTSTUB_LeaveMutex()
 {
+    ysfx_host_mutex().Leave();
 }

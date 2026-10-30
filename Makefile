@@ -58,7 +58,8 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp -R App/Loopbacker/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework \
 		$(APP_CONTENTS)/Frameworks/
 	scripts/sign-sparkle.sh $(BUILD_DIR)/$(APP_BUNDLE) "$(SIGN_IDENTITY)"
-	codesign --force --deep --options runtime --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
+	codesign --force --options runtime --sign "$(SIGN_IDENTITY)" $(APP_CONTENTS)/Resources/Loopbacker.driver
+	codesign --force --options runtime --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
 		--sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	codesign --verify --deep --strict $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."

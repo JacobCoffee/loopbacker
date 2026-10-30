@@ -102,6 +102,54 @@ runtime build — that requires the AU slice's actual signed `.app` to be tested
 notarized target `.app`). No other JIT-related entitlement, Info.plist key, or sandbox exception
 is required by ysfx/EEL2 itself.
 
+
+## LB-JIT-001: restore write-protect on every `NSEEL_code_compile_ex` exit
+`eel_set_blocks_allow_execute(handle->blocks_code, 1)` (the call that flips this thread's JIT
+pages back to execute-only) only runs on the success path, inside the `if (startpts || ...)`
+branch. A compile that fails after `__newBlock_align` has already mapped at least one code
+block (e.g. a syntax error in a later section/function, after an earlier one allocated) left
+the thread's `pthread_jit_write_protect_np` flag in write mode with nothing to restore it.
+Swift's cooperative-pool threads are reused across unrelated script compiles, so a thread left
+writable this way could still modify every other already-compiled script's JIT code until it
+next compiled successfully. `WDL/eel2/nseel-compiler.c`'s `NSEEL_code_compile_ex` now calls
+`pthread_jit_write_protect_np(1)` unconditionally, under `#if defined(__APPLE__) &&
+!defined(EEL_DOESNT_NEED_EXEC_PERMS)`, right after the `freeBlocks` calls near the end of the
+function — after every path (success or failure) has released this call's own code/data
+blocks, and before the function returns.
+
+## LB-JSFX-002: a real EEL host mutex
+Upstream's `NSEEL_HOSTSTUB_EnterMutex`/`LeaveMutex` (`ysfx_api_eel.cpp`) are empty stubs
+("DSP and UI should not mutex each other"), but EEL2 itself relies on them for more than DSP/UI
+coordination: lazy RAM/gmem block allocation (`WDL/eel2/nseel-ram.c`), the process-wide
+global-variable list and VM refcount, and function-table sorting (`WDL/eel2/nseel-compiler.c`)
+are all guarded only by these two calls. Loopbacker runs one `ysfx_t*`'s code on three threads
+(`@sample` on the IO thread, `@gfx` on the main thread, `@serialize` via `ysfx_save_state` from
+`JSFXNode.captureState` on the main actor) with no host-side lock otherwise, so the empty stubs
+left a real data race. `ysfx_api_eel.cpp` now implements both stubs with a process-wide
+recursive `WDL_Mutex` (already vendored, pthread `PTHREAD_MUTEX_RECURSIVE` on this platform).
+`JSFXNode` additionally serializes `ysfx_save_state` against `process()` itself with an
+IO-thread-never-blocks atomic try-lock (see `JSFXNode.swift`): if `process()` can't acquire it
+because a capture is in flight, it skips that one block's `ysfx_process_float` call entirely
+(passes the block through dry) rather than waiting. `@gfx` running concurrently with `@sample`
+with no *VM-state* lock between them is unchanged and is JSFX's own upstream concurrency model,
+not a gap introduced here (see "`@gfx` (main thread) runs concurrently with `@sample`" below).
+
+## LB-PRESET-001: JSFX file access confined to relative paths under the data root
+`ysfx_find_data_file` (`ysfx.cpp`) is the backing implementation for the `file_*` EEL opcodes a
+script calls with `file_open()`. Upstream honors any absolute path a script's own string data
+names (`accept_absolute`/`ysfx_string_get`), which let a script read any file the user's TCC
+grants allow under Loopbacker's identity and feed the bytes into the voice chain's output — the
+virtual mic other call participants hear, and whatever records it. `ysfx_find_data_file` no
+longer honors `accept_absolute` at all: only the two relative candidates (next to the script,
+and under `fx->config->data_root`) are tried, and a new `ysfx::path_contains_dotdot` check
+(`ysfx_utils.cpp`/`.hpp`) rejects any candidate with a `..` path component before it is built,
+closing parent-directory traversal out of the data root too. `JSFXNode.load` (Swift side) sets
+`ysfx_set_data_root` explicitly to the resolved catalog root the effect was loaded from (rather
+than relying only on `ysfx_guess_file_roots`'s heuristic), and independently validates
+`ref.identifier` resolves (after symlink resolution) under one of the two known catalog roots
+before ever calling into ysfx — see `JSFXNode.swift` and `FXNodeConfig.swift`'s
+`FXPluginRef.identifier` doc comment for the on-disk/persisted format.
+
 ## EEL2 RAM/gmem allocation on the IO thread
 EEL2's implicit per-script "memory" array (`x[123] = ...`) and the cross-script shared `gmem()`
 pool are both backed by `WDL/eel2/nseel-ram.c`'s `__NSEEL_RAMAlloc`/`__NSEEL_RAMAllocGMEM`: each

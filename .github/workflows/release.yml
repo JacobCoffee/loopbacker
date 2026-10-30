@@ -125,13 +125,13 @@ jobs:
       - name: Code sign (Developer ID)
         if: steps.secrets.outputs.has_cert == 'true'
         run: |
-          codesign --force --options runtime \
+          codesign --force --options runtime --timestamp \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app/Contents/Resources/Loopbacker.driver
 
           scripts/sign-sparkle.sh Loopbacker.app "$SIGNING_IDENTITY" --hardened
 
-          codesign --force --options runtime \
+          codesign --force --options runtime --timestamp \
             --entitlements App/Loopbacker/Resources/Loopbacker.entitlements \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app
