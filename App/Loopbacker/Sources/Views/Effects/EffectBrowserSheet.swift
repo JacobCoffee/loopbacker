@@ -7,6 +7,7 @@ import SwiftUI
 struct EffectBrowserSheet: View {
     @EnvironmentObject var fxEngine: FXEngine
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     /// Called with a built-in kind, or a hosted plugin ref to insert.
     let onInsertBuiltin: (FXNodeKind) -> Void
@@ -80,13 +81,25 @@ struct EffectBrowserSheet: View {
             }
 
             HStack(alignment: .top, spacing: 0) {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        content
+                Group {
+                    if snapshotRendering {
+                        // `ScrollView` (and `LazyVStack`) render blank offscreen (confirmed
+                        // repro); a plain `VStack` with no scroll container shows the real list
+                        // content in render tests.
+                        VStack(alignment: .leading, spacing: 4) { content }.padding(Metrics.panelPadding)
+                            .frame(maxHeight: 420, alignment: .top)
+                            .clipped()
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                content
+                            }
+                            .padding(Metrics.panelPadding)
+                        }
                     }
-                    .padding(Metrics.panelPadding)
                 }
                 .frame(minWidth: 320)
+
 
                 if let selectedPlugin, tab == .airwindows {
                     Divider()
@@ -237,10 +250,18 @@ struct EffectBrowserSheet: View {
             if let category = plugin.category {
                 Text(category).font(.caption).foregroundStyle(.secondary)
             }
-            ScrollView {
-                Text(AirwindowsNode.documentation(for: plugin.ref) ?? plugin.summary ?? "No documentation available.")
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if snapshotRendering {
+                    Text(AirwindowsNode.documentation(for: plugin.ref) ?? plugin.summary ?? "No documentation available.")
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ScrollView {
+                        Text(AirwindowsNode.documentation(for: plugin.ref) ?? plugin.summary ?? "No documentation available.")
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
             Spacer()
         }

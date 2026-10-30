@@ -154,6 +154,7 @@ struct AutoSetupView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     private enum Phase {
         case idle
@@ -228,47 +229,55 @@ struct AutoSetupView: View {
 
     @ViewBuilder
     private func resultContent(_ result: AutoSetupResult) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Measurements").font(.subheadline.weight(.semibold))
-                    measurementRow("Noise Floor", value: result.noiseFloorDBFS, unit: "dB")
-                    measurementRow("Speech Loudness", value: result.speechLUFS, unit: "LUFS")
-                    measurementRow("Peak", value: result.peakDBFS, unit: "dB")
-                    measurementRow("Sibilance", value: result.sibilanceDB, unit: "dB")
-                    measurementRow("Tonal Tilt", value: result.tiltDB, unit: "dB/oct")
-                }
+        // `ScrollView` renders blank offscreen (confirmed repro); skip it in render tests.
+        if snapshotRendering {
+            resultInnerContent(result)
+        } else {
+            ScrollView { resultInnerContent(result) }
+        }
+    }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Findings").font(.subheadline.weight(.semibold))
-                    ForEach(result.findings, id: \.self) { finding in
-                        HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(Color.loopbacker)
-                                .font(.caption)
-                            Text(finding).font(.callout).fixedSize(horizontal: false, vertical: true)
-                        }
+    @ViewBuilder
+    private func resultInnerContent(_ result: AutoSetupResult) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Measurements").font(.subheadline.weight(.semibold))
+                measurementRow("Noise Floor", value: result.noiseFloorDBFS, unit: "dB")
+                measurementRow("Speech Loudness", value: result.speechLUFS, unit: "LUFS")
+                measurementRow("Peak", value: result.peakDBFS, unit: "dB")
+                measurementRow("Sibilance", value: result.sibilanceDB, unit: "dB")
+                measurementRow("Tonal Tilt", value: result.tiltDB, unit: "dB/oct")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Findings").font(.subheadline.weight(.semibold))
+                ForEach(result.findings, id: \.self) { finding in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Color.loopbacker)
+                            .font(.caption)
+                        Text(finding).font(.callout).fixedSize(horizontal: false, vertical: true)
                     }
                 }
+            }
 
-                beforeAfterSummary(result)
+            beforeAfterSummary(result)
 
-                HStack {
-                    Button("Cancel") { dismiss() }
-                        .buttonStyle(.glass)
-                        .tint(nil)
-                    Spacer()
-                    Button("Apply") {
-                        var applied = result.preset
-                        applied.isEnabled = true
-                        routingState.effectsPreset = applied
-                        routingState.noiseSuppression = result.noiseSuppression
-                        routingState.save()
-                        dismiss()
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(.loopbacker)
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.glass)
+                    .tint(nil)
+                Spacer()
+                Button("Apply") {
+                    var applied = result.preset
+                    applied.isEnabled = true
+                    routingState.effectsPreset = applied
+                    routingState.noiseSuppression = result.noiseSuppression
+                    routingState.save()
+                    dismiss()
                 }
+                .buttonStyle(.glassProminent)
+                .tint(.loopbacker)
             }
         }
     }

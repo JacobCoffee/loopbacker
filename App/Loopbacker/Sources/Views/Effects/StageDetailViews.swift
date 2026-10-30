@@ -11,6 +11,30 @@ import SwiftUI
 
 private let meterTick: TimeInterval = 1.0 / 20.0
 
+// MARK: - Preview overrides (offscreen render tests)
+
+private struct PreviewMetersKey: EnvironmentKey {
+    static let defaultValue: [UUID: FXMeters] = [:]
+}
+private struct PreviewLoadErrorsKey: EnvironmentKey {
+    static let defaultValue: [UUID: String] = [:]
+}
+
+extension EnvironmentValues {
+    /// Offscreen render tests only: substitutes a node's live `FXMeters` so a render can show
+    /// mid-level activity without a real audio chain running. Empty (no override) in the app.
+    var previewMeters: [UUID: FXMeters] {
+        get { self[PreviewMetersKey.self] }
+        set { self[PreviewMetersKey.self] = newValue }
+    }
+    /// Offscreen render tests only: substitutes `FXEngine.nodeLoadErrors` so a render can show
+    /// the hosted-node load-error state without actually failing to load a plugin.
+    var previewLoadErrors: [UUID: String] {
+        get { self[PreviewLoadErrorsKey.self] }
+        set { self[PreviewLoadErrorsKey.self] = newValue }
+    }
+}
+
 /// Shared "no live signal" caption, shown under a resting visual.
 private struct RestingCaption: View {
     var body: some View {
@@ -27,6 +51,7 @@ private struct RestingCaption: View {
 struct GateVisual: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
+    @Environment(\.previewMeters) private var previewMeters
     let nodeID: UUID
 
     private var thresholdSpec: FXParamSpec { FXBuiltinSpecs.gate.first { $0.id == "threshold" }! }
@@ -51,7 +76,7 @@ struct GateVisual: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: meterTick)) { _ in
-            let meters = fxEngine.liveNode(id: nodeID)?.meters
+            let meters = previewMeters[nodeID] ?? fxEngine.liveNode(id: nodeID)?.meters
             let inputDB = meters.map { fxLinearToDB($0.inputPeak) } ?? -80
             let openness = meters?.activity ?? 0
             let isOpen = openness > 0.5
@@ -111,7 +136,7 @@ struct GateVisual: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if fxEngine.liveNode(id: nodeID) == nil { RestingCaption() }
+                if meters == nil { RestingCaption() }
             }
         }
     }
@@ -124,6 +149,7 @@ struct GateVisual: View {
 struct CompressorVisual: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
+    @Environment(\.previewMeters) private var previewMeters
     let nodeID: UUID
 
     private func value(_ id: String) -> Float {
@@ -143,7 +169,7 @@ struct CompressorVisual: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: meterTick)) { _ in
-            let meters = fxEngine.liveNode(id: nodeID)?.meters
+            let meters = previewMeters[nodeID] ?? fxEngine.liveNode(id: nodeID)?.meters
             let inputDB = meters.map { fxLinearToDB($0.inputPeak) } ?? -60
             let gr = meters?.gainReductionDB ?? 0
             let threshold = value("threshold")
@@ -212,7 +238,7 @@ struct CompressorVisual: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Gain reduction, \(String(format: "%.1f", gr)) dB")
 
-                if fxEngine.liveNode(id: nodeID) == nil { RestingCaption() }
+                if meters == nil { RestingCaption() }
             }
         }
     }
@@ -224,6 +250,7 @@ struct CompressorVisual: View {
 struct LevelerVisual: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
+    @Environment(\.previewMeters) private var previewMeters
     let nodeID: UUID
 
     private func value(_ id: String) -> Float {
@@ -233,7 +260,7 @@ struct LevelerVisual: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: meterTick)) { _ in
-            let meters = fxEngine.liveNode(id: nodeID)?.meters
+            let meters = previewMeters[nodeID] ?? fxEngine.liveNode(id: nodeID)?.meters
             // `activity` documented per-stage: the leveler reports measured short-term loudness
             // mapped into -40...0 LUFS-ish range for display.
             let measured = meters.map { -40 + $0.activity * 40 } ?? value("target")
@@ -268,12 +295,12 @@ struct LevelerVisual: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("Gain \(gain >= 0 ? "+" : "")\(String(format: "%.1f", -gain)) dB")
+                    Text(String(format: "Gain %+.1f dB", -gain))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
 
-                if fxEngine.liveNode(id: nodeID) == nil { RestingCaption() }
+                if meters == nil { RestingCaption() }
             }
         }
     }
@@ -284,11 +311,12 @@ struct LevelerVisual: View {
 /// Sibilance-reduction activity meter.
 struct DeEsserVisual: View {
     @EnvironmentObject var fxEngine: FXEngine
+    @Environment(\.previewMeters) private var previewMeters
     let nodeID: UUID
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: meterTick)) { _ in
-            let meters = fxEngine.liveNode(id: nodeID)?.meters
+            let meters = previewMeters[nodeID] ?? fxEngine.liveNode(id: nodeID)?.meters
             let activity = meters?.activity ?? 0
 
             VStack(alignment: .leading, spacing: 6) {
@@ -314,7 +342,7 @@ struct DeEsserVisual: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("De-esser activity, \(Int(activity * 100)) percent")
 
-                if fxEngine.liveNode(id: nodeID) == nil { RestingCaption() }
+                if meters == nil { RestingCaption() }
             }
         }
     }
@@ -326,6 +354,7 @@ struct DeEsserVisual: View {
 struct LimiterVisual: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
+    @Environment(\.previewMeters) private var previewMeters
     let nodeID: UUID
 
     private func value(_ id: String) -> Float {
@@ -335,7 +364,7 @@ struct LimiterVisual: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: meterTick)) { _ in
-            let meters = fxEngine.liveNode(id: nodeID)?.meters
+            let meters = previewMeters[nodeID] ?? fxEngine.liveNode(id: nodeID)?.meters
             let gr = meters?.gainReductionDB ?? 0
             let ceiling = value("ceiling")
 
@@ -367,7 +396,7 @@ struct LimiterVisual: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
 
-                if fxEngine.liveNode(id: nodeID) == nil { RestingCaption() }
+                if meters == nil { RestingCaption() }
             }
         }
     }

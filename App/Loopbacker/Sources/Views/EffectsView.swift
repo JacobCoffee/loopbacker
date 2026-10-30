@@ -11,6 +11,9 @@ struct EffectsView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.previewMeters) private var previewMeters
+    @Environment(\.previewLoadErrors) private var previewLoadErrors
     @Namespace private var chainNamespace
 
     private enum Mode: String, CaseIterable, Identifiable {
@@ -55,36 +58,18 @@ struct EffectsView: View {
     private var activeCount: Int { nodes.filter(\.enabled).count }
 
     var body: some View {
-        ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
-                adviceBanner
-
-                Picker("Mode", selection: $mode) {
-                    ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 360)
-
-                noiseSuppressionCard
-
-                if !preset.isEnabled {
-                    disabledPrompt
-                }
-
-                switch mode {
-                case .simple:
-                    EffectsSimpleView(showingAutoSetup: $showingAutoSetup)
-                        .opacity(preset.isEnabled ? 1 : 0.6)
-                case .advanced:
-                    advancedBody
-                }
-
-                AppAudioSection()
+        Group {
+            if snapshotRendering {
+                // `ImageRenderer` renders `ScrollView` content as a blank rect (confirmed with
+                // an isolated repro: identical content inside vs. outside a `ScrollView` offscreen
+                // renders content vs. nothing) — swap in a plain, non-scrolling container so
+                // offscreen render tests still see the real page instead of an empty canvas.
+                pageContent
+            } else {
+                ScrollView(.vertical) { pageContent }
+                    .scrollEdgeEffectStyle(.soft, for: .top)
             }
-            .padding(Metrics.canvasMargin)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationSubtitle(preset.isEnabled ? "\(activeCount) of \(nodes.count) active" : "Bypassed")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -128,6 +113,36 @@ struct EffectsView: View {
         }
     }
 
+    private var pageContent: some View {
+        VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            adviceBanner
+
+            Picker("Mode", selection: $mode) {
+                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 360)
+
+            noiseSuppressionCard
+
+            if !preset.isEnabled {
+                disabledPrompt
+            }
+
+            switch mode {
+            case .simple:
+                EffectsSimpleView(showingAutoSetup: $showingAutoSetup)
+                    .opacity(preset.isEnabled ? 1 : 0.6)
+            case .advanced:
+                advancedBody
+            }
+
+            AppAudioSection()
+        }
+        .padding(Metrics.canvasMargin)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
     private var masterBinding: Binding<Bool> {
         Binding(
             get: { preset.isEnabled },
@@ -162,32 +177,11 @@ struct EffectsView: View {
         TimelineView(.periodic(from: .now, by: 5)) { _ in
             let advice = CallAppAdviceCatalog.running().filter { !dismissedAdviceIDs.contains($0.id) }
             if let first = advice.first {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "info.circle.fill")
-                        .foregroundStyle(Color.loopbacker)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(first.appName) is running").font(.callout.weight(.semibold))
-                        Text(first.advice)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 8)
-                    Button {
-                        var ids = dismissedAdviceIDs
-                        ids.insert(first.id)
-                        dismissedAdviceCSV = ids.joined(separator: ",")
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(.borderless)
-                    .tint(nil)
-                    .help("Dismiss this tip")
-                    .accessibilityLabel("Dismiss \(first.appName) tip")
-                }
-                .padding(.horizontal, Metrics.panelPadding)
-                .padding(.vertical, 10)
-                .glassPanel(cornerRadius: Metrics.innerRadius, tint: Color.loopbacker.opacity(0.06))
+                CallAppAdviceBanner(advice: first, onDismiss: {
+                    var ids = dismissedAdviceIDs
+                    ids.insert(first.id)
+                    dismissedAdviceCSV = ids.joined(separator: ",")
+                })
                 .transition(.opacity)
             }
         }
@@ -498,7 +492,7 @@ struct EffectsView: View {
                         },
                         namespace: chainNamespace,
                         activity: activityValue(for: node),
-                        loadError: fxEngine.nodeLoadErrors[node.id],
+                        loadError: nodeLoadError(for: node.id),
                         isHosted: node.kind.isHosted,
                         onDuplicate: { duplicateNode(node.id) },
                         onRemove: nodes.count > 1 ? { removeNode(node.id) } : nil,
@@ -549,12 +543,18 @@ struct EffectsView: View {
     /// from that stage's `FXMeters` (gate openness, de-esser/leveler activity, normalized gain
     /// reduction for compressor/limiter). Nil when no voice chain is running.
     private func activityValue(for node: FXNodeConfig) -> Float? {
-        guard let meters = fxEngine.liveNode(id: node.id)?.meters else { return nil }
+        guard let meters = previewMeters[node.id] ?? fxEngine.liveNode(id: node.id)?.meters else { return nil }
         switch node.kind {
         case .gate, .deEsser, .leveler: return meters.activity
         case .compressor, .limiter: return min(1, meters.gainReductionDB / 18)
         default: return min(1, meters.outputPeak)
         }
+    }
+
+    /// A hosted node's load-error message, preferring an offscreen-render-test override (see
+    /// `EnvironmentValues.previewLoadErrors`) over the live engine's `nodeLoadErrors`.
+    private func nodeLoadError(for id: UUID) -> String? {
+        previewLoadErrors[id] ?? fxEngine.nodeLoadErrors[id]
     }
 
     private func handleDrop(_ items: [String], ontoIndex index: Int) -> Bool {
@@ -691,7 +691,7 @@ struct EffectsView: View {
 
             Divider()
 
-            if let loadError = fxEngine.nodeLoadErrors[node.id] {
+            if let loadError = nodeLoadError(for: node.id) {
                 hostedLoadErrorBanner(node, message: loadError)
             } else {
                 if node.kind == .gate && node.enabled && routingState.noiseSuppression.isEnabled {
@@ -1051,5 +1051,37 @@ private struct ABCompareControl: View {
         .accessibilityValue(fxEngine.abBypassed ? "Bypassed (B)" : "Processed (A)")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { fxEngine.setABBypass(!fxEngine.abBypassed) }
+    }
+}
+
+// MARK: - Call app advice banner (standalone for direct preview/render-test use)
+
+struct CallAppAdviceBanner: View {
+    let advice: CallAppAdvice
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(Color.loopbacker)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(advice.appName) is running").font(.callout.weight(.semibold))
+                Text(advice.advice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .tint(nil)
+            .help("Dismiss this tip")
+            .accessibilityLabel("Dismiss \(advice.appName) tip")
+        }
+        .padding(.horizontal, Metrics.panelPadding)
+        .padding(.vertical, 10)
+        .glassPanel(cornerRadius: Metrics.innerRadius, tint: Color.loopbacker.opacity(0.06))
     }
 }

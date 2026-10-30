@@ -10,6 +10,7 @@ struct EffectsSimpleView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.previewMeters) private var previewMeters
 
     @Binding var showingAutoSetup: Bool
 
@@ -101,8 +102,8 @@ struct EffectsSimpleView: View {
             TimelineView(.periodic(from: .now, by: 1.0 / 20.0)) { _ in
                 let firstID = routingState.effectsPreset.nodes.first(where: \.enabled)?.id
                 let lastID = routingState.effectsPreset.nodes.last(where: \.enabled)?.id
-                let inputPeak = firstID.flatMap { fxEngine.liveNode(id: $0)?.meters.inputPeak } ?? 0
-                let outputPeak = lastID.flatMap { fxEngine.liveNode(id: $0)?.meters.outputPeak } ?? 0
+                let inputPeak = firstID.flatMap { previewMeters[$0]?.inputPeak ?? fxEngine.liveNode(id: $0)?.meters.inputPeak } ?? 0
+                let outputPeak = lastID.flatMap { previewMeters[$0]?.outputPeak ?? fxEngine.liveNode(id: $0)?.meters.outputPeak } ?? 0
                 let target = routingState.effectsPreset.nodes.first(where: { $0.kind == .leveler })?.params["target"] ?? -18
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -110,7 +111,7 @@ struct EffectsSimpleView: View {
                     meterRow(label: "Output", peak: outputPeak, target: target)
                 }
             }
-            if fxEngine.liveNode(id: routingState.effectsPreset.nodes.first?.id ?? UUID()) == nil {
+            if previewMeters.isEmpty, fxEngine.liveNode(id: routingState.effectsPreset.nodes.first?.id ?? UUID()) == nil {
                 Text("Not processing audio — route a mic to see live levels.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

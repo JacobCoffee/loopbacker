@@ -116,7 +116,7 @@ struct ChainTerminalTile: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .glassEffect(.regular, in: .capsule)
+            .glassMaterial(Capsule())
             .glassEffectID(label, in: namespace)
             .accessibilityElement(children: .combine)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -162,6 +162,7 @@ struct QuickPresetsRow: View {
     }
 
     let presets: [Preset]
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     var body: some View {
         if !presets.isEmpty {
@@ -170,15 +171,22 @@ struct QuickPresetsRow: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(presets, id: \.name) { preset in
-                            Button(preset.name, action: preset.apply)
-                                .buttonStyle(.glass)
-                                .tint(nil)
-                                .controlSize(.small)
-                        }
+                let row = HStack(spacing: 6) {
+                    ForEach(presets, id: \.name) { preset in
+                        Button(preset.name, action: preset.apply)
+                            .buttonStyle(.glass)
+                            .tint(nil)
+                            .controlSize(.small)
                     }
+                }
+
+                // `ScrollView` renders blank offscreen (confirmed repro); the plain row wraps
+                // instead of scrolling in render tests, which is fine at the Advanced panel's
+                // 760pt width.
+                if snapshotRendering {
+                    row
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) { row }
                 }
             }
         }
