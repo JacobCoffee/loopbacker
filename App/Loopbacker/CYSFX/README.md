@@ -150,6 +150,91 @@ serializes `ysfx_compile`/`ysfx_init` process-wide behind a single `NSLock`
 (`JSFXNode.compileLock`) as the fix. This only affects loading several JSFX effects at once
 (already off the IO thread) — `process()` and parameter changes are unaffected and need no lock.
 
+## `@gfx` (main thread) runs concurrently with `@sample` (IO thread)
+`ysfx_gfx_run` and `ysfx_process_float` both execute against the *same* EEL VM instance and the
+same registered variables (sliders, `gmem`, the implicit memory array, `spl0`/`spl1`), each
+tagging the calling thread via `ysfx_set_thread_id` (`ysfx_thread_id_gfx` /
+`ysfx_thread_id_dsp`) purely for internal bookkeeping — there is **no mutex guarding concurrent
+VM execution** between the two paths. `ysfx.hpp`/`ysfx.cpp` only lock three narrow, specific
+subsystems shared across threads: `string_mutex` (the string table), `image_mutex` (gfx image
+cache), and the file list/file mutexes (`ysfx_api_file.cpp`'s `file_*` opcodes) — never a
+general "VM state" lock. This is upstream's own design: the real ysfx plugin
+(`plugin/components/graphics_view.cpp`) runs `@gfx` on JUCE's message thread while audio runs on
+the audio thread, with the same absence of a VM-wide lock, so this host matches upstream's
+concurrency model exactly rather than introducing a gap.
+
+Practical consequence: reading a slider or scalar var from `@gfx` while `@sample` writes it
+(our own `loopbacker_meter_gfx.jsfx` fixture's `peak` var is exactly this) can read a torn or
+stale `EEL_F` (8-byte double) under a true data race, which is a correctness risk (a flickering
+meter), not a safety one, on arm64/x86-64 where aligned 8-byte loads/stores are not split by the
+hardware. The one place this becomes a *memory*-safety risk is EEL2's lazy RAM/`gmem`
+first-touch `calloc` (`WDL/eel2/nseel-ram.c`, see above) — `pblocks[whichblock] = calloc(...)`
+has no lock, so a block first touched by `@gfx` and `@sample` at the same time races on a plain
+pointer write, confirmed by reading `nseel-ram.c` (not reproduced in testing: none of this
+host's fixtures or the ReaTeam scripts smoke-tested below hit it, since well-behaved JSFX
+pre-touches its buffers in `@init`, run single-threaded before either `@gfx` or `@sample` ever
+starts). This is an inherent, unfixed-upstream EEL2 property (not introduced by this host) that
+only surfaces for a script that both (a) indexes into a RAM block neither `@init` nor
+`options:prealloc` has pre-touched, and (b) does so from both `@gfx` and `@sample` before either
+side's first touch completes — documented here as an open limitation rather than silently
+papered over, since fixing it upstream-correctly would mean adding a lock EEL2's design doesn't
+have anywhere, including inside `@sample`, which the IO-thread no-locks contract forbids.
+
+`JSFXEditorViewController`'s gfx tick (`JSFXNode.ysfxHandle` calls: `ysfx_gfx_setup`,
+`ysfx_gfx_set_window_state`, `ysfx_gfx_run`, plus the mouse/keyboard forwarders) takes no lock of
+its own, and neither does `JSFXNode.process`; the only lock in this slice,
+`JSFXNode.compileLock`, is taken exclusively inside `load()`, never from `process()` or from the
+editor's `tick()` — so there is no deadlock risk between the IO thread and the gfx/main thread.
+
+## Measured: allocation, binary size, real-world smoke test
+All measurements below used a throwaway interposed-malloc harness (the `scripts/bench/count.c`
+pattern) linking directly against the built `CYSFX.o`, deleted after use; none of its code is
+committed.
+
+- **Allocation in `process()` steady state**: zero heap allocations (`malloc`/`calloc`/
+  `realloc`/`free`/`posix_memalign`/`malloc_zone_malloc`, all interposed) across 10 s of signal
+  at a 512-frame block size, after a 4-block warmup, for all three committed fixtures
+  (`loopbacker_gain_pan.jsfx`, `loopbacker_fixed_delay.jsfx`, `loopbacker_meter_gfx.jsfx`) *and*
+  for the 9 real-world ReaTeam/JSFX scripts that loaded successfully (below). Confirms
+  `JSFXNode.process`'s design (fixed in/out pointer arrays reused across calls, no Array/
+  Dictionary/String mutation, `ysfx_process_float`'s own hot path only ever indexing
+  already-allocated EEL_F storage once warmed) holds in practice, not just by code reading.
+- **Binary size**: stripped (`strip -x`) `swift build -c release` output, same worktree, CYSFX
+  target added/removed via a temporary `Package.swift`/`Sources/Hosted` swap (restored
+  afterwards; `git status` clean before and after): **7,332,664 bytes without CYSFX →
+  8,260,328 bytes with CYSFX, +927,664 bytes (≈0.88 MB, ≈12.6%)**. The bulk is EEL2's compiler/
+  JIT, LICE's software rasterizer + glyph cache, and SWELL's macOS GDI/window-system shim —
+  none of it optional for JSFX hosting with `@gfx` support.
+- **Real-world smoke test** (`ReaTeam/JSFX` at the commit cloned for this check; not committed),
+  10 scripts across dynamics, EQ, saturation/distortion, delay, reverb, one explicitly chosen
+  for `@gfx`, and others using `import`, 5 s of band-limited noise with a slow envelope at
+  512-frame blocks:
+
+  | Script | Category | Loaded | NaN-free | Latency | CPU / 512-block |
+  |---|---|---|---|---|---|
+  | `Dynamic/ersh_Transient Controller 2.jsfx` | dynamics, gfx | yes | yes | 0 ms | 0.030 ms |
+  | `Dynamic/mrelwood_BandbAss.jsfx` | dynamics/compressor, gfx | yes | yes | 0 ms | 0.091 ms |
+  | `Filter/bellesondes_eq1979.jsfx` | EQ, gfx | yes | yes | 0 ms | 0.075 ms |
+  | `Filter/tilr_QuickFilter.jsfx` | EQ, import, gfx | yes | yes | 0 ms | 0.029 ms |
+  | `Distortion/rcjach_RCInflator.jsfx` | saturation | yes | yes | 0 ms | 0.035 ms |
+  | `Distortion/Loudener.jsfx` | saturation, gfx | yes | yes | 0 ms | 0.035 ms |
+  | `Utility/CoreyScogin_TimeDelayByDistance.jsfx` | delay | yes | yes | 0 ms | 0.020 ms |
+  | `Reverb/TiaR_HadamVerb.jsfx` | reverb, import | yes | yes | 0 ms | 0.102 ms |
+  | `Filter/tilr_SKFilter.jsfx` | EQ, gfx | **no** | — | — | — |
+  | `Modulation/snjuk2_LFO.jsfx` | modulation, import, gfx | yes | yes | 0 ms | 0.019 ms |
+
+  9/10 compiled and ran cleanly (`mrelwood_BandbAss.jsfx`/`tilr_QuickFilter.jsfx` logged a
+  non-fatal `[ysfx] warning: sliderN: the enumeration has an invalid range` to stderr, no crash,
+  no NaN). `tilr_SKFilter.jsfx` failed to load: its import line reads
+  `skf.Saike_Yutani_upsamplers.jsfx-inc`, but the checked-out repo has the sibling file
+  (128 KB, present) named `skf.Saike_Yutani_upsamplers` with **no** `.jsfx-inc` extension — a
+  naming mismatch in that script's own repository, not a bug in `ysfx_resolve_import_path` or
+  this host (`ysfx_set_import_root` was correctly pointed at the script's own directory; the
+  exact sibling file ysfx asked for is simply absent under that name). None of the 10 reported
+  any latency (`pdc_delay`) — expected, since none of them are delay-compensating effects; the
+  committed `loopbacker_fixed_delay.jsfx` fixture (10 ms / 480 samples at 48 kHz) is the latency
+  coverage.
+
 ## Differences from upstream behavior
 - `NSEEL_ATOF`/`WDL_LINEPARSE_ATOF` are not overridden to the locale-independent
   `ysfx_wdl_atof` upstream's CMake wires up; plain `atof()` is used. Only matters for
