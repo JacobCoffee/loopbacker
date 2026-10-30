@@ -63,17 +63,26 @@ struct RuleEngineTests {
         #expect(resolved == nil)
     }
 
-    @Test("Resume only fires once the signals differ from the ones frozen at pause time")
+    @Test("Resume only fires once the resolved rule changes, not on any unrelated signal change")
     func manualOverrideResume() {
+        let rules = [rule("Zoom", .appLaunched(bundleID: "com.zoom.xos", appName: "Zoom"), scene: "Call")]
         let paused = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"])
 
-        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: paused))
+        // Identical signals: never resume.
+        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: paused, rules: rules))
 
-        let changed = RuleEngine.Signals(runningBundleIDs: [])
-        #expect(RuleEngine.shouldResume(pausedSignals: paused, currentSignals: changed))
-
+        // Cmd-tabbing back to an app that was already running (frontmost changes, but the
+        // resolved rule doesn't) must not override the user's manual pick.
         let frontmostChanged = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"], frontmostBundleID: "com.zoom.xos")
-        #expect(RuleEngine.shouldResume(pausedSignals: paused, currentSignals: frontmostChanged))
+        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: frontmostChanged, rules: rules))
+
+        // An unrelated device connecting (no rule references it) must not resume either.
+        let unrelatedDevice = RuleEngine.Signals(runningBundleIDs: ["com.zoom.xos"], connectedDeviceUIDs: ["unrelated-uid"])
+        #expect(!RuleEngine.shouldResume(pausedSignals: paused, currentSignals: unrelatedDevice, rules: rules))
+
+        // Zoom quitting changes which rule resolves (Zoom rule -> nil): must resume.
+        let zoomQuit = RuleEngine.Signals(runningBundleIDs: [])
+        #expect(RuleEngine.shouldResume(pausedSignals: paused, currentSignals: zoomQuit, rules: rules))
     }
 }
 

@@ -34,7 +34,22 @@ struct RoutingDesiredState: Equatable {
     /// destination device).
     var deviceChannelCounts: [String: Int] = [:]
 
-    static func compute(from config: RoutingConfig) -> RoutingDesiredState {
+    /// Clamps a route's source channel to a device's real channel count, so a route built for
+    /// a wider device still reads somewhere valid on a narrower fallback device instead of
+    /// silently reading past the end (no signal, despite a "switched successfully"
+    /// notification). Routes are never mutated to do this -- clamping only ever happens here,
+    /// at the point the active mix is computed -- so switching back to a device wide enough for
+    /// the original channel numbers restores the original mapping for free.
+    static func clampedChannel(_ channel: Int, deviceChannelCount: Int?) -> Int {
+        guard let count = deviceChannelCount, count > 0 else { return channel }
+        return min(channel, count)
+    }
+
+    /// - Parameter inputDeviceChannelCounts: Real input channel count per hardware device UID
+    ///   (not the virtual mic/output device counts in `deviceChannelCounts`), used to clamp
+    ///   route source channels when a source is bound to a narrower device than it was
+    ///   designed for (see `clampedChannel`). Unknown/omitted UIDs aren't clamped.
+    static func compute(from config: RoutingConfig, inputDeviceChannelCounts: [String: Int] = [:]) -> RoutingDesiredState {
         var state = RoutingDesiredState()
 
         for source in config.sources {
@@ -44,8 +59,14 @@ struct RoutingDesiredState: Equatable {
             guard shouldRoute else { continue }
 
             let key = source.isAppCapture ? "app:\(source.appBundleID)" : source.deviceUID
+            let deviceChannelCount = source.isAppCapture ? nil : inputDeviceChannelCounts[source.deviceUID]
             let mix = sourceRoutes
-                .map { MixEntry(sourceChannel: $0.sourceChannelId, outputChannel: $0.outputChannelId) }
+                .map {
+                    MixEntry(
+                        sourceChannel: clampedChannel($0.sourceChannelId, deviceChannelCount: deviceChannelCount),
+                        outputChannel: $0.outputChannelId
+                    )
+                }
                 .sorted { ($0.sourceChannel, $0.outputChannel) < ($1.sourceChannel, $1.outputChannel) }
             state.routes[key] = ActiveRoute(
                 key: key, isAppCapture: source.isAppCapture, bundleID: source.appBundleID,
@@ -142,5 +163,34 @@ struct SceneDiff: Equatable {
         }
 
         return result
+    }
+}
+
+/// Pure computation of what loading a scene should do: normalizes the target config's sources
+/// against the devices actually present (so a source saved against a device that's since
+/// disappeared, with its fallback already running in its place, doesn't diff as "start the
+/// missing device, stop the working fallback") before diffing it against the running config.
+/// Kept free of `AudioRouter`/`AudioDeviceManager` so it's unit-testable without a live engine.
+enum SceneLoadPlanner {
+    struct Plan {
+        /// The target config with sources rebound onto present, unclaimed devices.
+        let normalizedConfig: RoutingConfig
+        /// Device rebinds made during normalization, for the caller to notify about.
+        let deviceChanges: [RebindChange]
+        let diff: SceneDiff
+    }
+
+    static func plan(loading target: RoutingConfig, over running: RoutingConfig, presentDevices: [SystemAudioDevice]) -> Plan {
+        let rebind = DeviceRebinder.rebind(sources: target.sources, devices: presentDevices)
+        var normalizedConfig = target
+        normalizedConfig.sources = rebind.sources
+
+        let inputDeviceChannelCounts = Dictionary(
+            presentDevices.map { ($0.uid, $0.inputChannelCount) }, uniquingKeysWith: { a, _ in a }
+        )
+        let old = RoutingDesiredState.compute(from: running, inputDeviceChannelCounts: inputDeviceChannelCounts)
+        let new = RoutingDesiredState.compute(from: normalizedConfig, inputDeviceChannelCounts: inputDeviceChannelCounts)
+
+        return Plan(normalizedConfig: normalizedConfig, deviceChanges: rebind.changes, diff: SceneDiff.diff(from: old, to: new))
     }
 }

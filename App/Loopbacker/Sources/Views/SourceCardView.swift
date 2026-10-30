@@ -268,8 +268,14 @@ struct SourceCardView: View {
 
     @ViewBuilder
     private var addFallbackDeviceMenu: some View {
-        let claimed = Set(source.fallbackDevices.map(\.uid))
-        let candidates = audioDeviceManager.systemDevices.filter { $0.isInput && !claimed.contains($0.uid) }
+        let alreadyListed = Set(source.fallbackDevices.map(\.uid))
+        // Devices another source is currently bound to can't also be offered here --
+        // AudioRouter keys routing contexts by device UID, so two sources on one UID would
+        // stop/overwrite each other.
+        let claimedByOtherSources = Set(routingState.sources.filter { $0.id != source.id }.map(\.deviceUID))
+        let candidates = audioDeviceManager.systemDevices.filter {
+            $0.isInput && !alreadyListed.contains($0.uid) && !claimedByOtherSources.contains($0.uid)
+        }
 
         Menu {
             if candidates.isEmpty {
@@ -277,7 +283,7 @@ struct SourceCardView: View {
             } else {
                 ForEach(candidates) { device in
                     Button(device.name) {
-                        source.fallbackDevices.append(DeviceFallbackEntry(uid: device.uid, name: device.name))
+                        source.addFallbackDevice(DeviceFallbackEntry(uid: device.uid, name: device.name))
                         routingState.save()
                     }
                 }
