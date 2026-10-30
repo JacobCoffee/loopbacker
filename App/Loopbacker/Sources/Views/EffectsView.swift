@@ -406,12 +406,45 @@ struct EffectsView: View {
 
             Divider()
 
+            if effectName == "Gate" && enabled && routingState.noiseSuppression.isEnabled {
+                gateWithSuppressionHint
+            }
+
             quickPresetsRow(for: effectName)
 
             expandedControls(for: effectName)
         }
         .padding(Metrics.panelPadding)
         .glassPanel(cornerRadius: Metrics.panelRadius, tint: enabled ? Color.loopbacker.opacity(0.08) : nil)
+    }
+
+    /// Noise suppression already pulls the room down, so a gate on top mostly clips quiet word
+    /// endings. Shown in the Gate panel while both run.
+    private var gateWithSuppressionHint: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "waveform.badge.minus")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Noise suppression already removes background noise. On top of it, the gate mostly clips quiet word endings.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("Use Light Gate") {
+                routingState.effectsPreset.gateThresholdDB = -45
+                routingState.effectsPreset.gateReductionDB = -6
+                routingState.save()
+            }
+            .help("Threshold -45 dB, reduction -6 dB: only trims what's left between words")
+            Button("Turn Off Gate") {
+                withAnimation(.easeInOut(duration: 0.2)) { routingState.effectsPreset.gateEnabled = false }
+                routingState.save()
+            }
+            .help("Bypass the gate and let noise suppression handle the room")
+        }
+        .buttonStyle(.glass)
+        .tint(nil)
+        .controlSize(.small)
     }
 
     // MARK: - Reset effect to defaults
