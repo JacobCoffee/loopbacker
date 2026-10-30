@@ -123,13 +123,16 @@ struct RoutingCanvasView: View {
     }
 
     private var virtualMicHeader: some View {
-        HStack {
-            Text("Virtual Mic")
-                .font(.headline)
-            Spacer()
-            Text("Loopbacker")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
+            HStack {
+                Text("Virtual Mic")
+                    .font(.headline)
+                Spacer()
+                Text("Loopbacker")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            LoudnessPanelView()
         }
     }
 

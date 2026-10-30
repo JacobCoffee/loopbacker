@@ -79,12 +79,21 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
   <img src="docs/screenshots/effects-dark.png" alt="Effects section: vertical insert chain beside the parametric EQ editor" width="720">
 </p>
 
+**Loudness Meter** (ITU-R BS.1770-4 / EBU R128)
+
+- Momentary (400 ms), short-term (3 s), and gated integrated loudness, plus true peak, on each virtual device's output
+- Target presets: Voice/Podcast (-16 LUFS), Broadcast EBU R128 (-23 LUFS), or a custom target
+- "Too quiet / on target / too loud" readout in the menu bar panel and the Routing page, with a reset-integrated button
+- Measuring only -- pair with the Effects limiter/compressor for gain control
+
 **Soundboard**
 
 - Play audio files (MP3, WAV, M4A, AIFF, FLAC, CAF) through the virtual device
 - Add individual files or scan an entire folder
 - Drag and drop audio files onto the grid
 - Multiple simultaneous sounds (CoreAudio mixes them on the device)
+- Per-pad trim (waveform editor), fade in/out, play mode (one-shot/loop/hold-to-play), choke groups, restart-vs-layer retrigger, and output target (virtual mic only, or mic + speakers)
+- Loudness-matched pads: each clip's integrated loudness is measured on import and gain-matched so pads play at a consistent level, independent of per-pad volume
 - Global volume control
 - Sounds appear in Discord/Zoom/OBS as if they're your mic
 
@@ -175,7 +184,7 @@ loopbacker/
 │   ├── CRNNoise/    Vendored RNNoise (C)
 │   └── Sources/
 │       ├── Models/      AudioSource, AudioRoute, EffectsPreset, SoundboardItem
-│       ├── Services/    AudioRouter, AudioEffectsChain, NoiseSuppressor, SoundboardPlayer
+│       ├── Services/    AudioRouter, AudioEffectsChain, NoiseSuppressor, LoudnessMeter, SoundboardPlayer
 │       └── Views/       ContentView, EffectsView, SoundboardView, ...
 ├── scripts/         Install/uninstall helpers, model conversion, denoiser quality eval
 └── docs/            Architecture docs
