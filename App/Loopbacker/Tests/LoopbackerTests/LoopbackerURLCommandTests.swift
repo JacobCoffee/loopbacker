@@ -77,3 +77,62 @@ struct LoopbackerURLCommandTests {
         #expect(parse("LOOPBACKER://mute") == .mute)
     }
 }
+
+/// `LoopbackerURLSettings.allowCommands` uses `UserDefaults.standard` directly (shared with the
+/// real app's setting, same as `MicHotkeySettings`); tests save and restore the original value.
+/// Exercises only the pure gating decision (`command == .mute || allowCommands`), not
+/// `URLCommandRouter.handle(_:)` itself, which drives `ControlCenter`/`MutedOverlayController`
+/// and would show a real on-screen panel for `.unmute`.
+@Suite("LoopbackerURLSettings", .serialized)
+struct LoopbackerURLSettingsTests {
+    private func withClean(_ body: () -> Void) {
+        let original = LoopbackerURLSettings.allowCommands
+        defer { LoopbackerURLSettings.allowCommands = original }
+        body()
+    }
+
+    @Test("Off by default")
+    func offByDefault() {
+        withClean {
+            UserDefaults.standard.removeObject(forKey: "Automation.allowURLCommands")
+            #expect(LoopbackerURLSettings.allowCommands == false)
+        }
+    }
+
+    @Test("mute is always allowed regardless of the setting")
+    func muteAlwaysAllowed() {
+        withClean {
+            for allowed in [true, false] {
+                LoopbackerURLSettings.allowCommands = allowed
+                let command = LoopbackerURLCommand.mute
+                #expect(command == .mute || LoopbackerURLSettings.allowCommands)
+            }
+        }
+    }
+
+    @Test("Every non-mute command is blocked while the setting is off")
+    func nonMuteBlockedWhenOff() {
+        withClean {
+            LoopbackerURLSettings.allowCommands = false
+            let commands: [LoopbackerURLCommand] = [
+                .unmute, .toggleMute, .preset(id: "p"), .scene(name: "s"), .effects(on: true),
+            ]
+            for command in commands {
+                #expect(!(command == .mute || LoopbackerURLSettings.allowCommands))
+            }
+        }
+    }
+
+    @Test("Every command is allowed while the setting is on")
+    func allCommandsAllowedWhenOn() {
+        withClean {
+            LoopbackerURLSettings.allowCommands = true
+            let commands: [LoopbackerURLCommand] = [
+                .mute, .unmute, .toggleMute, .preset(id: "p"), .scene(name: "s"), .effects(on: true),
+            ]
+            for command in commands {
+                #expect(command == .mute || LoopbackerURLSettings.allowCommands)
+            }
+        }
+    }
+}

@@ -52,7 +52,7 @@ struct PresetAutoSwitchEngineTests {
     func decideNothingMatches() {
         let decision = PresetAutoSwitchEngine.decide(
             rules: [rule(bundleID: "com.a")], signals: .init(), fallbackPresetID: nil,
-            activeRuleID: nil, presetBeforeActiveRule: nil, lastAppliedPresetID: nil
+            activeRuleID: nil, hasCapturedBefore: false, lastAppliedPresetID: nil
         )
         #expect(decision.action == .none)
         #expect(decision.activeRuleID == nil)
@@ -62,46 +62,48 @@ struct PresetAutoSwitchEngineTests {
     func decideFallback() {
         let decision = PresetAutoSwitchEngine.decide(
             rules: [rule(bundleID: "com.a")], signals: .init(), fallbackPresetID: "fallback",
-            activeRuleID: nil, presetBeforeActiveRule: nil, lastAppliedPresetID: nil
+            activeRuleID: nil, hasCapturedBefore: false, lastAppliedPresetID: nil
         )
         #expect(decision.action == .apply(presetID: "fallback"))
         #expect(decision.activeRuleID == nil)
     }
 
-    @Test("A rule starts matching: applies its preset and remembers what was active before")
+    @Test("A rule starts matching: applies its preset and signals the caller to capture a live snapshot")
     func decideRuleActivates() {
         let r = rule(bundleID: "com.a", presetID: "p1")
         let decision = PresetAutoSwitchEngine.decide(
             rules: [r], signals: .init(runningBundleIDs: ["com.a"]), fallbackPresetID: nil,
-            activeRuleID: nil, presetBeforeActiveRule: nil, lastAppliedPresetID: "manual-preset"
+            activeRuleID: nil, hasCapturedBefore: false, lastAppliedPresetID: "manual-preset"
         )
         #expect(decision.action == .apply(presetID: "p1"))
         #expect(decision.activeRuleID == r.id)
-        #expect(decision.presetBeforeActiveRule == "manual-preset")
+        #expect(decision.shouldCaptureBeforeApplying == true)
+        #expect(decision.hasCapturedBefore == true)
     }
 
-    @Test("Same rule still matching: no change, no repeated apply")
+    @Test("Same rule still matching: no change, no repeated apply, no re-capture")
     func decideNoChange() {
         let r = rule(bundleID: "com.a", presetID: "p1")
         let decision = PresetAutoSwitchEngine.decide(
             rules: [r], signals: .init(runningBundleIDs: ["com.a"]), fallbackPresetID: nil,
-            activeRuleID: r.id, presetBeforeActiveRule: "manual-preset", lastAppliedPresetID: "p1"
+            activeRuleID: r.id, hasCapturedBefore: true, lastAppliedPresetID: "p1"
         )
         #expect(decision.action == .none)
         #expect(decision.activeRuleID == r.id)
-        #expect(decision.presetBeforeActiveRule == "manual-preset")
+        #expect(decision.hasCapturedBefore == true)
+        #expect(decision.shouldCaptureBeforeApplying == false)
     }
 
-    @Test("App quits, rule has restorePreviousOnQuit: restores the preset active before the rule")
+    @Test("App quits, rule has restorePreviousOnQuit: restores the live snapshot captured before the rule")
     func decideRestorePreviousOnQuit() {
         let r = rule(bundleID: "com.a", presetID: "p1", restorePreviousOnQuit: true)
         let decision = PresetAutoSwitchEngine.decide(
             rules: [r], signals: .init(runningBundleIDs: []), fallbackPresetID: "fallback",
-            activeRuleID: r.id, presetBeforeActiveRule: "manual-preset", lastAppliedPresetID: "p1"
+            activeRuleID: r.id, hasCapturedBefore: true, lastAppliedPresetID: "p1"
         )
-        #expect(decision.action == .restorePrevious(presetID: "manual-preset"))
+        #expect(decision.action == .restorePrevious)
         #expect(decision.activeRuleID == nil)
-        #expect(decision.presetBeforeActiveRule == nil)
+        #expect(decision.hasCapturedBefore == false)
     }
 
     @Test("App quits, rule has restorePreviousOnQuit but nothing was captured: falls through to fallback")
@@ -109,7 +111,7 @@ struct PresetAutoSwitchEngineTests {
         let r = rule(bundleID: "com.a", presetID: "p1", restorePreviousOnQuit: true)
         let decision = PresetAutoSwitchEngine.decide(
             rules: [r], signals: .init(runningBundleIDs: []), fallbackPresetID: "fallback",
-            activeRuleID: r.id, presetBeforeActiveRule: nil, lastAppliedPresetID: "p1"
+            activeRuleID: r.id, hasCapturedBefore: false, lastAppliedPresetID: "p1"
         )
         #expect(decision.action == .apply(presetID: "fallback"))
     }
@@ -119,23 +121,41 @@ struct PresetAutoSwitchEngineTests {
         let r = rule(bundleID: "com.a", presetID: "p1", restorePreviousOnQuit: false)
         let decision = PresetAutoSwitchEngine.decide(
             rules: [r], signals: .init(runningBundleIDs: []), fallbackPresetID: "fallback",
-            activeRuleID: r.id, presetBeforeActiveRule: "manual-preset", lastAppliedPresetID: "p1"
+            activeRuleID: r.id, hasCapturedBefore: true, lastAppliedPresetID: "p1"
         )
         #expect(decision.action == .apply(presetID: "fallback"))
         #expect(decision.activeRuleID == nil)
     }
 
-    @Test("Switching directly from rule A to rule B keeps the original pre-automation preset, not A's")
+    @Test("Switching directly from rule A to rule B keeps the original pre-automation capture, doesn't re-capture")
     func decideRuleToRuleKeepsOriginalPrevious() {
         let a = rule(bundleID: "com.a", presetID: "pa")
         let b = rule(bundleID: "com.b", presetID: "pb")
         // a is active, b now also matches and sits earlier in priority (so it wins).
         let decision = PresetAutoSwitchEngine.decide(
             rules: [b, a], signals: .init(runningBundleIDs: ["com.a", "com.b"]), fallbackPresetID: nil,
-            activeRuleID: a.id, presetBeforeActiveRule: "manual-preset", lastAppliedPresetID: "pa"
+            activeRuleID: a.id, hasCapturedBefore: true, lastAppliedPresetID: "pa"
         )
         #expect(decision.action == .apply(presetID: "pb"))
         #expect(decision.activeRuleID == b.id)
-        #expect(decision.presetBeforeActiveRule == "manual-preset")
+        #expect(decision.hasCapturedBefore == true)
+        #expect(decision.shouldCaptureBeforeApplying == false)
+    }
+
+    @Test(
+        """
+        A rule engages with no `lastAppliedPresetID` at all (never manually tracked, e.g. an \
+        unsaved/customized configuration): still signals a capture, unlike presetID-based \
+        bookkeeping which would stay nil forever
+        """
+    )
+    func decideCapturesEvenWithNoTrackedPresetID() {
+        let r = rule(bundleID: "com.a", presetID: "p1", restorePreviousOnQuit: true)
+        let decision = PresetAutoSwitchEngine.decide(
+            rules: [r], signals: .init(runningBundleIDs: ["com.a"]), fallbackPresetID: nil,
+            activeRuleID: nil, hasCapturedBefore: false, lastAppliedPresetID: nil
+        )
+        #expect(decision.shouldCaptureBeforeApplying == true)
+        #expect(decision.hasCapturedBefore == true)
     }
 }

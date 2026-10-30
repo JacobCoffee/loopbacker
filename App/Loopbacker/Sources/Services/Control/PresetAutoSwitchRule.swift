@@ -102,10 +102,18 @@ final class PresetAutoSwitchState: ObservableObject {
         var fallbackPresetID: String?
     }
 
+    /// Serial (not `.global(qos:)`, which is a shared concurrent pool): consecutive saves must
+    /// finish their atomic file replacements in submission order, or a faster-finishing older
+    /// snapshot can overwrite a newer one — e.g. quickly toggling a rule twice, or adding then
+    /// deleting it, could otherwise restore stale rules on next launch. Matches `RoutingState.save()`.
+    private static let saveQueue = DispatchQueue(label: "com.jacobcoffee.loopbacker.presetautoswitch.save", qos: .utility)
+
     func save() {
+        // Snapshot the state on the calling thread (main), then write on the serial queue so
+        // writes land in the order they were requested.
         let snapshot = Persisted(rules: rules, fallbackPresetID: fallbackPresetID)
         let url = Self.fileURL
-        DispatchQueue.global(qos: .utility).async {
+        Self.saveQueue.async {
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 let data = try JSONEncoder().encode(snapshot)

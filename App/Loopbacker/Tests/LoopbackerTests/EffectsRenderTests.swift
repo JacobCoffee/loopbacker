@@ -21,6 +21,7 @@ struct EffectsRenderTests {
         let routingState: RoutingState
         let audioRouter: AudioRouter
         let fxEngine: FXEngine
+        let hostedPluginStateCapture: HostedPluginStateCapture
         let tap: SystemAudioTap
         let audioDeviceManager: AudioDeviceManager
         let driverInstaller: DriverInstaller
@@ -40,10 +41,13 @@ struct EffectsRenderTests {
     }()
     private static let sharedAudioRouter: AudioRouter = { _ = appInitialized; return AudioRouter() }()
     private static let sharedFXEngine = FXEngine(audioRouter: sharedAudioRouter)
+    private static let sharedRoutingStateForCapture = RoutingState(effectsPreset: EffectsPreset())
+    private static let sharedHostedPluginStateCapture = HostedPluginStateCapture(
+        fxEngine: sharedFXEngine, routingState: sharedRoutingStateForCapture
+    )
     private static let sharedTap = SystemAudioTap()
     private static let sharedAudioDeviceManager = AudioDeviceManager()
     private static let sharedDriverInstaller = DriverInstaller()
-
     /// A realistic 6-stage chain: gate, EQ, compressor, leveler, de-esser, and a hosted Audio
     /// Unit that failed to load (so the load-error recovery state is exercised too). The hosted
     /// node keeps a stable id across every call (not a fresh random one) so it matches
@@ -79,7 +83,8 @@ struct EffectsRenderTests {
         let routingState = RoutingState(effectsPreset: Self.realisticPreset(),
                                         noiseSuppression: NoiseSuppressionSettings(isEnabled: true))
         return Context(routingState: routingState, audioRouter: Self.sharedAudioRouter,
-                       fxEngine: Self.sharedFXEngine, tap: Self.sharedTap,
+                       fxEngine: Self.sharedFXEngine, hostedPluginStateCapture: Self.sharedHostedPluginStateCapture,
+                       tap: Self.sharedTap,
                        audioDeviceManager: Self.sharedAudioDeviceManager, driverInstaller: Self.sharedDriverInstaller)
     }
 
@@ -111,6 +116,7 @@ struct EffectsRenderTests {
         let wrapped = content
             .environmentObject(context.routingState)
             .environmentObject(context.fxEngine)
+            .environmentObject(context.hostedPluginStateCapture)
             .environmentObject(context.tap)
             .environmentObject(context.audioRouter)
             .environmentObject(context.audioDeviceManager)

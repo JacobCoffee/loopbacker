@@ -17,12 +17,19 @@ final class PresetAutoSwitcher: ObservableObject {
     @Published private(set) var activeRule: PresetAutoSwitchRule?
     @Published private(set) var lastAppliedPresetID: String?
 
-    private var presetBeforeActiveRule: String?
+    /// Whether `snapshotBeforeActiveRule` currently holds a valid capture, mirroring
+    /// `PresetAutoSwitchEngine.Decision.hasCapturedBefore`.
+    private var hasCapturedBefore = false
+    /// The actual live `routingState` state (not a named preset id, which may not exist for an
+    /// unsaved/customized configuration) captured the moment the first automation rule engaged,
+    /// so a `restorePreviousOnQuit` rule — or quitting automation entirely — can put it back.
+    private var snapshotBeforeActiveRule: (preset: EffectsPreset, noiseSuppression: NoiseSuppressionSettings)?
     private var runningBundleIDs: Set<String> = []
     private var frontmostBundleID: String?
 
     private let debouncer: Debouncer
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var suppressionCancellable: AnyCancellable?
 
     init(rulesState: PresetAutoSwitchState, routingState: RoutingState, debounce: TimeInterval = 1.0) {
         self.rulesState = rulesState
@@ -46,6 +53,17 @@ final class PresetAutoSwitcher: ObservableObject {
                 }
             })
         }
+
+        // `evaluate()` skips entirely while suppressed (the Effects page is open/editing), so a
+        // matching app launching/quitting mid-edit is otherwise silently dropped: `evaluate()`
+        // returns before touching any bookkeeping, and nothing re-runs it once editing ends.
+        // Re-evaluate with the latest cached signals as soon as suppression clears.
+        suppressionCancellable = rulesState.$isSuppressedByEditing
+            .removeDuplicates()
+            .sink { [weak self] isSuppressed in
+                guard !isSuppressed else { return }
+                self?.scheduleEvaluate()
+            }
     }
 
     private func refreshSignals() {
@@ -63,7 +81,8 @@ final class PresetAutoSwitcher: ObservableObject {
 
     /// Re-evaluates rules against the current signals and applies whatever should be active.
     /// Public so tests and a manual "Re-evaluate" action can force an immediate pass. Skipped
-    /// entirely while `rulesState.isSuppressedByEditing` (the Effects page is open/editing).
+    /// entirely while `rulesState.isSuppressedByEditing` (the Effects page is open/editing);
+    /// `observe()` reschedules a pass as soon as that clears.
     func evaluate() {
         guard !rulesState.isSuppressedByEditing else { return }
 
@@ -72,26 +91,36 @@ final class PresetAutoSwitcher: ObservableObject {
             signals: currentSignals,
             fallbackPresetID: rulesState.fallbackPresetID,
             activeRuleID: activeRule?.id,
-            presetBeforeActiveRule: presetBeforeActiveRule,
+            hasCapturedBefore: hasCapturedBefore,
             lastAppliedPresetID: lastAppliedPresetID
         )
 
+        if decision.shouldCaptureBeforeApplying {
+            snapshotBeforeActiveRule = (routingState.effectsPreset, routingState.noiseSuppression)
+        }
+        hasCapturedBefore = decision.hasCapturedBefore
         activeRule = decision.activeRuleID.flatMap { id in rulesState.rules.first { $0.id == id } }
-        presetBeforeActiveRule = decision.presetBeforeActiveRule
 
-        let presetID: String
         switch decision.action {
         case .none:
             return
-        case .apply(let id), .restorePrevious(let id):
-            presetID = id
+        case .apply(let presetID):
+            guard EffectsPresetLibrary.apply(id: presetID, to: routingState) else {
+                switcherLogger.warning("Preset auto-switch referenced missing preset '\(presetID, privacy: .public)'")
+                return
+            }
+            lastAppliedPresetID = presetID
+        case .restorePrevious:
+            guard let snapshot = snapshotBeforeActiveRule else {
+                switcherLogger.warning("Preset auto-switch asked to restore with no captured snapshot")
+                return
+            }
+            routingState.effectsPreset = snapshot.preset
+            routingState.noiseSuppression = snapshot.noiseSuppression
+            routingState.save()
+            lastAppliedPresetID = nil
+            snapshotBeforeActiveRule = nil
         }
-
-        guard EffectsPresetLibrary.apply(id: presetID, to: routingState) else {
-            switcherLogger.warning("Preset auto-switch referenced missing preset '\(presetID, privacy: .public)'")
-            return
-        }
-        lastAppliedPresetID = presetID
     }
 
     isolated deinit {

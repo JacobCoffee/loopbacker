@@ -28,11 +28,14 @@ final class MutedOverlayController {
 
     private var panel: NSPanel?
     private var cancellables: Set<AnyCancellable> = []
+    private weak var micControl: MicControl?
+    private var noticeRevertWorkItem: DispatchWorkItem?
 
     private init() {}
 
     /// Starts following `micControl`. Call once at launch.
     func start(micControl: MicControl) {
+        self.micControl = micControl
         micControl.$isMuted
             .combineLatest(micControl.$pushToTalkHeld)
             .sink { [weak self] isMuted, held in
@@ -45,6 +48,22 @@ final class MutedOverlayController {
     /// overlay or moves its corner).
     func refreshFromSettings(micControl: MicControl) {
         refresh(isMuted: micControl.isMuted, pushToTalkHeld: micControl.pushToTalkHeld)
+    }
+
+    /// Shows a brief transparency notice (e.g. "Mic unmuted by URL command") in place of the
+    /// mute/PTT badge, then reverts to tracking live mute state after a few seconds
+    /// (LB-URL-001). Shown regardless of `MutedOverlaySettings.isEnabled`: the persistent badge
+    /// is opt-out, but this one-time notice about an action another app took on the user's
+    /// behalf isn't the same feature. No-op if `start(micControl:)` hasn't run yet.
+    func showNotice(_ message: String) {
+        guard let micControl else { return }
+        noticeRevertWorkItem?.cancel()
+        show(state: .notice(message: message))
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refresh(isMuted: micControl.isMuted, pushToTalkHeld: micControl.pushToTalkHeld)
+        }
+        noticeRevertWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
     }
 
     private func refresh(isMuted: Bool, pushToTalkHeld: Bool) {

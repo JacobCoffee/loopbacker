@@ -12,6 +12,12 @@ struct MutedOverlayView: View {
         case muted
         /// A push-to-talk/push-to-mute key is held and the mic is live.
         case pushToTalkLive
+        /// A brief transparency notice about an action an external URL command took on the
+        /// user's behalf (e.g. unmuting, or enabling echo cancellation) — shown instead of the
+        /// mute/PTT badge for a few seconds, then `MutedOverlayController` reverts to tracking
+        /// live mute state (LB-URL-001). Neutral gray, not loopbacker green/signalHot: it's
+        /// informational, not a live or fault state.
+        case notice(message: String)
     }
 
     let state: State
@@ -20,6 +26,7 @@ struct MutedOverlayView: View {
         switch state {
         case .muted: "mic.slash.fill"
         case .pushToTalkLive: "mic.fill"
+        case .notice: "bell.fill"
         }
     }
 
@@ -27,6 +34,7 @@ struct MutedOverlayView: View {
         switch state {
         case .muted: "Muted"
         case .pushToTalkLive: "PTT"
+        case .notice(let message): message
         }
     }
 
@@ -34,6 +42,15 @@ struct MutedOverlayView: View {
         switch state {
         case .muted: .signalHot
         case .pushToTalkLive: .loopbacker
+        case .notice: .secondary
+        }
+    }
+
+    private var accessibilityStateLabel: String {
+        switch state {
+        case .muted: "Mic muted"
+        case .pushToTalkLive: "Push to talk, mic live"
+        case .notice(let message): message
         }
     }
 
@@ -50,7 +67,7 @@ struct MutedOverlayView: View {
         .background(tint.gradient, in: Capsule())
         .glassEffect(.regular.tint(tint).interactive(false), in: .capsule)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(title == "PTT" ? "Push to talk, mic live" : "Mic muted")
+        .accessibilityLabel(accessibilityStateLabel)
         .fixedSize()
     }
 }

@@ -3,6 +3,14 @@ import AppIntents
 /// Registers Loopbacker's App Intents with Shortcuts/Siri. `shortTitle`/`systemImageName` drive
 /// the Shortcuts app gallery entry; phrases use `\(.applicationName)` so they read naturally
 /// regardless of how the app is renamed.
+///
+/// Unlike `loopbacker://` URL commands (`Services/Control/LoopbackerURLCommand.swift`, gated by
+/// Settings › General → "Allow Other Apps to Control Loopbacker", off by default), every intent
+/// below calls `ControlCenter.shared` directly and is never gated by that setting (LB-URL-001).
+/// This is deliberate, not an oversight: an intent only runs when the user (or an automation
+/// they configured themselves) explicitly invokes it through the Shortcuts app, Siri, or a
+/// Shortcuts automation they set up — unlike an arbitrary `open loopbacker://…` from any local
+/// process or a web page link, invoking a Shortcut is itself a user consent gate.
 struct LoopbackerShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(

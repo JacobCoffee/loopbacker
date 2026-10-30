@@ -57,7 +57,16 @@ private final class RecorderNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard isRecording else { return }
+        guard isRecording else {
+            // Keyboard activation into recording, mirroring a button's Space/Return press, so
+            // VoiceOver-off keyboard-only users can reach it without a mouse.
+            if event.keyCode == 49 || event.keyCode == 36 { // Space, Return
+                isRecording = true
+            } else {
+                super.keyDown(with: event)
+            }
+            return
+        }
         if event.keyCode == 53 { // Escape cancels without changing the chord
             isRecording = false
             return
@@ -73,6 +82,31 @@ private final class RecorderNSView: NSView {
     override func resignFirstResponder() -> Bool {
         isRecording = false
         return super.resignFirstResponder()
+    }
+
+    // MARK: - Accessibility
+    //
+    // `draw(_:)` paints "Click to Record"/the current chord as plain text with no accessible
+    // role, label or action, so VoiceOver and keyboard-only users have no way to discover or
+    // activate recording. Expose this as a button-shaped accessibility element: a press
+    // (VO-Space, or clicking the VoiceOver cursor) enters recording the same as `mouseDown`,
+    // and the accessible value tracks recording/idle state and the current chord.
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+
+    override func accessibilityLabel() -> String? { "Record keyboard shortcut" }
+
+    override func accessibilityValue() -> Any? {
+        if isRecording { return "Recording — press a key combination, or Escape to cancel" }
+        return displayChord?.displayString ?? "No shortcut set"
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        window?.makeFirstResponder(self)
+        isRecording = true
+        return true
     }
 
     override func draw(_ dirtyRect: NSRect) {

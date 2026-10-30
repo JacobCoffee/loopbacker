@@ -11,6 +11,9 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
     @StateObject private var fxEngine: FXEngine
+    // Persists a hosted plugin editor's state on close independent of whether EffectsView is
+    // in the view hierarchy (UX slice, [ReviewUX] LB-PLUGIN-STATE-001-equivalent finding).
+    @StateObject private var hostedPluginStateCapture: HostedPluginStateCapture
     // Mute/push-to-talk state (Control slice); the global hotkey and muted overlay are wired
     // from `init()` so they work even if the main window never opens.
     @StateObject private var micControl: MicControl
@@ -37,7 +40,11 @@ struct LoopbackerApp: App {
         _soundboardState = StateObject(wrappedValue: SoundboardState.load())
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
-        _fxEngine = StateObject(wrappedValue: FXEngine(audioRouter: audioRouter))
+        let fxEngine = FXEngine(audioRouter: audioRouter)
+        _fxEngine = StateObject(wrappedValue: fxEngine)
+        _hostedPluginStateCapture = StateObject(wrappedValue: HostedPluginStateCapture(
+            fxEngine: fxEngine, routingState: routingState
+        ))
         _micControl = StateObject(wrappedValue: micControl)
         _presetAutoSwitchState = StateObject(wrappedValue: presetAutoSwitchState)
         _presetAutoSwitcher = StateObject(wrappedValue: PresetAutoSwitcher(
@@ -71,6 +78,7 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
                 .environmentObject(fxEngine)
+                .environmentObject(hostedPluginStateCapture)
                 .environmentObject(routingSync.systemAudioTap)
                 .environmentObject(micControl)
                 .environmentObject(presetAutoSwitchState)

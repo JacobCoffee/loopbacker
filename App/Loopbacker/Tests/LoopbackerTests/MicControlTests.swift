@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import Foundation
 import Testing
 @testable import Loopbacker
@@ -122,6 +123,71 @@ struct MicControlTests {
 
             control.mode = .open
             #expect(control.pushToTalkHeld == false)
+        }
+    }
+
+    @Test("Disabling the hotkey while push-to-talk is held resets held state and restores manual control")
+    func disablingHotkeyWhileHeldResetsHeldState() async {
+        await withClean {
+            MicHotkeySettings.isEnabled = true
+            MicHotkeySettings.chord = HotkeyChord(
+                keyCode: 96, modifiers: UInt32(controlKey) | UInt32(optionKey) | UInt32(shiftKey) | UInt32(cmdKey)
+            )
+            defer {
+                MicHotkeySettings.isEnabled = false
+                MicHotkeySettings.chord = nil
+                GlobalHotkeyManager.shared.unregister()
+            }
+
+            let control = MicControl(defaults: testDefaults)
+            control.mode = .pushToTalk
+            control.refreshHotkeyRegistration()
+            #expect(control.isHotkeyActive == true)
+
+            control.hotkeyPressed()
+            #expect(control.pushToTalkHeld == true)
+            #expect(control.isMuted == false)
+
+            // User disables the global hotkey while it's physically held down.
+            MicHotkeySettings.isEnabled = false
+            control.refreshHotkeyRegistration()
+
+            #expect(control.pushToTalkHeld == false) // not stuck "transmitting"
+            #expect(control.isHotkeyActive == false)
+            #expect(control.isMuted == false) // restored to live, not stuck muted
+
+            // Manual control works again even though `mode` is still `.pushToTalk`.
+            control.toggleMute()
+            #expect(control.isMuted == true)
+        }
+    }
+
+    @Test("Replacing the chord while push-to-mute is held resets held state instead of leaving it stuck")
+    func replacingChordWhileHeldResetsHeldState() async {
+        await withClean {
+            MicHotkeySettings.isEnabled = true
+            MicHotkeySettings.chord = HotkeyChord(keyCode: 96, modifiers: UInt32(controlKey) | UInt32(cmdKey))
+            defer {
+                MicHotkeySettings.isEnabled = false
+                MicHotkeySettings.chord = nil
+                GlobalHotkeyManager.shared.unregister()
+            }
+
+            let control = MicControl(defaults: testDefaults)
+            control.mode = .pushToMute
+            control.refreshHotkeyRegistration()
+
+            control.hotkeyPressed()
+            #expect(control.pushToTalkHeld == true)
+            #expect(control.isMuted == true) // push-to-mute: held = muted
+
+            // Replace the chord while the old one is still physically held; its eventual
+            // release can never reach `hotkeyReleased()` again.
+            MicHotkeySettings.chord = HotkeyChord(keyCode: 97, modifiers: UInt32(controlKey) | UInt32(cmdKey))
+            control.refreshHotkeyRegistration()
+
+            #expect(control.pushToTalkHeld == false)
+            #expect(control.isMuted == false) // reset to this mode's idle state, not stuck muted
         }
     }
 }

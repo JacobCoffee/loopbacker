@@ -1,5 +1,27 @@
 import SwiftUI
 
+// MARK: - Hosted-plugin spec safety
+
+/// A hosted plugin's reported parameter bounds (AU v2/v3 `minValue`/`maxValue`, JSFX
+/// `slider1:...<min,max,...>`) come straight from untrusted/third-party code: ysfx doesn't
+/// validate `curve.min`/`curve.max`, and neither AU API validates its bounds either. Building
+/// `spec.min...spec.max` directly traps when reversed or non-finite — LB-UI-001.
+extension FXParamSpec {
+    /// `min...max`, safe to pass to `ClosedRange`/`Slider`: non-finite bounds fall back to
+    /// `0...1`, reversed bounds are swapped.
+    var safeRange: ClosedRange<Float> {
+        guard min.isFinite, max.isFinite else { return 0...1 }
+        return Swift.min(min, max)...Swift.max(min, max)
+    }
+
+    /// `defaultValue` clamped into `safeRange`, for the same untrusted-bounds reason.
+    var safeDefaultValue: Float {
+        let range = safeRange
+        guard defaultValue.isFinite else { return range.lowerBound }
+        return Swift.min(Swift.max(defaultValue, range.lowerBound), range.upperBound)
+    }
+}
+
 // MARK: - Live stage visuals
 //
 // Each visual polls its node's `FXMeters` at display rate via `TimelineView(.periodic)` rather
@@ -329,7 +351,7 @@ struct DeEsserVisual: View {
                             RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5))
                             RoundedRectangle(cornerRadius: 4)
                                 .fill(Color.loopbacker)
-                                .frame(width: max(2, CGFloat(activity)) * geo.size.width)
+                                .frame(width: max(2, CGFloat(min(max(activity, 0), 1)) * geo.size.width))
                                 .animation(.linear(duration: 0.08), value: activity)
                         }
                     }
@@ -430,7 +452,7 @@ struct HostedStageControls: View {
                     } else {
                         ParameterSliderRow(label: spec.name, description: spec.detail,
                                            value: paramBinding(spec: spec),
-                                           range: spec.min...spec.max, unit: spec.unit.rawValue)
+                                           range: spec.safeRange, unit: spec.unit.rawValue)
                     }
                 }
             } else {
@@ -455,7 +477,7 @@ struct HostedStageControls: View {
 
     private func paramBinding(spec: FXParamSpec) -> Binding<Float> {
         Binding(
-            get: { routingState.effectsPreset.nodes.first(where: { $0.id == node.id })?.params[spec.id] ?? spec.defaultValue },
+            get: { routingState.effectsPreset.nodes.first(where: { $0.id == node.id })?.params[spec.id] ?? spec.safeDefaultValue },
             set: { newValue in
                 guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == node.id }) else { return }
                 routingState.effectsPreset.nodes[idx].params[spec.id] = newValue
@@ -466,7 +488,10 @@ struct HostedStageControls: View {
 
     private func choiceBinding(spec: FXParamSpec) -> Binding<Int> {
         Binding(
-            get: { Int(paramBinding(spec: spec).wrappedValue.rounded()) },
+            get: {
+                let raw = paramBinding(spec: spec).wrappedValue
+                return Int(raw.isFinite ? raw.rounded() : 0)
+            },
             set: { paramBinding(spec: spec).wrappedValue = Float($0) }
         )
     }
