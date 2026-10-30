@@ -40,8 +40,8 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	cp App/Loopbacker/Resources/logo.png $(APP_CONTENTS)/Resources/
 	rm -rf $(APP_CONTENTS)/Resources/DPDFNet2_48k.mlmodelc
 	cp -R App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc $(APP_CONTENTS)/Resources/
-	rm -rf $(APP_CONTENTS)/Resources/FastEnhancer_S_48k.mlmodelc
-	cp -R App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc $(APP_CONTENTS)/Resources/
+	rm -rf $(APP_CONTENTS)/Resources/FastEnhancer_M_48k.mlmodelc
+	cp -R App/Loopbacker/Resources/FastEnhancer_M_48k.mlmodelc $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/RNNoise-LICENSE.txt $(APP_CONTENTS)/Resources/
 	cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt $(APP_CONTENTS)/Resources/

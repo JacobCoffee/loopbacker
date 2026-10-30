@@ -14,6 +14,12 @@ struct CompiledGraph: @unchecked Sendable {
     /// allocated it while compiling, which must be `free`d.
     let isMapped: Bool
     let stateSize: Int
+    /// STFT geometry for kernels that frame their own analysis/synthesis in Swift (DPDFNet and
+    /// FastEnhancer): read from metadata rather than assumed, since FastEnhancer ships several
+    /// hop sizes. FFT size equals `windowLength` for every model here (none pads a shorter
+    /// window into a longer FFT), so there's no separate `nFFT` field.
+    let windowLength: Int
+    let hopLength: Int
     /// Initial recurrent state: a model-specific non-zero prefix (e.g. DPDFNet's norm state),
     /// then zeros.
     let stateInit: [Float]
@@ -41,8 +47,10 @@ struct CompiledGraph: @unchecked Sendable {
         guard let data = try? Data(contentsOf: model.appending(path: "metadata.json")),
               let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let meta = json.first?["userDefinedMetadata"] as? [String: String],
-              let stateSize = meta["state_size"].flatMap(Int.init) else {
-            nsLogger.error("\(cacheName, privacy: .public) metadata lacks state_size")
+              let stateSize = meta["state_size"].flatMap(Int.init),
+              let windowLength = meta["window_length"].flatMap(Int.init),
+              let hopLength = meta["hop_length"].flatMap(Int.init) else {
+            nsLogger.error("\(cacheName, privacy: .public) metadata lacks state_size/window_length/hop_length")
             return nil
         }
         let prefix = (meta["state_init"] ?? "").split(separator: ",").compactMap { Float($0) }
@@ -54,7 +62,8 @@ struct CompiledGraph: @unchecked Sendable {
 
         let cacheFile = cacheURL(for: model, name: cacheName)
         if let cacheFile, let graph = readWired(cacheFile) {
-            if let compiled = CompiledGraph(graph: graph, isMapped: true, stateSize: stateSize, stateInit: stateInit,
+            if let compiled = CompiledGraph(graph: graph, isMapped: true, stateSize: stateSize,
+                                             windowLength: windowLength, hopLength: hopLength, stateInit: stateInit,
                                              inputArgument: inputArgument, stateInArgument: stateInArgument,
                                              outputArgument: outputArgument, stateOutArgument: stateOutArgument) {
                 return compiled
@@ -79,7 +88,8 @@ struct CompiledGraph: @unchecked Sendable {
             // .atomic writes a temporary file and renames it, so a crash never leaves a torn graph.
             try? Data(bytesNoCopy: data, count: graph.size, deallocator: .none).write(to: cacheFile, options: .atomic)
         }
-        guard let compiled = CompiledGraph(graph: graph, isMapped: false, stateSize: stateSize, stateInit: stateInit,
+        guard let compiled = CompiledGraph(graph: graph, isMapped: false, stateSize: stateSize,
+                                           windowLength: windowLength, hopLength: hopLength, stateInit: stateInit,
                                            inputArgument: inputArgument, stateInArgument: stateInArgument,
                                            outputArgument: outputArgument, stateOutArgument: stateOutArgument) else {
             munlock(data, graph.size)
@@ -90,8 +100,9 @@ struct CompiledGraph: @unchecked Sendable {
     }
 
     private init?(
-        graph: bnns_graph_t, isMapped: Bool, stateSize: Int, stateInit: [Float],
-        inputArgument: String, stateInArgument: String, outputArgument: String, stateOutArgument: String
+        graph: bnns_graph_t, isMapped: Bool, stateSize: Int, windowLength: Int, hopLength: Int,
+        stateInit: [Float], inputArgument: String, stateInArgument: String, outputArgument: String,
+        stateOutArgument: String
     ) {
         func position(_ name: String) -> Int? {
             let p = BNNSGraphGetArgumentPosition(graph, nil, name)
@@ -105,6 +116,8 @@ struct CompiledGraph: @unchecked Sendable {
         self.graph = graph
         self.isMapped = isMapped
         self.stateSize = stateSize
+        self.windowLength = windowLength
+        self.hopLength = hopLength
         self.stateInit = stateInit
         argumentCount = BNNSGraphGetInputCount(graph, nil) + BNNSGraphGetOutputCount(graph, nil)
         inputPosition = input

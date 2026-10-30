@@ -2,9 +2,9 @@ import Foundation
 
 /// Noise suppression engines. Each trades cleanup quality against latency and CPU.
 enum NoiseSuppressionEngine: String, Codable, CaseIterable, Identifiable {
-    /// CEVA's DPDFNet2 48 kHz (Apache-2.0): the strongest cleanup, 60 ms latency.
+    /// CEVA's DPDFNet2 48 kHz (Apache-2.0): strong cleanup, 60 ms latency.
     case dpdfnet
-    /// aask1357's FastEnhancer-S 48 kHz (MIT): near-DPDFNet cleanup, 21 ms latency, under 2%
+    /// aask1357's FastEnhancer-M 48 kHz (MIT): DPDFNet-level cleanup, 21 ms latency, about 6%
     /// of a core. The default.
     case fastenhancer
     /// Xiph's RNNoise (BSD-3-Clause): light cleanup, 30 ms latency, a fraction of the CPU.

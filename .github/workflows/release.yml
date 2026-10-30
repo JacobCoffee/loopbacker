@@ -73,7 +73,7 @@ jobs:
           cp App/Loopbacker/Resources/Info.plist        Loopbacker.app/Contents/
           cp App/Loopbacker/Resources/AppIcon.icns      Loopbacker.app/Contents/Resources/
           cp -R App/Loopbacker/Resources/DPDFNet2_48k.mlmodelc Loopbacker.app/Contents/Resources/
-          cp -R App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc Loopbacker.app/Contents/Resources/
+          cp -R App/Loopbacker/Resources/FastEnhancer_M_48k.mlmodelc Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/DPDFNet-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/RNNoise-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt Loopbacker.app/Contents/Resources/

@@ -50,7 +50,7 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 
 - On-device noise removal for mic inputs, run inline on the audio thread, with three engines:
   - [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz neural model through BNNS Graph: strongest cleanup (fans, keyboards, chatter), 60 ms of latency
-  - [aask1357's FastEnhancer-S](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: close to DPDFNet's cleanup, 21 ms of latency, a fraction of DPDFNet's CPU
+  - [aask1357's FastEnhancer-M](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: matches DPDFNet's cleanup, 21 ms of latency, a third of DPDFNet's CPU
   - [Xiph's RNNoise](https://github.com/xiph/rnnoise): lighter cleanup (steady hiss and hum), 30 ms of latency, about a third of DPDFNet's CPU
 - The Effects section compares them with CPU measured on your Mac and recommends one; switching frees the other engine's memory
 - Runs before the effects chain, independent of its bypass and presets; toggle it from the Effects section or the menu bar
@@ -200,6 +200,6 @@ loopbacker/
 
 [FSL-1.1-MIT](LICENSE) -- free to use for any non-competing purpose, converts to MIT after 2 years.
 
-The bundled noise suppression models are converted from upstream sources: `DPDFNet2_48k.mlmodelc` from [CEVA's DPDFNet](https://github.com/ceva-ip/DPDFNet) ([Apache-2.0](App/Loopbacker/Resources/DPDFNet-LICENSE.txt), `scripts/convert-dpdfnet.py`) and `FastEnhancer_S_48k.mlmodelc` from [aask1357's FastEnhancer](https://github.com/aask1357/fastenhancer) ([MIT](App/Loopbacker/Resources/FastEnhancer-LICENSE.txt), `scripts/convert-fastenhancer.py`); both need [uv](https://docs.astral.sh/uv/) to rebuild.
+The bundled noise suppression models are converted from upstream sources: `DPDFNet2_48k.mlmodelc` from [CEVA's DPDFNet](https://github.com/ceva-ip/DPDFNet) ([Apache-2.0](App/Loopbacker/Resources/DPDFNet-LICENSE.txt), `scripts/convert-dpdfnet.py`) and `FastEnhancer_M_48k.mlmodelc` from [aask1357's FastEnhancer](https://github.com/aask1357/fastenhancer) ([MIT](App/Loopbacker/Resources/FastEnhancer-LICENSE.txt), `scripts/convert-fastenhancer.py m`); both need [uv](https://docs.astral.sh/uv/) to rebuild.
 
 [RNNoise](https://github.com/xiph/rnnoise) (v0.2, default model) is vendored in `App/Loopbacker/CRNNoise` under the [BSD-3-Clause license](App/Loopbacker/Resources/RNNoise-LICENSE.txt).

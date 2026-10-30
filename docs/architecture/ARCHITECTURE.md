@@ -473,19 +473,25 @@ captures and output routes don't.
   `mlock`ed mapping; the compiled graph is read into wired memory too, since a file mapping
   could page-fault from disk mid-callback. Kernel delay: 2400 samples (4 hops of model
   lookahead plus a hop for the second half of the analysis window).
-- **FastEnhancer** (`FastEnhancerKernel`): aask1357's FastEnhancer-S 48 kHz model (MIT) through
+- **FastEnhancer** (`FastEnhancerKernel`): aask1357's FastEnhancer-M 48 kHz model (MIT) through
   the same BNNS Graph setup as DPDFNet (they share `CompiledGraph`, generalised over the
-  model's bundle name and its four argument names). 212K parameters -- tiny next to DPDFNet --
-  so it measures ~0.2 ms per 10.67 ms hop (~2% of a core). A 1024-sample/512-hop Hann-window
-  STFT, one model execution per hop with a ping-pong recurrent state (the per-frequency-bin
-  GRUs' hidden states, flattened), then ISTFT with FastEnhancer's own COLA synthesis window
-  (not a symmetric analysis/synthesis window like DPDFNet's). FastEnhancer is zero-lookahead:
-  every layer but the GRUs is purely per-frame (strided convs and self-attention across
-  frequency bins, never across time), so unlike DPDFNet it has no model-inherent lookahead.
-  Kernel delay: 512 samples (one hop), measured by passing an impulse through the exact
-  analysis/synthesis framing with an identity mask -- matching FastEnhancer's reported
-  zero-lookahead, ~10.7 ms algorithmic latency. Zero heap allocations on the execute path,
-  checked the same way as DPDFNet (an interposed `malloc`, 500 hops).
+  model's bundle name, its four argument names, and -- since FastEnhancer ships several
+  checkpoints at different hop sizes over the same 1024-sample window -- its STFT geometry,
+  read from the model's own metadata rather than hardcoded). 520K parameters, measuring
+  ~0.39 ms per 6.67 ms hop (~5.8% of a core hot, zero allocations on the execute path, checked
+  the same way as DPDFNet with an interposed `malloc` over 200 hops); a worst-case 512-frame IO
+  callback runs `ceil(512/320) = 2` hops, ~0.77 ms (~7.2% of the callback's budget). A
+  1024-sample/320-hop Hann-window STFT, one model execution per hop with a ping-pong recurrent
+  state (the per-frequency-bin GRUs' hidden states, flattened), then ISTFT with FastEnhancer's
+  own general-overlap COLA synthesis window (not a symmetric analysis/synthesis window like
+  DPDFNet's, and not the 2x-overlap special case the earlier S checkpoint allowed). FastEnhancer
+  is zero-lookahead: every layer but the GRUs is purely per-frame (strided convs and
+  self-attention across frequency bins, never across time), so unlike DPDFNet it has no
+  model-inherent lookahead. Kernel delay: 704 samples (`windowLength - hop`), measured by
+  passing an impulse through the exact analysis/synthesis framing with an identity mask --
+  total latency (`delay + hop - 1`) is 1023 samples regardless of which FastEnhancer checkpoint
+  is loaded, since `windowLength` is 1024 for all of them (see "FastEnhancer variant choice"
+  below).
 - **RNNoise** (`RNNoiseKernel`): Xiph's RNNoise v0.2 (BSD-3-Clause), vendored as the `CRNNoise`
   C target with its default model compiled in. ~0.2 ms per hop. `rnnoise_init(_, NULL)` resets
   state without allocating. Kernel delay: 960 samples (analysis over two frames, plus
@@ -493,7 +499,7 @@ captures and output routes don't.
   read-only data (mlock refuses those pages) and are read every hop.
 
 The engine-independent part is `NoiseSuppressor`: it downmixes channels 1–2 to mono, feeds
-the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 512 for FastEnhancer -- any hop
+the kernel hop-sized blocks (480 samples for DPDFNet/RNNoise, 320 for FastEnhancer -- any hop
 size works, `NoiseSuppressor` doesn't assume one), and blends the dry signal (delayed by the
 kernel's delay) back in at the user's max-reduction level. Its buffers are `mlock`ed as well.
 
@@ -510,13 +516,14 @@ suppressor when suppression is on, the engine matches, and the source hasn't opt
 slot after 100 ms, and drops its reference 0.5 s later, once no callback can still be inside
 it. Switching engines goes old wet → dry → new wet with no click. The router holds each
 model-backed engine's compiled model weakly, behind a small generic `NoiseModelLoadState`, so
-the model (DPDFNet ~13 MB, FastEnhancer <1 MB) is freed with the last kernel that uses it.
+the model (DPDFNet ~13 MB, FastEnhancer ~2 MB) is freed with the last kernel that uses it.
 
 `NoiseEngineBenchmark` times 200 hops of each engine once per launch, when the Effects section
 first shows the picker. It recommends FastEnhancer while it takes at most 20% of a core (one
 512-frame callback can run roughly two hops alongside the mix and effects), and RNNoise
 otherwise. FastEnhancer is also the default engine for new setups. DPDFNet is never the
-recommendation: it cleans up slightly more, but its 60 ms of delay matters more on a live mic.
+recommendation: it doesn't clean up any better (see "FastEnhancer variant choice" below) and
+costs 3x FastEnhancer's latency and CPU.
 
 The virtual mic route and the monitor route of the same mic share one suppressor. They mix
 identically, and the HAL calls both input callbacks back to back on the device's IO thread
@@ -541,20 +548,50 @@ is unchanged. The script checks the result against the unmodified upstream PyTor
 compute and the Neural Engine were tried: fp16 compute breaks the output (~9 dB SNR), and the
 Neural Engine gives nothing for an fp32 model.
 
-`scripts/convert-fastenhancer.py` rebuilds `App/Loopbacker/Resources/FastEnhancer_S_48k.mlmodelc`
-from pinned upstream code (commit `85d98a6`) and the `fastenhancer_s` checkpoint (release
-`ckpt-v1.0.0-48khz`, epoch 500). FastEnhancer-S's `ONNXModel.forward` already takes one STFT
-frame plus the per-block GRU caches and returns the enhanced frame plus the next caches -- the
-same shape as DPDFNet's traced graph -- so the conversion is a plain `torch.jit.trace` plus
-`coremltools.convert` with no custom op lowering: a single-layer unidirectional `nn.GRU` and
-`scaled_dot_product_attention` both convert natively (unlike DPDFNet's bidirectional,
-chunked GRU). Weights stay fp32 (212K parameters is under 1 MB either way, so there's no size
-reason to compress). Parity against the unmodified upstream PyTorch model over 484 frames
-(STFT frames of a real signal plus random spectra): 127.2 dB SNR, worst frame 1.26e-5 relative
-error. Three checkpoints share this hop size (10.67 ms) at increasing size/quality -- t (29K
-params), b (104K), s (212K) -- with authors' own VoiceBank+DEMAND-48k validation PESQ/STOI of
-2.73/0.937, 2.92/0.944 and 2.98/0.947 respectively; s is shipped since BNNS Graph runs it in a
-small fraction of the ~1 ms/hop budget regardless of size, so quality decided it.
+`scripts/convert-fastenhancer.py <variant>` (`s`, `m` or `l`) rebuilds
+`App/Loopbacker/Resources/FastEnhancer_<V>_48k.mlmodelc` from pinned upstream code (commit
+`85d98a6`) and the matching checkpoint (release `ckpt-v1.0.0-48khz`, epoch 500). Every
+variant's `ONNXModel.forward` already takes one STFT frame plus the per-block GRU caches and
+returns the enhanced frame plus the next caches -- the same shape as DPDFNet's traced graph --
+so the conversion is a plain `torch.jit.trace` plus `coremltools.convert` with no custom op
+lowering: a single-layer unidirectional `nn.GRU` and `scaled_dot_product_attention` both
+convert natively (unlike DPDFNet's bidirectional, chunked GRU). Weights stay fp32 (every
+variant is under 5 MB fp32, so there's no size reason to compress). Parity against the
+unmodified upstream PyTorch model, carrying state frame to frame: S 127.2 dB SNR over 484
+frames, M 126.0 dB over 709 frames, L 124.6 dB over 1069 frames (worst frame 1.3–2.5e-5
+relative error) -- frame counts differ because the parity signal is fixed-length and each
+variant's hop size changes how many STFT frames it produces, plus 110 random spectra appended
+to every variant.
+
+#### FastEnhancer variant choice
+
+FastEnhancer ships three 48 kHz checkpoints at the pinned release, all sharing the same causal
+architecture (strided-conv encoder/decoder around a per-frequency-bin-GRU "RNNFormer"
+bottleneck) and the same 1024-sample window, differing only in width/depth and hop size:
+
+| Variant | Params | Hop | Total latency | Hot CPU | Worst-case 512-callback | PESQ | ESTOI | SI-SDR | DNSMOS OVRL |
+|---|---|---|---|---|---|---|---|---|---|
+| S | 212K | 512 (10.67 ms) | 21.3 ms | 0.20 ms/hop (1.8%) | 1 hop, 0.20 ms (1.8%) | 2.99 | 0.86 | 18.2 | 3.07 |
+| M | 520K | 320 (6.67 ms) | 21.3 ms | 0.39 ms/hop (5.8%) | 2 hops, 0.77 ms (7.2%) | 3.07 | 0.87 | 19.2 | 3.12 |
+| L | 1.15M | 200 (4.17 ms) | 21.3 ms | 0.69 ms/hop (16.5%) | 3 hops, 2.06 ms (19.3%) | 3.14 | 0.88 | 19.4 | 3.13 |
+
+Total latency (`delay + hop - 1`) is identical across variants -- `windowLength - 1` samples,
+and `windowLength` is 1024 for all three -- so a smaller hop buys nothing on latency, only a
+finer analysis grid the model can use for quality. CPU scales roughly with params and inversely
+with hop (more model executions per second at a smaller hop): measured the same way as the
+other engines (hot loop, 2000 hops, interposed `malloc`), plus the worst case a 512-frame IO
+callback can hit, `ceil(512/hop)` hops back to back, since the callback and hop boundaries
+don't line up. All three are zero-allocation on the execute path.
+
+L has the best quality but its worst-case callback (19.3%) is not "well under" the 20%-of-a-core
+budget `NoiseEngineBenchmark` uses to recommend FastEnhancer over RNNoise -- that budget already
+assumes headroom for the mix and effects sharing the IO thread, and L leaves almost none. M
+clears that budget with comfortable margin (7.2%) while still beating S on every quality metric,
+including matching or exceeding DPDFNet's cleanup (PESQ 3.07 vs 3.04, ESTOI 0.87 vs 0.86, SI-SDR
+19.2 vs 18.8 dB, DNSMOS OVRL 3.12 vs 3.13) at roughly a third of DPDFNet's latency and CPU. So
+**M replaced S** as the shipped FastEnhancer model; S and L are no longer bundled, though both
+still build and score with `convert-fastenhancer.py {s,l}` and
+`eval.py --fastenhancer-model <path>` for comparison.
 
 ### Quality
 
@@ -570,14 +607,14 @@ model) at -60 dB max reduction:
 |---|---|---|---|---|---|---|
 | Noisy input | 1.97 | 0.79 | 8.4 | 3.34 | 3.13 | 2.70 |
 | DPDFNet | 3.04 | 0.86 | 18.8 | 3.40 | 4.02 | 3.13 |
-| FastEnhancer | 2.99 | 0.86 | 18.2 | 3.35 | 4.02 | 3.07 |
+| FastEnhancer | 3.07 | 0.87 | 19.2 | 3.40 | 4.03 | 3.12 |
 | RNNoise | 2.47 | 0.84 | 13.2 | 3.38 | 4.02 | 3.09 |
 
-DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with DPDFNet
-slightly ahead of FastEnhancer on every metric -- consistent with the authors' own
-VoiceBank+DEMAND numbers for FastEnhancer-S against stronger non-causal baselines. FastEnhancer
-gets close to DPDFNet's cleanup at roughly a third of its latency and CPU, which is why it's the
-recommended engine and the default. Re-run with
+DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with
+FastEnhancer matching DPDFNet on every metric (PESQ, ESTOI and SI-SDR slightly ahead; DNSMOS
+OVRL essentially tied) at roughly a third of its latency and CPU, which is why it's the
+recommended engine and the default -- see "FastEnhancer variant choice" above for how the
+shipped FastEnhancer-M checkpoint was picked over S and L. Re-run with
 `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.
 
 ## UI Cost
@@ -619,11 +656,10 @@ on a given machine, independent of the app's own UI.
   `DYLD_INSERT_LIBRARIES`) confirming the execute path allocates nothing on the heap. `--coreml`
   additionally reports parity (SNR) against running the same frames through Core ML. On an M4
   Max: ~1.4 s single-thread compile, 0.55 ms/hop hot, paced median/p99/max ~0.7/1.9/2.3 ms, 0
-  allocations. `FastEnhancer_S_48k.mlmodelc` isn't wired into `model-bench.sh` (it's
-  DPDFNet-shaped only), but the same technique applied ad hoc gives ~0.2 ms/hop hot (BNNS
-  execute alone ~0.2 ms; full kernel including the STFT/ISTFT vDSP work ~0.2 ms, run-to-run
-  noise dominates the difference) and 0 allocations over 500 hops, both with and without the
-  STFT/ISTFT around it.
+  allocations. `FastEnhancer_M_48k.mlmodelc` isn't wired into `model-bench.sh` (it's
+  DPDFNet-shaped only), but the same technique applied ad hoc gives ~0.39 ms/hop hot (6.67 ms
+  hop, including the STFT/ISTFT vDSP work around the BNNS execute) and 0 allocations over 200
+  hops, both with and without the STFT/ISTFT around it.
 - **`tone.swift`** plays a quiet 440 Hz tone with level swinging -40..-20 dBFS at 1.5 Hz to a
   named output device via `AudioQueue`, so meters and any level-dependent processing keep
   moving during a measurement without needing real program audio.
