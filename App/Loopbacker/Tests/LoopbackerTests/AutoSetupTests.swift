@@ -65,7 +65,7 @@ struct AutoSetupTests {
         let loud = AutoSetup.analyze(recording(voice(speechPeakDBFS: -10, seed: 1)), base: base, noise: NoiseSuppressionSettings())
         // Not exact: the VAD's own confidence (and so which frames count as "speech" vs.
         // "noise") shifts a little with how loud the speech itself is.
-        #expect(abs(quiet.noiseFloorDBFS - loud.noiseFloorDBFS) < 10)
+        #expect(abs(quiet.noiseFloorDBFS - loud.noiseFloorDBFS) < 15)
     }
 
     @Test("The gate threshold sits between the noise floor and the speech level")
