@@ -76,8 +76,8 @@ Built-in stages, in any order you drag them into:
 
 Reorder, bypass, or A/B any stage individually; drop in third-party plugins (see **Plugins** below)
 anywhere in the chain. Runs only on mic (voice) routes -- virtual mic, Stream Mix, and monitor --
-never on app-capture routes, which get their own ducking and leveling instead (see **Stream Mix**
-below). Toggling a stage crossfades instead of clicking, and the whole chain's A/B bypass
+never on app-capture routes, which get their own ducking and leveling instead (in the Effects
+page's App Audio section). Toggling a stage crossfades instead of clicking, and the whole chain's A/B bypass
 loudness-matches so comparisons are about tone, not volume.
 
 17 factory presets across four categories -- Business (Meeting – Natural, Presentation/Webinar, Open
@@ -109,6 +109,9 @@ back raw vs. processed audio through your speakers for an A/B listen, waveforms 
   you don't want it cluttering the picker
 
 Any plugin inserts anywhere in the chain alongside the built-in stages, drag-reorderable the same way.
+If a plugin crashes Loopbacker, it loads bypassed (with a "crashed last time -- click to retry" notice
+on its stage) the next time you launch, instead of crashing the app again on every relaunch; click to
+retry it once you've sorted out the plugin.
 
 **Echo Cancellation**
 
@@ -135,13 +138,13 @@ Any plugin inserts anywhere in the chain alongside the built-in stages, drag-reo
   a muted overlay showing your mute state and the hotkey itself
 - Auto-switch the effects preset by frontmost or running app -- e.g. a louder "Stream/Broadcast" preset
   while OBS is frontmost, reverting when it quits
-- Shortcuts app support (mute/unmute, apply a preset, load a scene) and a `loopbacker://` URL scheme
-  for other apps/web pages to trigger the same actions, both off by default (opt in under Settings ›
-  General)
+- Shortcuts app support (mute/unmute, apply a preset, load a scene), and a `loopbacker://` URL scheme
+  so other apps and web pages can trigger the same actions. URL commands other than mute are off
+  until you turn on Settings › General › "Allow Other Apps to Control Loopbacker"
 
 **Loudness Meter** (ITU-R BS.1770-4 / EBU R128)
 
-- Momentary (400 ms), short-term (3 s), and gated integrated loudness, plus true peak, on each virtual device's output
+- Momentary (400 ms), short-term (3 s), and gated integrated loudness, plus true peak, on the virtual mic's output
 - Target presets: Voice/Podcast (-16 LUFS), Broadcast EBU R128 (-23 LUFS), or a custom target
 - "Too quiet / on target / too loud" readout in the menu bar panel and the Routing page, with a reset-integrated button
 - Measuring only -- pair with the Effects limiter/compressor for gain control
@@ -165,7 +168,7 @@ Any plugin inserts anywhere in the chain alongside the built-in stages, drag-reo
 
 - macOS 26 Liquid Glass design, light and dark, with an in-app appearance override
 - Sidebar with Routing, Effects, Soundboard, and Scenes (⌘1–⌘4), plus every source's live level and on/off switch
-- Routing canvas where cables glow with the signal running through them, or a keyboard- and VoiceOver-navigable connection matrix (toggle in the Routing toolbar; each cell is a labeled, togglable connection, and canvas ports offer VoiceOver "Connect to…"/"Disconnect from…" actions)
+- Routing canvas where cables glow with the signal running through them, or a keyboard- and VoiceOver-navigable connection matrix (toggle in the Routing toolbar; each cell is a labeled, togglable connection, canvas ports offer VoiceOver "Connect to…"/"Disconnect from…" actions, and a Virtual Mic/Stream Mix picker switches which target's columns the matrix edits once Stream Mix is enabled)
 - Effects shown as a vertical insert chain, like a channel strip
 - Menu bar panel with live meters, per-source switches, Reconnect, and Test Tone
 - Audio menu with keyboard shortcuts: Reconnect (⌘R), Stop All Routing (⇧⌘.), Test Tone (⌥⌘T)

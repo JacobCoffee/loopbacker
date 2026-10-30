@@ -783,7 +783,12 @@ each with a different trust and crash boundary:
   varies -- not safe on the IO thread. In-process means a v2 plugin that crashes or corrupts
   memory takes Loopbacker down with it; `com.apple.security.cs.disable-library-validation` is
   required because the hardened runtime otherwise refuses to `dlopen` a component not signed with
-  Loopbacker's own team ID.
+  Loopbacker's own team ID. Any installed `aufx`/`aumf` component inherits Loopbacker's mic/
+  system-audio permissions once instantiated, so `AUCatalog.scan()` only reads
+  `AVAudioUnitComponent` metadata (name, declared channel support) and never instantiates a
+  component merely to list it -- the only point a component is actually created is
+  `AUHostNode.load`, when the user picks it in the browser or a persisted chain is built at
+  launch, the explicit trust boundary.
 - **Audio Units v3** (`AUHostNode`, same class, different load path): app-extension AUs have no
   in-process C-API option, so they load out-of-process over XPC via `AUAudioUnit.instantiate` and
   run through the captured `renderBlock`/`scheduleParameterBlock` closures. A v3 plugin crash is
@@ -800,8 +805,13 @@ each with a different trust and crash boundary:
   `pthread_jit_write_protect_np` path the vendored EEL2 patch uses, and `JSFXNode.load` compiles
   and runs each script's `@init` off the IO thread (`async`, serialized process-wide behind
   `compileLock` since the EEL2 compiler isn't safe to call concurrently), so compilation failures
-  surface before a node ever reaches the chain. See `CYSFX/README.md` for the open limitation
-  around EEL2's lazy per-block RAM allocation.
+  surface before a node ever reaches the chain. A JSFX `FXPluginRef.identifier` is persisted as
+  `"<root>:<relative path>"` (`JSFXCatalogRoots`' `"reaper"`/`"loopbacker"` root names plus the
+  script's path under it, shared between `JSFXCatalog.scan()` and `JSFXNode`'s load-time
+  resolver) rather than an absolute path, so an exported preset stays portable and `load()`
+  rejects a ref that doesn't resolve back under a known root instead of reading an arbitrary
+  path off disk. See `CYSFX/README.md` for the open limitation around EEL2's lazy per-block RAM
+  allocation.
 - **Airwindows** (`AirwindowsNode`, vendored airwin2rack): compiled directly into Loopbacker's own
   binary, not a third-party dylib -- no process-boundary trust question, and `aw_process`/
   `aw_get_param`/`aw_set_param` touch only plain data on an already-constructed effect, never
@@ -809,10 +819,36 @@ each with a different trust and crash boundary:
   (Airwindows effects have no native reset; reconstructing the instance would allocate on the IO
   thread, which the contract forbids).
 
-No quarantine or crash-recovery layer exists yet for in-process hosts (v2 AU, JSFX): a crash in
-either currently takes the whole app down, same as any other in-process code. v3 AUs are the only
-catalog with real process isolation today, inherent to how Apple ships app-extension AUs rather
-than something `AUHostNode` added.
+**Crash quarantine (LB-HOST-002).** `HostedPluginQuarantine` (`Services/FX/Hosted/
+HostedPluginQuarantine.swift`) stops a hosted node that crashed Loopbacker from crashing it again
+at every subsequent launch, for the two in-process hosts above (v2 AU, JSFX):
+
+- Before instantiating a hosted node, `FXNodeFactory.makeHosted` calls `beginTracking`, which
+  writes a sentinel file (`~/Library/Application Support/Loopbacker/crash-sentinels/<node
+  id>.json`, the node id plus its plugin ref) to disk.
+- A node that loads successfully is wrapped in `QuarantineWitnessNode`, which flips an atomic
+  flag after its first `process()` call returns -- no I/O on the IO thread itself. A single
+  shared sweep (`observe`/`sweepOnce`, not a per-node poll, polling every 250 ms) clears that
+  node's sentinel once the flag is set, or once the node is deallocated without ever having
+  rendered (a disabled node, a chain torn down for a route change, or any other normal removal --
+  reaching that point at all proves the process didn't crash).
+- `applicationWillTerminate` calls `clearSessionSentinels()`, sweeping every sentinel this
+  process ever wrote this session regardless of render/teardown state, since a clean termination
+  proves none of them crashed -- covering a node still loaded and live right up to quit, whose
+  `QuarantineWitnessNode` might not `deinit` before the process actually exits.
+- If none of the above clears a sentinel before the process dies, it's still present at the next
+  launch. `isQuarantined(nodeID:)` reports that node as crashed; `FXNodeFactory.makeHosted` skips
+  `load()` entirely and returns a `PassthroughNode` with a "crashed Loopbacker last time; click
+  to retry" `loadError` instead, surfaced the same way `EffectsView` shows any other hosted load
+  error. `retry(nodeID:)`/`clearAll()` clear the sentinel on user request; the caller still has
+  to trigger a chain rebuild for the node to actually load again.
+- A thrown Swift error during `load()` (a graceful failure, not a crash) clears tracking
+  immediately -- nothing to quarantine.
+
+v3 AUs don't need this: process isolation over XPC already contains a crash to the extension's
+own process rather than Loopbacker's, inherent to how Apple ships app-extension AUs. Airwindows
+is compiled-in code, not a loaded plugin, so it has no separate crash-tracking story either --
+a bug there is a Loopbacker bug.
 
 ## Echo Cancellation
 
