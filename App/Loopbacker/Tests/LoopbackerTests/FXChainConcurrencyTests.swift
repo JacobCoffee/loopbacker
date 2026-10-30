@@ -140,4 +140,46 @@ struct FXChainConcurrencyTests {
         }
         for v in buffer2 { #expect(v.isFinite) }
     }
+
+    @Test("record() finishes when capture stops (ioStopped), not just once the arena fills",
+          .timeLimit(.minutes(1)))
+    func recordFinishesWhenCaptureStops() async {
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "record-stop")
+        await chain.updateConfigs([FXNodeConfig(id: UUID(), kind: .limiter)])
+
+        // Feed a little audio with a raw tap so the recorder has something to capture.
+        var buffer = [Float](repeating: 0.1, count: 128 * 2)
+        let raw = [Float](repeating: 0.1, count: 128 * 2)
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            raw.withUnsafeBufferPointer { rawPtr in
+                chain.process(ptr.baseAddress!, frames: 128, stride: 2, sampleTime: nil, rawPreNS: rawPtr.baseAddress)
+            }
+        }
+
+        async let recording = chain.record(seconds: 30) // would otherwise need 30 s of audio to ever return
+
+        // Give the poll loop a moment to start waiting, then simulate the route stopping
+        // mid-recording the way `AudioRouter.detachFXChain` does (disconnect/restart).
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        chain.ioStopped()
+
+        let result = await recording
+        // Must return promptly (the `.timeLimit` above fails the test otherwise) with whatever
+        // partial audio was captured before the stop, not hang for the full 30 s.
+        #expect(result.raw.count < Int(30 * Double(Self.sampleRate)))
+    }
+
+    @Test("record() disarms and returns promptly when its own Task is cancelled",
+          .timeLimit(.minutes(1)))
+    func recordDisarmsOnCancellation() async {
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "record-cancel")
+        await chain.updateConfigs([FXNodeConfig(id: UUID(), kind: .limiter)])
+
+        let task = Task { await chain.record(seconds: 30) }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+
+        let result = await task.value
+        #expect(result.raw.count < Int(30 * Double(Self.sampleRate)))
+    }
 }

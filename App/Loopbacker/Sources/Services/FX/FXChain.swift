@@ -61,6 +61,7 @@ final class FXChain: @unchecked Sendable {
 
     private let graphPtr = Atomic<Unmanaged<ChainGraph>?>(nil)
     private let abBypassFlag = Atomic<Bool>(false)
+    private let masterEnabledFlag = Atomic<Bool>(true)
     private let voiceProbabilityBits = Atomic<UInt32>(Float(0).bitPattern)
 
     // MARK: Graph ownership + config state (guarded by configLock; never touched on the IO thread)
@@ -71,6 +72,7 @@ final class FXChain: @unchecked Sendable {
     private var ownedGraphs: [ObjectIdentifier: ChainGraph] = [:]
     private var releaseTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var isTornDown = false
+    private var nextGraphGeneration = 0
 
     /// Serializes `updateConfigs`: only ever one build/publish in flight, and a build superseded
     /// by a newer request while it awaits (e.g. a hosted-plugin load) is simply never reached --
@@ -89,6 +91,12 @@ final class FXChain: @unchecked Sendable {
     /// concurrent calls (which the real contract forbids -- `ioStopped` is only called once no
     /// more `process` calls can happen) aren't ordered by this alone.
     private let tornDownFlag = Atomic<Bool>(false)
+    /// IO-thread-published: the generation of the newest graph the IO thread has observed
+    /// via `graphPtr` on any `runGraph` call, even one it doesn't adopt this call (a graph
+    /// superseded before the IO thread ever reads it is still "observed" once something
+    /// newer is). `scheduleRelease` uses this to reclaim graphs the IO thread will provably
+    /// never touch, not just ones it adopted and then faded away from.
+    private let ioObservedGeneration = Atomic<Int>(-1)
     private var cachedStart: Float64 = -1
     private var cachedFrames = 0
     private let cachedInterleaved: UnsafeMutablePointer<Float>
@@ -117,10 +125,14 @@ final class FXChain: @unchecked Sendable {
     private var pendingFadeIn = false
     private var abDryWrite = 0
     private var abCrossfade: Float = 1 // 1 = normal chain output, 0 = fully bypassed (dry)
+    private var masterCrossfade: Float = 1 // 1 = chain output, 0 = fully bypassed dry (no ratio); matches `masterEnabledFlag`'s default-enabled state
     private var inputRMSEnergy: Float = 0
     private var outputRMSEnergy: Float = 0
     private var abRatioSmoothed: Float = 1
     private static let rmsDecay: Float = 0.999 // ~3 s one-pole window at typical block rates
+    private static let abRatioMin: Float = 0.25 // -12 dB: bounds the measured A/B dry ratio so a quiet/odd window can't blow it toward 0 or infinity
+    private static let abRatioMax: Float = 4.0 // +12 dB
+    private static let abRatioTimeConstant: Float = 0.5 // seconds to ~63% of the way to a newly measured ratio
 
     init(sampleRate: Float, captureDeviceUID: String) {
         self.sampleRate = sampleRate
@@ -176,6 +188,7 @@ final class FXChain: @unchecked Sendable {
         // Set first: any `process` call chronologically after this point bails before touching
         // graph state at all, so it can never dereference what we're about to free below.
         tornDownFlag.store(true, ordering: .releasing)
+        recorder.disarm()
 
         configLock.lock()
         guard !isTornDown else { configLock.unlock(); return }
@@ -293,6 +306,8 @@ final class FXChain: @unchecked Sendable {
             return
         }
         let previous = latestGraph
+        nextGraphGeneration += 1
+        newGraph.generation = nextGraphGeneration
         latestGraph = newGraph
         ownedGraphs[ObjectIdentifier(newGraph)] = newGraph
         configLock.unlock()
@@ -310,7 +325,14 @@ final class FXChain: @unchecked Sendable {
         let id = ObjectIdentifier(graph)
         let task = Task.detached(priority: .utility) { [weak self] in
             while !graph.retired.load(ordering: .acquiring) {
-                guard let self, !self.checkTornDown() else { return }
+                guard let self else { return }
+                // The IO thread has already observed (and, by `runGraph`'s immediate-adopt
+                // design, necessarily adopted) something strictly newer than `graph`: `graph`
+                // was superseded before the IO thread ever read it, so it will provably never
+                // be touched again -- safe to reclaim without waiting for a `retired` flag
+                // that would otherwise never be set.
+                if self.ioObservedGeneration.load(ordering: .acquiring) > graph.generation { break }
+                guard !self.checkTornDown() else { return }
                 try? await Task.sleep(nanoseconds: 2_000_000)
             }
             self?.dropOwnership(of: graph, id: id)
@@ -350,12 +372,15 @@ final class FXChain: @unchecked Sendable {
     /// hand-built graphs of fake nodes. Call before the first `process`.
     func debugInstallGraph(_ graph: ChainGraph) {
         configLock.lock()
+        nextGraphGeneration += 1
+        graph.generation = nextGraphGeneration
         ownedGraphs[ObjectIdentifier(graph)] = graph
         latestGraph = graph
         configLock.unlock()
         graphPtr.store(.passUnretained(graph), ordering: .releasing)
         activeGraphRef = .passUnretained(graph)
         activeTotalLatency = graph.totalLatency
+        ioObservedGeneration.store(graph.generation, ordering: .relaxed)
         pendingFadeIn = false
     }
 
@@ -406,6 +431,21 @@ final class FXChain: @unchecked Sendable {
     var isABBypassed: Bool { abBypassFlag.load(ordering: .relaxed) }
     func setABBypass(_ bypassed: Bool) { abBypassFlag.store(bypassed, ordering: .relaxed) }
 
+    // MARK: - Master enable
+
+    /// Any thread: whether `EffectsPreset.isEnabled` currently gates this chain's output to
+    /// wet. Distinct from `isABBypassed`/`setABBypass` (the loudness-matched A/B comparison
+    /// toggle): this is "Effects Off" -- no RMS ratio applied, and once the crossfade settles
+    /// the output is bit-identical to the input. Defaults to `true` (enabled, matching every
+    /// pre-existing caller that never calls this) rather than mirroring `EffectsPreset`'s own
+    /// `isEnabled = false` default: `AudioRouter.attachFXChain` is responsible for calling
+    /// `setMasterEnabled(currentEffectsPreset.isEnabled)` synchronously right after construction
+    /// (not inside the async `updateConfigs` `Task`), before the chain is attached to a route
+    /// or its first `process` call, so a freshly created chain for a disabled preset is already
+    /// gated dry with no window where it would run wet.
+    var isMasterEnabled: Bool { masterEnabledFlag.load(ordering: .relaxed) }
+    func setMasterEnabled(_ on: Bool) { masterEnabledFlag.store(on, ordering: .relaxed) }
+
     // MARK: - Recording
 
     /// Arms the recorder and waits (polling, off the IO thread) until it fills or `seconds`
@@ -413,7 +453,19 @@ final class FXChain: @unchecked Sendable {
     func record(seconds: Double) async -> FXRecording {
         recorder.arm(seconds: seconds)
         while recorder.isCapturing {
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            if Task.isCancelled {
+                recorder.disarm()
+                break
+            }
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                // Cancelled mid-sleep: disarm immediately rather than spin back around the
+                // loop (`isCapturing` would otherwise still read true and `Task.sleep` throws
+                // without actually waiting, busy-polling until something else disarms it).
+                recorder.disarm()
+                break
+            }
         }
         return recorder.snapshot()
     }
@@ -486,9 +538,19 @@ final class FXChain: @unchecked Sendable {
             let outEnergy = FXBlockIO.rms(scratchLeft, frames: frames)
             inputRMSEnergy = Self.rmsDecay * inputRMSEnergy + (1 - Self.rmsDecay) * inEnergy
             outputRMSEnergy = Self.rmsDecay * outputRMSEnergy + (1 - Self.rmsDecay) * outEnergy
+            // Silence-safe: only derive a fresh ratio once the dry window carries enough
+            // energy to divide by meaningfully; otherwise hold the last smoothed value rather
+            // than let a near-zero denominator blow the ratio toward infinity.
+            if inputRMSEnergy > 1e-6 {
+                let rawRatio = outputRMSEnergy / inputRMSEnergy
+                let boundedRatio = min(max(rawRatio, Self.abRatioMin), Self.abRatioMax)
+                let smoothingCoeff = min(1, Float(frames) / sampleRate / Self.abRatioTimeConstant)
+                abRatioSmoothed += (boundedRatio - abRatioSmoothed) * smoothingCoeff
+            }
         }
 
         applyABBypass(left: scratchLeft, right: scratchRight, frames: frames, abPushStart: abPushStart)
+        applyMasterBypass(left: scratchLeft, right: scratchRight, frames: frames, abPushStart: abPushStart)
 
         FXBlockIO.reinterleave(buffer, frames: frames, stride: stride, channels: min(stride, 2),
                                left: scratchLeft, right: scratchRight, mono: mono)
@@ -524,6 +586,28 @@ final class FXChain: @unchecked Sendable {
         abCrossfade = fade
     }
 
+    /// Crossfades the chain's output (after node processing and any A/B comparison) against
+    /// the same chain-level dry tap used for A/B, but unscaled (no loudness matching) and
+    /// driven by `masterEnabledFlag` (`EffectsPreset.isEnabled`) rather than the A/B toggle.
+    /// Composes with `applyABBypass`: a disabled master always wins, since this runs after it
+    /// and blends from whatever `applyABBypass` already produced toward pure delayed dry.
+    private func applyMasterBypass(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
+                                   frames: Int, abPushStart: Int) {
+        let target: Float = masterEnabledFlag.load(ordering: .relaxed) ? 1 : 0
+        guard target != 1 || masterCrossfade != 1 else { return } // steady-state enabled: nothing to blend
+        let latency = min(activeTotalLatency, Self.abDryCapacity - FXBlock.maxFrames)
+        var fade = masterCrossfade
+        for i in 0..<frames {
+            fade = target > fade ? min(target, fade + Self.crossfadeStep) : max(target, fade - Self.crossfadeStep)
+            let readIndex = abPushStart + i - latency
+            let dl: Float = readIndex >= 0 ? abDryLeft[readIndex & (Self.abDryCapacity - 1)] : 0
+            let dr: Float = readIndex >= 0 ? abDryRight[readIndex & (Self.abDryCapacity - 1)] : 0
+            left[i] = fade * left[i] + (1 - fade) * dl
+            right[i] = fade * right[i] + (1 - fade) * dr
+        }
+        masterCrossfade = fade
+    }
+
     /// Declicks a structural swap: the outgoing graph finishes its last block faded to
     /// silence, the incoming one starts its first block faded in from silence. Never retains a
     /// `ChainGraph`: `activeGraphRef`/`latest` are non-owning `Unmanaged` views into whatever
@@ -531,6 +615,9 @@ final class FXChain: @unchecked Sendable {
     private func runGraph(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
                           frames: Int, mono: Bool, sidechain: FXSidechain) {
         let latestRef = graphPtr.load(ordering: .acquiring)
+        if let generation = latestRef?.takeUnretainedValue().generation {
+            ioObservedGeneration.store(generation, ordering: .releasing)
+        }
         var processedThisBlock = false
 
         // Any change -- a new graph published, OR the chain torn down (`graphPtr` cleared to
@@ -583,7 +670,14 @@ final class FXChain: @unchecked Sendable {
 
     /// Runs one stage, crossfading its wet output against a dry tap delayed by the stage's own
     /// latency, so toggling `enabled` never jumps (the delayed dry signal lines up exactly with
-    /// where the wet signal would be) and never changes the chain's overall timing.
+    /// where the wet signal would be) and never changes the chain's overall timing. Always
+    /// pushes the dry ring regardless of enabled state, so a stage's contribution to total chain
+    /// latency never depends on whether it happens to be running. Once a stage has fully settled
+    /// bypassed, `node.process` is skipped entirely (no RT cost for a disabled stage) until it's
+    /// asked to turn back on, at which point its history is reset and its wet output is kept out
+    /// of the blend for one `latency`-sample priming window before crossfading in -- a node
+    /// skipped while off would otherwise resume with stale or zeroed history and emit a sample
+    /// that's neither a valid dry nor a valid wet value.
     private func processSlot(_ slot: ChainGraph.Slot, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
                              frames: Int, mono: Bool, sidechain: FXSidechain) {
         let latency = slot.latency
@@ -596,14 +690,40 @@ final class FXChain: @unchecked Sendable {
         }
         slot.dryWrite = pushStart + frames
 
+        let target: Float = slot.enabled.load(ordering: .relaxed) ? 1 : 0
+
+        if target == 0, slot.isSettledOff {
+            for i in 0..<frames {
+                let readIndex = pushStart + i - latency
+                left[i] = readIndex >= 0 ? slot.dryLeft[readIndex & (ringLen - 1)] : 0
+                right[i] = readIndex >= 0 ? slot.dryRight[readIndex & (ringLen - 1)] : 0
+            }
+            return
+        }
+
+        if slot.isSettledOff {
+            slot.node.reset()
+            slot.primingRemaining = latency
+            slot.isSettledOff = false
+        }
+
         let block = FXBlock(left: left, right: mono ? left : right, frames: frames,
                             channels: mono ? 1 : 2, sidechain: sidechain)
         slot.node.process(block)
         if mono { for i in 0..<frames { right[i] = left[i] } }
 
-        let target: Float = slot.enabled.load(ordering: .relaxed) ? 1 : 0
         var fade = slot.crossfade
         for i in 0..<frames {
+            if slot.primingRemaining > 0 {
+                // Still priming after an off-to-on transition: the node's just-computed wet
+                // sample may still reflect its just-reset history, so emit pure delayed dry
+                // and never blend it in until the priming window has fully elapsed.
+                slot.primingRemaining -= 1
+                let readIndex = pushStart + i - latency
+                left[i] = readIndex >= 0 ? slot.dryLeft[readIndex & (ringLen - 1)] : 0
+                right[i] = readIndex >= 0 ? slot.dryRight[readIndex & (ringLen - 1)] : 0
+                continue
+            }
             fade = target > fade ? min(target, fade + Self.crossfadeStep) : max(target, fade - Self.crossfadeStep)
             let readIndex = pushStart + i - latency
             let dl: Float = readIndex >= 0 ? slot.dryLeft[readIndex & (ringLen - 1)] : 0
@@ -612,6 +732,9 @@ final class FXChain: @unchecked Sendable {
             right[i] = fade * right[i] + (1 - fade) * dr
         }
         slot.crossfade = fade
+        if target == 0, fade == 0 {
+            slot.isSettledOff = true
+        }
     }
 }
 
@@ -666,6 +789,14 @@ final class ChainGraph: @unchecked Sendable {
         /// 0 = fully bypassed (dry), 1 = fully wet. Initialized already settled to the node's
         /// starting `enabled` state: only live toggles animate it, not graph (re)builds.
         var crossfade: Float
+        /// IO-thread only: true once this stage has fully settled bypassed (`crossfade == 0`,
+        /// no pending fade or priming), letting `processSlot` skip `node.process` entirely
+        /// until the stage is asked to turn back on.
+        var isSettledOff: Bool
+        /// IO-thread only: frames still needed to prime the node's internal history after an
+        /// off-to-on transition (reset to zero, then fed real audio) before its wet output is
+        /// allowed into the crossfade blend. 0 when not priming.
+        var primingRemaining = 0
 
         init(id: UUID, node: any FXNode, enabled: Bool, latency: Int, loadError: String?) {
             self.id = id
@@ -679,6 +810,7 @@ final class ChainGraph: @unchecked Sendable {
             dryLeft.initialize(repeating: 0, count: dryCapacity)
             dryRight.initialize(repeating: 0, count: dryCapacity)
             crossfade = enabled ? 1 : 0
+            isSettledOff = !enabled
         }
 
         deinit {
@@ -693,6 +825,11 @@ final class ChainGraph: @unchecked Sendable {
     /// runs through this graph following a swap. `FXChain.scheduleRelease` polls this (off the
     /// IO thread, no timeout) before freeing the graph.
     let retired = Atomic<Bool>(false)
+    /// Monotonically increasing per chain (`FXChain.nextGraphGeneration`), assigned when
+    /// published (or installed via `debugInstallGraph`). Lets `FXChain.scheduleRelease` tell
+    /// apart a graph the IO thread properly adopted-then-retired from one superseded before the
+    /// IO thread ever observed it (see `ioObservedGeneration`), without needing a timeout.
+    var generation = 0
 
     init(slots: [Slot]) {
         self.slots = slots

@@ -1,5 +1,14 @@
 import Foundation
 
+/// Per-frame voice-chain meter values, isolated into their own `ObservableObject` so the 15 Hz
+/// poll that updates them invalidates only the small views observing `FXEngine.meters` --
+/// never the whole Effects page (`FXEngine` itself, including `InteractiveEQView`'s
+/// pixel-by-pixel curve work) the way folding this into `FXEngine`'s own `@Published` state did.
+@MainActor
+final class FXEngineMeters: ObservableObject {
+    @Published var voiceProbability: Float = 0
+}
+
 /// Main-actor facade over the voice chains running inside `AudioRouter`, owned by the app
 /// alongside `RoutingSync`/`AudioRouter`. Every voice-input device (mic → virtual mic, mic →
 /// monitor) runs its own `FXChain`, but they all run the same preset, so this surfaces the
@@ -11,7 +20,11 @@ final class FXEngine: ObservableObject {
     @Published private(set) var nodeLoadErrors: [UUID: String] = [:]
     @Published private(set) var availablePlugins: [FXPluginInfo] = []
     @Published private(set) var abBypassed = false
-    @Published private(set) var voiceProbability: Float = 0
+    /// Per-frame speech-probability meter, moved out of this object's own `@Published` state
+    /// (see `FXEngineMeters`). Not `@Published` here: reading it doesn't trigger a SwiftUI
+    /// update on its own -- observe `meters` directly for that.
+    var voiceProbability: Float { meters.voiceProbability }
+    let meters = FXEngineMeters()
 
     private weak var audioRouter: AudioRouter?
     private var pollTimer: Timer?
@@ -28,17 +41,23 @@ final class FXEngine: ObservableObject {
         pollTimer?.invalidate()
     }
 
+    /// Publishes slow-changing chain status only on change (so a steady-state chain doesn't
+    /// invalidate `EffectsView` 15 times a second for values that never moved), and routes the
+    /// genuinely per-frame value (`voiceProbability`) through `meters` instead of `self`.
     private func poll() {
         guard let chain = audioRouter?.firstVoiceFXChain() else {
             if totalLatencyMs != 0 { totalLatencyMs = 0 }
             if !nodeLoadErrors.isEmpty { nodeLoadErrors = [:] }
-            if voiceProbability != 0 { voiceProbability = 0 }
+            if meters.voiceProbability != 0 { meters.voiceProbability = 0 }
             return
         }
-        totalLatencyMs = chain.sampleRate > 0 ? Double(chain.totalLatencySamples) / Double(chain.sampleRate) * 1000 : 0
-        nodeLoadErrors = chain.nodeLoadErrors()
-        voiceProbability = chain.voiceProbability
-        abBypassed = chain.isABBypassed
+        let latencyMs = chain.sampleRate > 0 ? Double(chain.totalLatencySamples) / Double(chain.sampleRate) * 1000 : 0
+        if totalLatencyMs != latencyMs { totalLatencyMs = latencyMs }
+        let errors = chain.nodeLoadErrors()
+        if nodeLoadErrors != errors { nodeLoadErrors = errors }
+        let bypassed = chain.isABBypassed
+        if abBypassed != bypassed { abBypassed = bypassed }
+        meters.voiceProbability = chain.voiceProbability
     }
 
     /// The live node instance for `id` on the first active voice device, or nil if no voice
@@ -53,14 +72,18 @@ final class FXEngine: ObservableObject {
         abBypassed = bypassed
     }
 
-    /// Every hosted node's current state across every running voice chain (devices sharing the
-    /// same preset carry the same node ids), to persist into the preset.
+    /// Every hosted node's current state from the representative voice chain
+    /// (`firstVoiceFXChain()`, the same instance `liveNode` surfaces and the plugin editor
+    /// edits), to persist into the preset. Other devices run independent instances of the same
+    /// node ids but are never the one being edited, so their state is intentionally left out:
+    /// capturing from every chain and merging by id let whichever instance happened to be
+    /// visited last in `allVoiceFXChains()`'s unspecified dictionary order silently overwrite
+    /// the edited instance's state. Live-synchronizing other devices' hosted-plugin instances
+    /// would need a runtime `restoreState` on `FXHostedNode` (today state is only consumed at
+    /// construction, from `FXNodeConfig.pluginState`); out of scope here.
     func captureHostedStates() async -> [UUID: Data] {
-        var out: [UUID: Data] = [:]
-        for chain in audioRouter?.allVoiceFXChains() ?? [] {
-            for (id, data) in await chain.captureHostedStates() { out[id] = data }
-        }
-        return out
+        guard let chain = audioRouter?.firstVoiceFXChain() else { return [:] }
+        return await chain.captureHostedStates()
     }
 
     /// Scans the three hosted-effect catalogs concurrently and caches the result for the

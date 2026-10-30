@@ -793,6 +793,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             guard let self else { return }
             let nodes = preset.nodes
             for chain in self.fxChainsByDevice.values {
+                chain.setMasterEnabled(preset.isEnabled)
                 Task { await chain.updateConfigs(nodes) }
             }
             let appConfig = AppAudioProcessor.Config(
@@ -816,6 +817,7 @@ class AudioRouter: ObservableObject, @unchecked Sendable {
             return
         }
         let chain = FXChain(sampleRate: Float(ctx.sampleRate), captureDeviceUID: ctx.captureDeviceUID)
+        chain.setMasterEnabled(currentEffectsPreset.isEnabled)
         ctx.attachFXChain(chain)
         fxChainsByDevice[ctx.captureDeviceUID] = chain
         fxChainsLock.lock()
