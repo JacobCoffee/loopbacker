@@ -210,8 +210,22 @@ struct ParameterSliderRow: View {
 
 struct EQBandRow: View {
     @EnvironmentObject var routingState: RoutingState
+    let nodeID: UUID
     let band: EQBandConfig
-    let index: Int
+
+    private var gainBinding: Binding<Float> {
+        Binding(
+            get: { band.gainDB },
+            set: { newValue in
+                guard let nodeIdx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == nodeID }),
+                      var bands = routingState.effectsPreset.nodes[nodeIdx].eqBands,
+                      let bandIdx = bands.firstIndex(where: { $0.id == band.id }) else { return }
+                bands[bandIdx].gainDB = newValue
+                routingState.effectsPreset.nodes[nodeIdx].eqBands = bands
+                routingState.save()
+            }
+        )
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -233,16 +247,7 @@ struct EQBandRow: View {
             .frame(width: 54, alignment: .leading)
 
             if band.type != .highpass {
-                Slider(
-                    value: Binding(
-                        get: { routingState.effectsPreset.eqBands[index].gainDB },
-                        set: {
-                            routingState.effectsPreset.eqBands[index].gainDB = $0
-                            routingState.save()
-                        }
-                    ),
-                    in: -12...12
-                ) {
+                Slider(value: gainBinding, in: -12...12) {
                     Text("Gain")
                 }
                 .tint(.loopbacker)

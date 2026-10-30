@@ -2,15 +2,16 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Effects section: a left-to-right signal chain of glass slots (Input → 9 stages → Output)
-/// plus a detail panel for the selected stage's parameters. Signal is the light source: active
-/// stages and the lines between them glow Loopbacker green only while the chain is enabled.
+/// Effects section: a left-to-right signal chain of glass slots (Input → preset.nodes → Output)
+/// plus a detail panel for the selected stage's parameters, generic over `FXParamSpec`. Signal
+/// is the light source: active stages and the lines between them glow Loopbacker green only
+/// while the chain is enabled.
 struct EffectsView: View {
     @EnvironmentObject var routingState: RoutingState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var chainNamespace
 
-    @State private var selectedEffect: String?
+    @State private var selectedNodeID: UUID?
 
     // Preset management state
     @State private var savedPresetNames: [String] = []
@@ -21,40 +22,8 @@ struct EffectsView: View {
         routingState.effectsPreset
     }
 
-    /// The ordered pipeline stages.
-    private var stages: [(name: String, icon: String, enabled: Bool, toggle: () -> Void)] {
-        [
-            ("Gate", "waveform.path.ecg", preset.gateEnabled, {
-                routingState.effectsPreset.gateEnabled.toggle(); routingState.save()
-            }),
-            ("EQ", "slider.vertical.3", preset.eqEnabled, {
-                routingState.effectsPreset.eqEnabled.toggle(); routingState.save()
-            }),
-            ("Compressor", "arrow.down.right.and.arrow.up.left", preset.compressorEnabled, {
-                routingState.effectsPreset.compressorEnabled.toggle(); routingState.save()
-            }),
-            ("De-Esser", "s.circle", preset.deEsserEnabled, {
-                routingState.effectsPreset.deEsserEnabled.toggle(); routingState.save()
-            }),
-            ("Chorus", "waveform.path", preset.chorusEnabled, {
-                routingState.effectsPreset.chorusEnabled.toggle(); routingState.save()
-            }),
-            ("Pitch Shift", "arrow.up.arrow.down", preset.pitchShiftEnabled, {
-                routingState.effectsPreset.pitchShiftEnabled.toggle(); routingState.save()
-            }),
-            ("Reverb", "drop.halffull", preset.reverbEnabled, {
-                routingState.effectsPreset.reverbEnabled.toggle(); routingState.save()
-            }),
-            ("Delay", "repeat", preset.delayEnabled, {
-                routingState.effectsPreset.delayEnabled.toggle(); routingState.save()
-            }),
-            ("Limiter", "gauge.with.dots.needle.67percent", preset.limiterEnabled, {
-                routingState.effectsPreset.limiterEnabled.toggle(); routingState.save()
-            }),
-        ]
-    }
-
-    private var activeCount: Int { stages.filter(\.enabled).count }
+    private var nodes: [FXNodeConfig] { preset.nodes }
+    private var activeCount: Int { nodes.filter(\.enabled).count }
 
     var body: some View {
         ScrollView(.vertical) {
@@ -70,8 +39,8 @@ struct EffectsView: View {
                         .frame(width: 210)
                         .opacity(preset.isEnabled ? 1 : 0.45)
 
-                    if let selected = selectedEffect {
-                        detailPanel(for: selected)
+                    if let selected = selectedNodeID, let node = nodes.first(where: { $0.id == selected }) {
+                        detailPanel(for: node)
                             .frame(maxWidth: 760, alignment: .topLeading)
                             .id(selected)
                             .transition(.opacity)
@@ -82,7 +51,7 @@ struct EffectsView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .scrollEdgeEffectStyle(.soft, for: .top)
-        .navigationSubtitle(preset.isEnabled ? "\(activeCount) of \(stages.count) active" : "Bypassed")
+        .navigationSubtitle(preset.isEnabled ? "\(activeCount) of \(nodes.count) active" : "Bypassed")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Toggle(isOn: masterBinding) {
@@ -96,8 +65,8 @@ struct EffectsView: View {
         }
         .onAppear {
             refreshSavedPresets()
-            if selectedEffect == nil {
-                selectedEffect = stages.first(where: \.enabled)?.name ?? "Gate"
+            if selectedNodeID == nil {
+                selectedNodeID = nodes.first(where: \.enabled)?.id ?? nodes.first?.id
             }
         }
     }
@@ -112,6 +81,58 @@ struct EffectsView: View {
                 routingState.save()
             }
         )
+    }
+
+    // MARK: - Display metadata
+
+    private func icon(for kind: FXNodeKind) -> String {
+        switch kind {
+        case .gate: "waveform.path.ecg"
+        case .eq: "slider.vertical.3"
+        case .compressor: "arrow.down.right.and.arrow.up.left"
+        case .leveler: "chart.bar.fill"
+        case .deEsser: "s.circle"
+        case .chorus: "waveform.path"
+        case .pitchShift: "arrow.up.arrow.down"
+        case .reverb: "drop.halffull"
+        case .delay: "repeat"
+        case .limiter: "gauge.with.dots.needle.67percent"
+        case .audioUnit, .jsfx, .airwindows: "puzzlepiece.extension"
+        }
+    }
+
+    private func displayName(for kind: FXNodeKind) -> String {
+        switch kind {
+        case .gate: "Gate"
+        case .eq: "EQ"
+        case .compressor: "Compressor"
+        case .leveler: "Leveler"
+        case .deEsser: "De-Esser"
+        case .chorus: "Chorus"
+        case .pitchShift: "Pitch Shift"
+        case .reverb: "Reverb"
+        case .delay: "Delay"
+        case .limiter: "Limiter"
+        case .audioUnit: "Audio Unit"
+        case .jsfx: "JSFX"
+        case .airwindows: "Airwindows"
+        }
+    }
+
+    private func effectDescription(_ kind: FXNodeKind) -> String {
+        switch kind {
+        case .gate: "Reduces background noise below a threshold"
+        case .eq: "Shape tonal balance with parametric bands"
+        case .compressor: "Tames dynamic range for consistent levels"
+        case .leveler: "Holds your voice at a target loudness"
+        case .deEsser: "Reduces harsh sibilance in vocals"
+        case .chorus: "Thickens voice with modulated detuning"
+        case .pitchShift: "Shift voice pitch up or down in semitones"
+        case .reverb: "Adds room/hall spatial ambience"
+        case .delay: "Echo effect with adjustable feedback"
+        case .limiter: "Prevents clipping with a hard ceiling"
+        case .audioUnit, .jsfx, .airwindows: "Hosted third-party effect"
+        }
     }
 
     // MARK: - Noise suppression
@@ -215,6 +236,7 @@ struct EffectsView: View {
         var applied = newPreset
         applied.isEnabled = true
         routingState.effectsPreset = applied
+        selectedNodeID = applied.nodes.first?.id
         routingState.save()
     }
 
@@ -328,24 +350,24 @@ struct EffectsView: View {
             VStack(spacing: 0) {
                 ChainTerminalTile(label: "Input", icon: "mic.fill", namespace: chainNamespace)
 
-                ForEach(Array(stages.enumerated()), id: \.element.name) { index, stage in
-                    SignalLineConnector(active: preset.isEnabled && previousActive(before: index) && stage.enabled)
+                ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
+                    SignalLineConnector(active: preset.isEnabled && previousActive(before: index) && node.enabled)
                     ChainSlotTile(
-                        name: stage.name,
-                        icon: stage.icon,
-                        enabled: stage.enabled,
-                        isSelected: selectedEffect == stage.name,
-                        toggle: stage.toggle,
+                        name: displayName(for: node.kind),
+                        icon: icon(for: node.kind),
+                        enabled: node.enabled,
+                        isSelected: selectedNodeID == node.id,
+                        toggle: { toggleNode(node.id) },
                         select: {
                             withAnimation(.easeOut(duration: 0.2)) {
-                                selectedEffect = stage.name
+                                selectedNodeID = node.id
                             }
                         },
                         namespace: chainNamespace
                     )
                 }
 
-                SignalLineConnector(active: preset.isEnabled && (stages.last?.enabled ?? false))
+                SignalLineConnector(active: preset.isEnabled && (nodes.last?.enabled ?? false))
                 ChainTerminalTile(label: "Output", icon: "speaker.wave.2.fill", namespace: chainNamespace)
             }
         }
@@ -354,30 +376,30 @@ struct EffectsView: View {
     /// Whether the segment feeding into `index` should glow: both the upstream node and this
     /// stage must be active (the input terminal is always "active").
     private func previousActive(before index: Int) -> Bool {
-        index == 0 ? true : stages[index - 1].enabled
+        index == 0 ? true : nodes[index - 1].enabled
+    }
+
+    private func toggleNode(_ id: UUID) {
+        guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == id }) else { return }
+        routingState.effectsPreset.nodes[idx].enabled.toggle()
+        routingState.save()
     }
 
     // MARK: - Detail panel
 
     @ViewBuilder
-    private func detailPanel(for effectName: String) -> some View {
-        let stage = stages.first { $0.name == effectName }
-        let enabled = stage?.enabled ?? false
-        let toggle = stage?.toggle ?? {}
-
+    private func detailPanel(for node: FXNodeConfig) -> some View {
         VStack(alignment: .leading, spacing: Metrics.panelSpacing) {
             HStack(spacing: 10) {
-                if let icon = stage?.icon {
-                    Image(systemName: icon)
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(enabled ? Color.loopbacker : Color.secondary)
-                        .frame(width: 28, height: 28)
-                }
+                Image(systemName: icon(for: node.kind))
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(node.enabled ? Color.loopbacker : Color.secondary)
+                    .frame(width: 28, height: 28)
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(effectName)
+                    Text(displayName(for: node.kind))
                         .font(.headline)
-                    Text(effectDescription(effectName))
+                    Text(effectDescription(node.kind))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -385,18 +407,18 @@ struct EffectsView: View {
                 Spacer()
 
                 Button("Reset") {
-                    resetEffect(effectName)
+                    resetNode(node.id)
                 }
                 .buttonStyle(.glass)
                 .tint(nil)
                 .controlSize(.small)
-                .help("Reset \(effectName) to default values")
+                .help("Reset \(displayName(for: node.kind)) to default values")
 
                 Toggle(isOn: Binding(
-                    get: { enabled },
-                    set: { _ in withAnimation(.easeInOut(duration: 0.2)) { toggle() } }
+                    get: { node.enabled },
+                    set: { _ in withAnimation(.easeInOut(duration: 0.2)) { toggleNode(node.id) } }
                 )) {
-                    Text(enabled ? "Active" : "Bypassed")
+                    Text(node.enabled ? "Active" : "Bypassed")
                         .font(.caption.weight(.semibold))
                 }
                 .toggleStyle(.switch)
@@ -406,21 +428,21 @@ struct EffectsView: View {
 
             Divider()
 
-            if effectName == "Gate" && enabled && routingState.noiseSuppression.isEnabled {
-                gateWithSuppressionHint
+            if node.kind == .gate && node.enabled && routingState.noiseSuppression.isEnabled {
+                gateWithSuppressionHint(node.id)
             }
 
-            quickPresetsRow(for: effectName)
+            quickPresetsRow(for: node)
 
-            expandedControls(for: effectName)
+            expandedControls(for: node)
         }
         .padding(Metrics.panelPadding)
-        .glassPanel(cornerRadius: Metrics.panelRadius, tint: enabled ? Color.loopbacker.opacity(0.08) : nil)
+        .glassPanel(cornerRadius: Metrics.panelRadius, tint: node.enabled ? Color.loopbacker.opacity(0.08) : nil)
     }
 
     /// Noise suppression already pulls the room down, so a gate on top mostly clips quiet word
     /// endings. Shown in the Gate panel while both run.
-    private var gateWithSuppressionHint: some View {
+    private func gateWithSuppressionHint(_ nodeID: UUID) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Image(systemName: "waveform.badge.minus")
                 .foregroundStyle(.secondary)
@@ -431,14 +453,11 @@ struct EffectsView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
             Button("Use Light Gate") {
-                routingState.effectsPreset.gateThresholdDB = -45
-                routingState.effectsPreset.gateReductionDB = -6
-                routingState.save()
+                applyQuickPreset(nodeID, overrides: ["threshold": -45, "range": -6])
             }
-            .help("Threshold -45 dB, reduction -6 dB: only trims what's left between words")
+            .help("Threshold -45 dB, range -6 dB: only trims what's left between words")
             Button("Turn Off Gate") {
-                withAnimation(.easeInOut(duration: 0.2)) { routingState.effectsPreset.gateEnabled = false }
-                routingState.save()
+                withAnimation(.easeInOut(duration: 0.2)) { toggleNode(nodeID) }
             }
             .help("Bypass the gate and let noise suppression handle the room")
         }
@@ -447,393 +466,205 @@ struct EffectsView: View {
         .controlSize(.small)
     }
 
-    // MARK: - Reset effect to defaults
+    // MARK: - Reset / quick presets, driven by FXParamSpec ids
 
-    private func resetEffect(_ name: String) {
-        let defaults = EffectsPreset()
+    private func resetNode(_ id: UUID) {
+        guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == id }) else { return }
+        let kind = routingState.effectsPreset.nodes[idx].kind
+        var defaults: [String: Float] = [:]
+        for spec in FXBuiltinSpecs.specs(for: kind) { defaults[spec.id] = spec.defaultValue }
         withAnimation(.easeInOut(duration: 0.2)) {
-            switch name {
-            case "Gate":
-                routingState.effectsPreset.gateThresholdDB = defaults.gateThresholdDB
-                routingState.effectsPreset.gateAttackMs = defaults.gateAttackMs
-                routingState.effectsPreset.gateReleaseMs = defaults.gateReleaseMs
-                routingState.effectsPreset.gateReductionDB = defaults.gateReductionDB
-            case "EQ":
-                routingState.effectsPreset.eqBands = defaults.eqBands
-            case "Compressor":
-                routingState.effectsPreset.compressorThresholdDB = defaults.compressorThresholdDB
-                routingState.effectsPreset.compressorRatio = defaults.compressorRatio
-                routingState.effectsPreset.compressorAttackMs = defaults.compressorAttackMs
-                routingState.effectsPreset.compressorReleaseMs = defaults.compressorReleaseMs
-                routingState.effectsPreset.compressorMakeupDB = defaults.compressorMakeupDB
-            case "De-Esser":
-                routingState.effectsPreset.deEsserFrequencyHz = defaults.deEsserFrequencyHz
-                routingState.effectsPreset.deEsserReductionDB = defaults.deEsserReductionDB
-                routingState.effectsPreset.deEsserRatio = defaults.deEsserRatio
-            case "Chorus":
-                routingState.effectsPreset.chorusRate = defaults.chorusRate
-                routingState.effectsPreset.chorusDepth = defaults.chorusDepth
-                routingState.effectsPreset.chorusMix = defaults.chorusMix
-            case "Pitch Shift":
-                routingState.effectsPreset.pitchSemitones = defaults.pitchSemitones
-                routingState.effectsPreset.pitchMix = defaults.pitchMix
-            case "Reverb":
-                routingState.effectsPreset.reverbRoomSize = defaults.reverbRoomSize
-                routingState.effectsPreset.reverbDamping = defaults.reverbDamping
-                routingState.effectsPreset.reverbMix = defaults.reverbMix
-            case "Delay":
-                routingState.effectsPreset.delayTimeMs = defaults.delayTimeMs
-                routingState.effectsPreset.delayFeedback = defaults.delayFeedback
-                routingState.effectsPreset.delayMix = defaults.delayMix
-            case "Limiter":
-                routingState.effectsPreset.limiterCeilingDB = defaults.limiterCeilingDB
-                routingState.effectsPreset.limiterReleaseMs = defaults.limiterReleaseMs
-            default:
-                break
-            }
+            routingState.effectsPreset.nodes[idx].params = defaults
+            if kind == .eq { routingState.effectsPreset.nodes[idx].eqBands = EQBandConfig.broadcastMasculine }
             routingState.save()
         }
     }
 
-    // MARK: - Quick presets row
+    private func applyQuickPreset(_ id: UUID, overrides: [String: Float]) {
+        guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == id }) else { return }
+        for (key, value) in overrides { routingState.effectsPreset.nodes[idx].params[key] = value }
+        routingState.save()
+    }
 
-    @ViewBuilder
-    private func quickPresetsRow(for effectName: String) -> some View {
-        QuickPresetsRow(presets: quickPresets(for: effectName).map {
-            QuickPresetsRow.Preset(name: $0.name, apply: $0.apply)
-        })
+    private func applyQuickEQBands(_ id: UUID, bands: [EQBandConfig]) {
+        guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == id }) else { return }
+        routingState.effectsPreset.nodes[idx].eqBands = bands
+        routingState.save()
     }
 
     private struct QuickPreset {
         let name: String
-        let apply: () -> Void
+        let overrides: [String: Float]
     }
 
-    private func quickPresets(for effectName: String) -> [QuickPreset] {
-        switch effectName {
-        case "Gate":
+    private func quickPresets(for kind: FXNodeKind) -> [QuickPreset] {
+        switch kind {
+        case .gate:
             return [
-                QuickPreset(name: "Soft Gate") {
-                    routingState.effectsPreset.gateThresholdDB = -36
-                    routingState.effectsPreset.gateReductionDB = -12
-                    routingState.save()
-                },
-                QuickPreset(name: "Hard Gate") {
-                    routingState.effectsPreset.gateThresholdDB = -30
-                    routingState.effectsPreset.gateReductionDB = -40
-                    routingState.save()
-                },
-                QuickPreset(name: "Light") {
-                    routingState.effectsPreset.gateThresholdDB = -45
-                    routingState.effectsPreset.gateReductionDB = -6
-                    routingState.save()
-                },
+                QuickPreset(name: "Soft Gate", overrides: ["threshold": -36, "range": -12]),
+                QuickPreset(name: "Hard Gate", overrides: ["threshold": -30, "range": -40]),
+                QuickPreset(name: "Light", overrides: ["threshold": -45, "range": -6]),
             ]
-        case "EQ":
+        case .compressor:
             return [
-                QuickPreset(name: "Broadcast Masculine") {
-                    routingState.effectsPreset.eqBands = EQBandConfig.broadcastMasculine
-                    routingState.save()
-                },
-                QuickPreset(name: "Flat") {
-                    routingState.effectsPreset.eqBands = [
-                        EQBandConfig(id: 0, type: .highpass, frequencyHz: 80, gainDB: 0, q: 0.7),
-                        EQBandConfig(id: 1, type: .peaking, frequencyHz: 220, gainDB: 0, q: 0.7),
-                        EQBandConfig(id: 2, type: .peaking, frequencyHz: 350, gainDB: 0, q: 1.2),
-                        EQBandConfig(id: 3, type: .peaking, frequencyHz: 3500, gainDB: 0, q: 0.9),
-                        EQBandConfig(id: 4, type: .highshelf, frequencyHz: 10000, gainDB: 0, q: 0.7),
-                    ]
-                    routingState.save()
-                },
-                QuickPreset(name: "Warm") {
-                    routingState.effectsPreset.eqBands = [
-                        EQBandConfig(id: 0, type: .highpass, frequencyHz: 80, gainDB: 0, q: 0.7),
-                        EQBandConfig(id: 1, type: .peaking, frequencyHz: 200, gainDB: 2, q: 0.8),
-                        EQBandConfig(id: 2, type: .peaking, frequencyHz: 350, gainDB: 0, q: 1.2),
-                        EQBandConfig(id: 3, type: .peaking, frequencyHz: 3000, gainDB: -1, q: 0.9),
-                        EQBandConfig(id: 4, type: .highshelf, frequencyHz: 10000, gainDB: 0, q: 0.7),
-                    ]
-                    routingState.save()
-                },
-                QuickPreset(name: "Bright") {
-                    routingState.effectsPreset.eqBands = [
-                        EQBandConfig(id: 0, type: .highpass, frequencyHz: 80, gainDB: 0, q: 0.7),
-                        EQBandConfig(id: 1, type: .peaking, frequencyHz: 220, gainDB: 0, q: 0.7),
-                        EQBandConfig(id: 2, type: .peaking, frequencyHz: 350, gainDB: 0, q: 1.2),
-                        EQBandConfig(id: 3, type: .peaking, frequencyHz: 5000, gainDB: 3, q: 0.9),
-                        EQBandConfig(id: 4, type: .highshelf, frequencyHz: 10000, gainDB: 2, q: 0.7),
-                    ]
-                    routingState.save()
-                },
+                QuickPreset(name: "Gentle", overrides: ["ratio": 2, "threshold": -20, "makeup": 0]),
+                QuickPreset(name: "Broadcast", overrides: ["ratio": 3, "threshold": -18, "makeup": 3]),
+                QuickPreset(name: "Aggressive", overrides: ["ratio": 6, "threshold": -24, "makeup": 6]),
             ]
-        case "Compressor":
+        case .deEsser:
             return [
-                QuickPreset(name: "Gentle") {
-                    routingState.effectsPreset.compressorRatio = 2
-                    routingState.effectsPreset.compressorThresholdDB = -20
-                    routingState.effectsPreset.compressorMakeupDB = 0
-                    routingState.save()
-                },
-                QuickPreset(name: "Broadcast") {
-                    routingState.effectsPreset.compressorRatio = 3
-                    routingState.effectsPreset.compressorThresholdDB = -18
-                    routingState.effectsPreset.compressorMakeupDB = 3
-                    routingState.save()
-                },
-                QuickPreset(name: "Aggressive") {
-                    routingState.effectsPreset.compressorRatio = 6
-                    routingState.effectsPreset.compressorThresholdDB = -24
-                    routingState.effectsPreset.compressorMakeupDB = 6
-                    routingState.save()
-                },
+                QuickPreset(name: "Light", overrides: ["range": 3]),
+                QuickPreset(name: "Normal", overrides: ["range": 6]),
+                QuickPreset(name: "Heavy", overrides: ["range": 10]),
             ]
-        case "De-Esser":
+        case .chorus:
             return [
-                QuickPreset(name: "Light") {
-                    routingState.effectsPreset.deEsserReductionDB = -3
-                    routingState.save()
-                },
-                QuickPreset(name: "Normal") {
-                    routingState.effectsPreset.deEsserReductionDB = -6
-                    routingState.save()
-                },
-                QuickPreset(name: "Heavy") {
-                    routingState.effectsPreset.deEsserReductionDB = -10
-                    routingState.save()
-                },
+                QuickPreset(name: "Subtle", overrides: ["rate": 1.0, "depth": 2, "mix": 20]),
+                QuickPreset(name: "Thick", overrides: ["rate": 0.8, "depth": 5, "mix": 50]),
+                QuickPreset(name: "Vibrato", overrides: ["rate": 5.0, "depth": 1, "mix": 80]),
             ]
-        case "Chorus":
+        case .pitchShift:
             return [
-                QuickPreset(name: "Subtle") {
-                    routingState.effectsPreset.chorusRate = 1.0; routingState.effectsPreset.chorusDepth = 2; routingState.effectsPreset.chorusMix = 0.2; routingState.save()
-                },
-                QuickPreset(name: "Thick") {
-                    routingState.effectsPreset.chorusRate = 0.8; routingState.effectsPreset.chorusDepth = 5; routingState.effectsPreset.chorusMix = 0.5; routingState.save()
-                },
-                QuickPreset(name: "Vibrato") {
-                    routingState.effectsPreset.chorusRate = 5.0; routingState.effectsPreset.chorusDepth = 1; routingState.effectsPreset.chorusMix = 0.8; routingState.save()
-                },
+                QuickPreset(name: "Down Octave", overrides: ["semitones": -12]),
+                QuickPreset(name: "Up Fifth", overrides: ["semitones": 7]),
+                QuickPreset(name: "Chipmunk", overrides: ["semitones": 12]),
+                QuickPreset(name: "None", overrides: ["semitones": 0]),
             ]
-        case "Pitch Shift":
+        case .reverb:
             return [
-                QuickPreset(name: "Down Octave") {
-                    routingState.effectsPreset.pitchSemitones = -12; routingState.save()
-                },
-                QuickPreset(name: "Up Fifth") {
-                    routingState.effectsPreset.pitchSemitones = 7; routingState.save()
-                },
-                QuickPreset(name: "Chipmunk") {
-                    routingState.effectsPreset.pitchSemitones = 12; routingState.save()
-                },
-                QuickPreset(name: "None") {
-                    routingState.effectsPreset.pitchSemitones = 0; routingState.save()
-                },
+                QuickPreset(name: "Small Room", overrides: ["size": 30, "damping": 60, "mix": 12]),
+                QuickPreset(name: "Hall", overrides: ["size": 80, "damping": 30, "mix": 20]),
+                QuickPreset(name: "Subtle", overrides: ["size": 40, "damping": 50, "mix": 8]),
             ]
-        case "Reverb":
+        case .delay:
             return [
-                QuickPreset(name: "Small Room") {
-                    routingState.effectsPreset.reverbRoomSize = 0.3; routingState.effectsPreset.reverbDamping = 0.6; routingState.effectsPreset.reverbMix = 0.12; routingState.save()
-                },
-                QuickPreset(name: "Hall") {
-                    routingState.effectsPreset.reverbRoomSize = 0.8; routingState.effectsPreset.reverbDamping = 0.3; routingState.effectsPreset.reverbMix = 0.2; routingState.save()
-                },
-                QuickPreset(name: "Subtle") {
-                    routingState.effectsPreset.reverbRoomSize = 0.4; routingState.effectsPreset.reverbDamping = 0.5; routingState.effectsPreset.reverbMix = 0.08; routingState.save()
-                },
+                QuickPreset(name: "Slapback", overrides: ["time": 80, "feedback": 10, "mix": 30]),
+                QuickPreset(name: "Quarter", overrides: ["time": 500, "feedback": 30, "mix": 25]),
+                QuickPreset(name: "Long Echo", overrides: ["time": 750, "feedback": 50, "mix": 20]),
             ]
-        case "Delay":
+        case .limiter:
             return [
-                QuickPreset(name: "Slapback") {
-                    routingState.effectsPreset.delayTimeMs = 80; routingState.effectsPreset.delayFeedback = 0.1; routingState.effectsPreset.delayMix = 0.3; routingState.save()
-                },
-                QuickPreset(name: "Quarter") {
-                    routingState.effectsPreset.delayTimeMs = 500; routingState.effectsPreset.delayFeedback = 0.3; routingState.effectsPreset.delayMix = 0.25; routingState.save()
-                },
-                QuickPreset(name: "Long Echo") {
-                    routingState.effectsPreset.delayTimeMs = 750; routingState.effectsPreset.delayFeedback = 0.5; routingState.effectsPreset.delayMix = 0.2; routingState.save()
-                },
+                QuickPreset(name: "Safe", overrides: ["ceiling": -1.5]),
+                QuickPreset(name: "Loud", overrides: ["ceiling": -0.5]),
+                QuickPreset(name: "Broadcast", overrides: ["ceiling": -1.0]),
             ]
-        case "Limiter":
-            return [
-                QuickPreset(name: "Safe") {
-                    routingState.effectsPreset.limiterCeilingDB = -1.5
-                    routingState.save()
-                },
-                QuickPreset(name: "Loud") {
-                    routingState.effectsPreset.limiterCeilingDB = -0.5
-                    routingState.save()
-                },
-                QuickPreset(name: "Broadcast") {
-                    routingState.effectsPreset.limiterCeilingDB = -1.0
-                    routingState.save()
-                },
-            ]
-        default:
+        case .eq, .leveler, .audioUnit, .jsfx, .airwindows:
             return []
         }
     }
 
-    private func effectDescription(_ name: String) -> String {
-        switch name {
-        case "Gate": return "Reduces background noise below a threshold"
-        case "EQ": return "Shape tonal balance with parametric bands"
-        case "Compressor": return "Tames dynamic range for consistent levels"
-        case "De-Esser": return "Reduces harsh sibilance in vocals"
-        case "Chorus": return "Thickens voice with modulated detuning"
-        case "Pitch Shift": return "Shift voice pitch up or down in semitones"
-        case "Reverb": return "Adds room/hall spatial ambience"
-        case "Delay": return "Echo effect with adjustable feedback"
-        case "Limiter": return "Prevents clipping with a hard ceiling"
-        default: return ""
-        }
-    }
-
     @ViewBuilder
-    private func expandedControls(for effectName: String) -> some View {
-        switch effectName {
-        case "Gate": gateDetailControls
-        case "EQ": eqDetailControls
-        case "Compressor": compressorDetailControls
-        case "De-Esser": deEsserDetailControls
-        case "Chorus": chorusDetailControls
-        case "Pitch Shift": pitchShiftDetailControls
-        case "Reverb": reverbDetailControls
-        case "Delay": delayDetailControls
-        case "Limiter": limiterDetailControls
-        default: EmptyView()
+    private func quickPresetsRow(for node: FXNodeConfig) -> some View {
+        if node.kind == .eq {
+            QuickPresetsRow(presets: [
+                QuickPresetsRow.Preset(name: "Broadcast Masculine", apply: {
+                    applyQuickEQBands(node.id, bands: EQBandConfig.broadcastMasculine)
+                }),
+                QuickPresetsRow.Preset(name: "Flat", apply: {
+                    applyQuickEQBands(node.id, bands: EQBandConfig.broadcastMasculine.map {
+                        var band = $0; band.gainDB = 0; return band
+                    })
+                }),
+            ])
+        } else {
+            let presets = quickPresets(for: node.kind)
+            if !presets.isEmpty {
+                QuickPresetsRow(presets: presets.map { preset in
+                    QuickPresetsRow.Preset(name: preset.name, apply: { applyQuickPreset(node.id, overrides: preset.overrides) })
+                })
+            }
         }
     }
 
-    // MARK: - Parameter binding helper
+    // MARK: - Parameter binding helpers (generic, by FXParamSpec id)
 
-    private func boundParameter(_ keyPath: WritableKeyPath<EffectsPreset, Float>) -> Binding<Float> {
+    private func paramValue(_ node: FXNodeConfig, _ spec: FXParamSpec) -> Float {
+        node.params[spec.id] ?? spec.defaultValue
+    }
+
+    private func paramBinding(nodeID: UUID, spec: FXParamSpec) -> Binding<Float> {
         Binding(
-            get: { routingState.effectsPreset[keyPath: keyPath] },
-            set: {
-                routingState.effectsPreset[keyPath: keyPath] = $0
+            get: {
+                guard let node = routingState.effectsPreset.nodes.first(where: { $0.id == nodeID }) else { return spec.defaultValue }
+                return paramValue(node, spec)
+            },
+            set: { newValue in
+                guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
+                routingState.effectsPreset.nodes[idx].params[spec.id] = newValue
                 routingState.save()
             }
         )
     }
 
-    // MARK: - Gate detail controls
+    private func choiceBinding(nodeID: UUID, spec: FXParamSpec) -> Binding<Int> {
+        Binding(
+            get: { Int(paramBinding(nodeID: nodeID, spec: spec).wrappedValue.rounded()) },
+            set: { paramBinding(nodeID: nodeID, spec: spec).wrappedValue = Float($0) }
+        )
+    }
 
-    private var gateDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Threshold", description: "Level below which audio is attenuated",
-                                value: boundParameter(\.gateThresholdDB), range: -60...0, unit: "dB")
-            ParameterSliderRow(label: "Attack", description: "How fast the gate opens",
-                                value: boundParameter(\.gateAttackMs), range: 0.1...50, unit: "ms")
-            ParameterSliderRow(label: "Release", description: "How fast the gate closes",
-                                value: boundParameter(\.gateReleaseMs), range: 10...500, unit: "ms")
-            ParameterSliderRow(label: "Reduction", description: "Attenuation applied when gate is closed",
-                                value: boundParameter(\.gateReductionDB), range: -40...0, unit: "dB")
+    // MARK: - Generic + EQ-specific controls
+
+    @ViewBuilder
+    private func expandedControls(for node: FXNodeConfig) -> some View {
+        if node.kind == .eq {
+            eqDetailControls(node)
+        } else if node.kind.isHosted {
+            Text("Open this effect's editor window to adjust its parameters.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            genericDetailControls(node)
         }
     }
 
-    // MARK: - EQ detail controls
-
-    private var eqDetailControls: some View {
+    private func genericDetailControls(_ node: FXNodeConfig) -> some View {
         VStack(spacing: 10) {
-            InteractiveEQView()
-                .environmentObject(routingState)
-                .frame(height: 110)
-
-            ForEach(0..<min(preset.eqBands.count, 5), id: \.self) { i in
-                EQBandRow(band: preset.eqBands[i], index: i)
-                    .environmentObject(routingState)
+            ForEach(FXBuiltinSpecs.specs(for: node.kind)) { spec in
+                if let choices = spec.choices {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(spec.name)
+                            .font(.body.weight(.medium))
+                        Picker(spec.name, selection: choiceBinding(nodeID: node.id, spec: spec)) {
+                            ForEach(Array(choices.enumerated()), id: \.offset) { index, choice in
+                                Text(choice).tag(index)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        if !spec.detail.isEmpty {
+                            Text(spec.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                } else {
+                    ParameterSliderRow(label: spec.name, description: spec.detail,
+                                       value: paramBinding(nodeID: node.id, spec: spec),
+                                       range: spec.min...spec.max, unit: spec.unit.rawValue)
+                }
             }
         }
     }
 
-    // MARK: - Compressor detail controls
-
-    private var compressorDetailControls: some View {
+    private func eqDetailControls(_ node: FXNodeConfig) -> some View {
         VStack(spacing: 10) {
-            ParameterSliderRow(label: "Threshold", description: "Level above which compression starts",
-                                value: boundParameter(\.compressorThresholdDB), range: -40...0, unit: "dB")
-            ParameterSliderRow(label: "Ratio", description: "Amount of gain reduction applied",
-                                value: boundParameter(\.compressorRatio), range: 1...20, unit: ":1")
-            ParameterSliderRow(label: "Attack", description: "How fast compression engages",
-                                value: boundParameter(\.compressorAttackMs), range: 0.1...100, unit: "ms")
-            ParameterSliderRow(label: "Release", description: "How fast compression releases",
-                                value: boundParameter(\.compressorReleaseMs), range: 10...500, unit: "ms")
-            ParameterSliderRow(label: "Makeup", description: "Gain added after compression",
-                                value: boundParameter(\.compressorMakeupDB), range: 0...12, unit: "dB")
-        }
-    }
+            InteractiveEQView(nodeID: node.id)
+                .environmentObject(routingState)
+                .frame(height: 110)
 
-    // MARK: - De-Esser detail controls
+            let bands = node.eqBands ?? []
+            ForEach(Array(bands.prefix(16).enumerated()), id: \.element.id) { _, band in
+                EQBandRow(nodeID: node.id, band: band)
+                    .environmentObject(routingState)
+            }
 
-    private var deEsserDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Frequency", description: "Center frequency for sibilance detection",
-                                value: boundParameter(\.deEsserFrequencyHz), range: 2000...12000, unit: "Hz")
-            ParameterSliderRow(label: "Reduction", description: "Maximum sibilance attenuation",
-                                value: boundParameter(\.deEsserReductionDB), range: -12...0, unit: "dB")
-            ParameterSliderRow(label: "Ratio", description: "Compression ratio for detected sibilance",
-                                value: boundParameter(\.deEsserRatio), range: 1...10, unit: ":1")
-        }
-    }
-
-    // MARK: - Chorus detail controls
-
-    private var chorusDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Rate", description: "LFO speed -- how fast the modulation sweeps",
-                                value: boundParameter(\.chorusRate), range: 0.1...5.0, unit: "Hz")
-            ParameterSliderRow(label: "Depth", description: "Modulation depth -- wider = more detuning",
-                                value: boundParameter(\.chorusDepth), range: 0...10, unit: "ms")
-            ParameterSliderRow(label: "Mix", description: "Wet/dry balance",
-                                value: boundParameter(\.chorusMix), range: 0...1, unit: "")
-        }
-    }
-
-    // MARK: - Pitch Shift detail controls
-
-    private var pitchShiftDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Semitones", description: "Pitch shift amount (-12 = octave down, +12 = octave up)",
-                                value: boundParameter(\.pitchSemitones), range: -12...12, unit: "st")
-            ParameterSliderRow(label: "Mix", description: "Blend shifted signal with original",
-                                value: boundParameter(\.pitchMix), range: 0...1, unit: "")
-        }
-    }
-
-    // MARK: - Reverb detail controls
-
-    private var reverbDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Room Size", description: "Size of the virtual space (0 = tiny, 1 = cathedral)",
-                                value: boundParameter(\.reverbRoomSize), range: 0...1, unit: "")
-            ParameterSliderRow(label: "Damping", description: "High-frequency absorption (higher = warmer)",
-                                value: boundParameter(\.reverbDamping), range: 0...1, unit: "")
-            ParameterSliderRow(label: "Mix", description: "Wet/dry balance (keep low for voice)",
-                                value: boundParameter(\.reverbMix), range: 0...1, unit: "")
-        }
-    }
-
-    // MARK: - Delay detail controls
-
-    private var delayDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Time", description: "Delay time between echoes",
-                                value: boundParameter(\.delayTimeMs), range: 10...1000, unit: "ms")
-            ParameterSliderRow(label: "Feedback", description: "How many times the echo repeats (0.9 = long tail)",
-                                value: boundParameter(\.delayFeedback), range: 0...0.9, unit: "")
-            ParameterSliderRow(label: "Mix", description: "Wet/dry balance",
-                                value: boundParameter(\.delayMix), range: 0...1, unit: "")
-        }
-    }
-
-    // MARK: - Limiter detail controls
-
-    private var limiterDetailControls: some View {
-        VStack(spacing: 10) {
-            ParameterSliderRow(label: "Ceiling", description: "Maximum output level -- prevents clipping",
-                                value: boundParameter(\.limiterCeilingDB), range: -6...0, unit: "dB")
-            ParameterSliderRow(label: "Release", description: "How fast the limiter recovers",
-                                value: boundParameter(\.limiterReleaseMs), range: 10...200, unit: "ms")
+            if let outputGainSpec = FXBuiltinSpecs.eq.first(where: { $0.id == "outputGain" }) {
+                ParameterSliderRow(label: outputGainSpec.name, description: outputGainSpec.detail,
+                                   value: paramBinding(nodeID: node.id, spec: outputGainSpec),
+                                   range: outputGainSpec.min...outputGainSpec.max, unit: outputGainSpec.unit.rawValue)
+            }
         }
     }
 }
