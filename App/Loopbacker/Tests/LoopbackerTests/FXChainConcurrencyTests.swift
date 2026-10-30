@@ -61,7 +61,8 @@ struct FXChainConcurrencyTests {
         for cfg in currentConfig {
             #expect(chain.liveNode(id: cfg.id) != nil)
         }
-        #expect(chain.totalLatencySamples == 0) // every scaffolding node reports 0 latency
+        let expectedLatency = currentConfig.reduce(0) { $0 + (chain.liveNode(id: $1.id)?.latencySamples ?? 0) }
+        #expect(chain.totalLatencySamples == expectedLatency)
     }
 
     @Test("Concurrent updateConfigs calls never publish a corrupted mix of two requests")

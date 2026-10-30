@@ -77,7 +77,7 @@ struct AppAudioProcessorTests {
         #expect(abs(buffer[(4800 - 1) * 2] - 0.5 * fxDBToLinear(-12)) < 0.01)
 
         // VoiceBus is a process-wide singleton. Other suites run real `FXChain`s whose VAD
-        // (even the scaffolding stand-in) keeps calling `VoiceBus.update(1)` for as long as
+        // keeps calling `VoiceBus.update` for as long as they're processing, so a single
         // they're processing, so a single quiet-then-release attempt can be re-pinned mid-flight
         // by a concurrently-running suite. Retry the whole settle-and-verify step until it
         // succeeds (bounded, so a genuine regression still fails the test).

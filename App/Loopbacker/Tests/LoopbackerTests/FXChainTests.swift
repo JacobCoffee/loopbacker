@@ -155,8 +155,10 @@ struct FXChainTests {
     @Test("A structural graph swap declicks: fade out then fade in, not a jump")
     func graphSwapDeclicks() async {
         let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "test3")
-        let configA = [FXNodeConfig(id: UUID(), kind: .limiter)]
-        let configB = [FXNodeConfig(id: UUID(), kind: .limiter), FXNodeConfig(id: UUID(), kind: .gate)]
+        // Band-less EQs are exact identities with no latency, so any deviation from `value`
+        // below comes from the swap itself.
+        let configA = [FXNodeConfig(id: UUID(), kind: .eq, eqBands: [])]
+        let configB = [FXNodeConfig(id: UUID(), kind: .eq, eqBands: []), FXNodeConfig(id: UUID(), kind: .eq, eqBands: [])]
 
         await chain.updateConfigs(configA)
 
@@ -171,8 +173,7 @@ struct FXChainTests {
             return stride(from: 0, to: buffer.count, by: 2).map { buffer[$0] }
         }
 
-        // First block settles the initial graph (built-in gate/limiter scaffolding nodes are
-        // identity pass-throughs, so this is just `value` throughout).
+        // First block settles the initial graph: `value` throughout.
         let steady = processBlock()
         #expect(steady.allSatisfy { abs($0 - value) < 1e-5 })
 
