@@ -38,16 +38,18 @@ final class DriverInstaller: ObservableObject {
         }
     }
 
-    /// Hashes `__TEXT,__text` of each driver's executable off the main thread and compares them.
-    /// A content hash (not the whole file or the codesign CDHash) is required here: `install()`
-    /// re-signs the installed copy ad-hoc, which can change the embedded codesign CDHash and
-    /// definitely changes the file bytes, even when the underlying code is identical.
+    /// Hashes every section's content (except `__LINKEDIT`) of each driver's executable off the
+    /// main thread and compares them. A content hash of all sections -- not the whole file, not
+    /// just `__TEXT,__text`, and not codesign's CDHash -- is required here: `install()` re-signs
+    /// the installed copy ad-hoc, which can change the embedded codesign CDHash and definitely
+    /// changes the file bytes, even when the underlying code and data (strings, constant tables,
+    /// etc) are identical.
     private nonisolated static func driverContentDiffers(bundledPath: String, installedPath: String) async -> Bool {
         await Task.detached(priority: .utility) {
             let bundledExecutable = (bundledPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
             let installedExecutable = (installedPath as NSString).appendingPathComponent("Contents/MacOS/Loopbacker")
-            guard let bundledDigest = MachOTextHasher.textSectionDigest(ofExecutableAt: bundledExecutable),
-                  let installedDigest = MachOTextHasher.textSectionDigest(ofExecutableAt: installedExecutable)
+            guard let bundledDigest = MachOTextHasher.contentDigest(ofExecutableAt: bundledExecutable),
+                  let installedDigest = MachOTextHasher.contentDigest(ofExecutableAt: installedExecutable)
             else { return false }
             return bundledDigest != installedDigest
         }.value
