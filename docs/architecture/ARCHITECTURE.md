@@ -588,7 +588,7 @@ budget `NoiseEngineBenchmark` uses to recommend FastEnhancer over RNNoise -- tha
 assumes headroom for the mix and effects sharing the IO thread, and L leaves almost none. M
 clears that budget with comfortable margin (7.2%) while still beating S on every quality metric,
 including matching or exceeding DPDFNet's cleanup (PESQ 3.07 vs 3.04, ESTOI 0.87 vs 0.86, SI-SDR
-19.2 vs 18.8 dB, DNSMOS OVRL 3.12 vs 3.13) at roughly a third of DPDFNet's latency and CPU. So
+19.2 vs 18.8 dB, DNSMOS OVRL 3.12 vs 3.13) at a third of DPDFNet's latency and similar CPU. So
 **M replaced S** as the shipped FastEnhancer model; S and L are no longer bundled, though both
 still build and score with `convert-fastenhancer.py {s,l}` and
 `eval.py --fastenhancer-model <path>` for comparison.
@@ -612,7 +612,7 @@ model) at -60 dB max reduction:
 
 DPDFNet and FastEnhancer both clean up far more than RNNoise (SI-SDR and PESQ), with
 FastEnhancer matching DPDFNet on every metric (PESQ, ESTOI and SI-SDR slightly ahead; DNSMOS
-OVRL essentially tied) at roughly a third of its latency and CPU, which is why it's the
+OVRL essentially tied) at a third of its latency and similar CPU, which is why it's the
 recommended engine and the default -- see "FastEnhancer variant choice" above for how the
 shipped FastEnhancer-M checkpoint was picked over S and L. Re-run with
 `scripts/eval-denoisers/build.sh && scripts/eval-denoisers/eval.py`.

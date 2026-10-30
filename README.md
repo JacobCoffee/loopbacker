@@ -50,7 +50,7 @@ Loopbacker creates a virtual audio device on macOS that captures audio from any 
 
 - On-device noise removal for mic inputs, run inline on the audio thread, with three engines:
   - [CEVA's DPDFNet2](https://github.com/ceva-ip/DPDFNet) 48 kHz neural model through BNNS Graph: strongest cleanup (fans, keyboards, chatter), 60 ms of latency
-  - [aask1357's FastEnhancer-M](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: matches DPDFNet's cleanup, 21 ms of latency, a third of DPDFNet's CPU
+  - [aask1357's FastEnhancer-M](https://github.com/aask1357/fastenhancer) 48 kHz neural model, also through BNNS Graph: matches DPDFNet's cleanup, 21 ms of latency, similar CPU
   - [Xiph's RNNoise](https://github.com/xiph/rnnoise): lighter cleanup (steady hiss and hum), 30 ms of latency, about a third of DPDFNet's CPU
 - The Effects section compares them with CPU measured on your Mac and recommends one; switching frees the other engine's memory
 - Runs before the effects chain, independent of its bypass and presets; toggle it from the Effects section or the menu bar

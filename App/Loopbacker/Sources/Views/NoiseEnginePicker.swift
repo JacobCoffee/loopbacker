@@ -164,7 +164,7 @@ struct NoiseEnginePicker: View {
         case .rnnoise:
             return "\(basis) FastEnhancer takes \(percent)% on \(chip), too close to the audio deadline, so RNNoise is recommended."
         default:
-            return "\(basis) FastEnhancer is recommended: nearly DPDFNet's cleanup at a third of the delay, and \(percent < 1 ? "under 1" : "\(percent)")% on \(chip). Pick DPDFNet for the most cleanup if 60 ms of delay doesn't bother you."
+            return "\(basis) FastEnhancer is recommended: DPDFNet's cleanup at a third of the delay, and \(percent < 1 ? "under 1" : "\(percent)")% on \(chip)."
         }
     }
 }
