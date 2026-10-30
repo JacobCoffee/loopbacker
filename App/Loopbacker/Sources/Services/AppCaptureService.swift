@@ -42,17 +42,26 @@ final class AppCaptureService: NSObject, ObservableObject {
     /// Bundle IDs of running apps, kept current by NSWorkspace launch/terminate notifications so
     /// views can ask `isAppRunning` from `body` without a LaunchServices round trip.
     @Published private(set) var runningBundleIDs: Set<String> = []
+    /// The current frontmost app's bundle ID, kept current by NSWorkspace activation
+    /// notifications. Used by automation rules ("App frontmost") without their own observer.
+    @Published private(set) var frontmostBundleID: String?
     private var workspaceObservers: [NSObjectProtocol] = []
 
     override init() {
         super.init()
         refreshRunningApps()
+        frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
             workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshRunningApps() }
             })
         }
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            }
+        })
     }
 
     private func refreshRunningApps() {

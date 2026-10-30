@@ -142,9 +142,10 @@ final class RoutingSync: ObservableObject {
         for change in changes {
             audioRouter.stopRouting(sourceDeviceUID: change.old)
             audioRouter.stopOutputRouting(virtualDeviceUID: "monitor:\(change.old)")
-            guard let source = routingState.sources.first(where: { $0.deviceUID == change.new }),
+            SceneNotifier.shared.deviceFallback(sourceName: change.sourceName, toDeviceName: change.newName)
+            guard let source = routingState.sources.first(where: { $0.deviceUID == change.newUID }),
                   !source.monitorOutputUID.isEmpty, source.isEnabled, !source.isMuted else { continue }
-            audioRouter.startMonitoring(sourceDeviceUID: change.new, outputDeviceUID: source.monitorOutputUID)
+            audioRouter.startMonitoring(sourceDeviceUID: change.newUID, outputDeviceUID: source.monitorOutputUID)
         }
     }
 

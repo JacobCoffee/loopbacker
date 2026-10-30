@@ -11,15 +11,27 @@ struct LoopbackerApp: App {
     @StateObject private var soundboardPlayer: SoundboardPlayer
     @StateObject private var appCaptureService: AppCaptureService
     @StateObject private var appUpdater: AppUpdater
+    @StateObject private var automationRulesState: AutomationRulesState
     // Owns engine startup and the RoutingState -> AudioRouter sync for the app's lifetime, so
     // routes start and menu-bar edits reach the engine even if the main window never opens.
     @StateObject private var routingSync: RoutingSync
+    // Applies scenes as a diff against the running config, shared with the automation engine
+    // and the Scenes UI.
+    @StateObject private var sceneLoader: SceneLoader
+    // Watches app/device signals and loads scenes automatically; runs independent of any
+    // window so rules apply under Open at Login too.
+    @StateObject private var automationRulesEngine: AutomationRulesEngine
 
     init() {
         let routingState = RoutingState.load()
         let audioDeviceManager = AudioDeviceManager()
         let audioRouter = AudioRouter()
         let appCaptureService = AppCaptureService()
+        let automationRulesState = AutomationRulesState.load()
+        let sceneLoader = SceneLoader(
+            routingState: routingState, audioRouter: audioRouter,
+            appCaptureService: appCaptureService, audioDeviceManager: audioDeviceManager
+        )
         _routingState = StateObject(wrappedValue: routingState)
         _audioDeviceManager = StateObject(wrappedValue: audioDeviceManager)
         _driverInstaller = StateObject(wrappedValue: DriverInstaller())
@@ -28,11 +40,19 @@ struct LoopbackerApp: App {
         _soundboardPlayer = StateObject(wrappedValue: SoundboardPlayer())
         _appCaptureService = StateObject(wrappedValue: appCaptureService)
         _appUpdater = StateObject(wrappedValue: AppUpdater.shared)
+        _automationRulesState = StateObject(wrappedValue: automationRulesState)
+        _sceneLoader = StateObject(wrappedValue: sceneLoader)
         _routingSync = StateObject(wrappedValue: RoutingSync(
             routingState: routingState,
             audioDeviceManager: audioDeviceManager,
             audioRouter: audioRouter,
             appCaptureService: appCaptureService
+        ))
+        _automationRulesEngine = StateObject(wrappedValue: AutomationRulesEngine(
+            rulesState: automationRulesState,
+            sceneLoader: sceneLoader,
+            appCaptureService: appCaptureService,
+            audioDeviceManager: audioDeviceManager
         ))
     }
 
@@ -53,6 +73,9 @@ struct LoopbackerApp: App {
                 .environmentObject(soundboardPlayer)
                 .environmentObject(appCaptureService)
                 .environmentObject(appUpdater)
+                .environmentObject(automationRulesState)
+                .environmentObject(automationRulesEngine)
+                .environmentObject(sceneLoader)
                 .environment(audioRouter.meters)
                 .frame(minWidth: 1000, minHeight: 600)
         }
