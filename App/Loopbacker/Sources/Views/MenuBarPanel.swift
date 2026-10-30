@@ -8,12 +8,21 @@ struct MenuBarPanel: View {
     @EnvironmentObject var driverInstaller: DriverInstaller
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var appCaptureService: AppCaptureService
+    @EnvironmentObject var micControl: MicControl
 
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var loginItem = LoginItem.shared
 
     private var engineStatus: EngineStatus {
         EngineStatus(driverInstaller: driverInstaller, audioDeviceManager: audioDeviceManager, routingState: routingState)
+    }
+
+    private var muteButtonTitle: String {
+        switch micControl.mode {
+        case .open: micControl.isMuted ? "Unmute" : "Mute"
+        case .pushToTalk: micControl.pushToTalkHeld ? "Talking" : "Push to Talk"
+        case .pushToMute: micControl.pushToTalkHeld ? "Muted" : "Live"
+        }
     }
 
     var body: some View {
@@ -172,6 +181,19 @@ struct MenuBarPanel: View {
 
     private var actions: some View {
         VStack(spacing: 8) {
+            Button {
+                micControl.toggleMute()
+            } label: {
+                Label(muteButtonTitle, systemImage: micControl.isMuted ? "mic.slash.fill" : "mic.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            .tint(micControl.isMuted ? .signalHot : nil)
+            .disabled(micControl.mode != .open)
+            .help(micControl.mode == .open
+                  ? (micControl.isMuted ? "Unmute the mic" : "Mute the mic")
+                  : "Controlled by the \(micControl.mode.title) hotkey in Settings › Hotkeys")
+
             HStack(spacing: 8) {
                 Button {
                     audioRouter.restartAllRoutes()

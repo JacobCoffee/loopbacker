@@ -14,6 +14,17 @@
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.jacobcoffee.loopbacker</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.jacobcoffee.loopbacker</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>loopbacker</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
