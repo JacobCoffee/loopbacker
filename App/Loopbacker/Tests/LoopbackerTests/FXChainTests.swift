@@ -232,4 +232,212 @@ struct FXChainTests {
         }
         #expect(!stereo)
     }
+
+    @Test("Master disabled (as AudioRouter wires EffectsPreset.isEnabled == false) settles to output bit-identical to input")
+    func masterDisabledSettlesToIdenticalOutput() {
+        final class InvertNode: FXNode, @unchecked Sendable {
+            let kind: FXNodeKind = .limiter
+            let specs: [FXParamSpec] = []
+            let params = FXParamStore(specs: [])
+            let meters = FXMeters()
+            let latencySamples = 0
+            func process(_ block: FXBlock) {
+                for i in 0..<block.frames { block.left[i] = -block.left[i] }
+                if block.channels == 2 { for i in 0..<block.frames { block.right[i] = block.left[i] } }
+            }
+            func reset() {}
+        }
+
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "master")
+        let node = InvertNode()
+        let slot = ChainGraph.Slot(id: UUID(), node: node, enabled: true, latency: 0, loadError: nil)
+        chain.debugInstallGraph(ChainGraph(slots: [slot]))
+
+        // `FXChain` itself defaults to master-enabled (every pre-existing caller that never
+        // touches this API keeps running wet); `AudioRouter.attachFXChain` is the one
+        // responsible for applying `EffectsPreset.isEnabled`'s own `false` default, which this
+        // simulates explicitly.
+        #expect(chain.isMasterEnabled)
+        chain.setMasterEnabled(false)
+
+        let frames = 960
+        var input = [Float](repeating: 0, count: frames)
+        for i in 0..<frames { input[i] = sinf(2 * .pi * 440 * Float(i) / Self.sampleRate) * 0.5 }
+        var buffer = [Float](repeating: 0, count: frames * 2)
+        for i in 0..<frames { buffer[i * 2] = input[i]; buffer[i * 2 + 1] = input[i] }
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            chain.process(ptr.baseAddress!, frames: frames, stride: 2, sampleTime: nil, rawPreNS: nil)
+        }
+        // Ramps down from fully wet over the first 480 samples (10 ms crossfade); the tail is
+        // fully settled dry.
+        for i in (frames - 100)..<frames {
+            #expect(abs(buffer[i * 2] - input[i]) < 1e-5, "sample \(i): expected bit-identical dry passthrough while master disabled")
+        }
+
+        // Re-enabling flips the chain back to wet (inverted); give it another settle window.
+        chain.setMasterEnabled(true)
+        var buffer2 = [Float](repeating: 0, count: frames * 2)
+        for i in 0..<frames { buffer2[i * 2] = input[i]; buffer2[i * 2 + 1] = input[i] }
+        buffer2.withUnsafeMutableBufferPointer { ptr in
+            chain.process(ptr.baseAddress!, frames: frames, stride: 2, sampleTime: nil, rawPreNS: nil)
+        }
+        for i in (frames - 100)..<frames {
+            #expect(abs(buffer2[i * 2] - (-input[i])) < 1e-5, "sample \(i): expected wet (inverted) output once master is re-enabled")
+        }
+    }
+
+    @Test("A/B bypass applies the measured output/input loudness ratio to the dry path, not a frozen unity")
+    func abBypassAppliesMeasuredRatio() async {
+        final class GainNode: FXNode, @unchecked Sendable {
+            let kind: FXNodeKind = .limiter
+            let specs: [FXParamSpec] = []
+            let params = FXParamStore(specs: [])
+            let meters = FXMeters()
+            let latencySamples = 0
+            let gain: Float
+            init(gain: Float) { self.gain = gain }
+            func process(_ block: FXBlock) {
+                for i in 0..<block.frames { block.left[i] *= gain }
+                if block.channels == 2 { for i in 0..<block.frames { block.right[i] = block.left[i] } }
+            }
+            func reset() {}
+        }
+
+        let gain: Float = 3.0
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "ab-ratio")
+        let node = GainNode(gain: gain)
+        let slot = ChainGraph.Slot(id: UUID(), node: node, enabled: true, latency: 0, loadError: nil)
+        chain.debugInstallGraph(ChainGraph(slots: [slot]))
+
+        let voice = SyntheticVoiceGenerator.generate(sampleRate: Self.sampleRate, speechPeakDBFS: -20)
+
+        @discardableResult
+        func runOnce(collectOutput: Bool) -> [Float] {
+            var output = [Float](repeating: 0, count: collectOutput ? voice.samples.count : 0)
+            var offset = 0
+            let chunk = 480
+            while offset < voice.samples.count {
+                let n = min(chunk, voice.samples.count - offset)
+                var buffer = [Float](repeating: 0, count: n * 2)
+                for i in 0..<n { buffer[i * 2] = voice.samples[offset + i]; buffer[i * 2 + 1] = voice.samples[offset + i] }
+                buffer.withUnsafeMutableBufferPointer { ptr in
+                    chain.process(ptr.baseAddress!, frames: n, stride: 2, sampleTime: nil, rawPreNS: nil)
+                }
+                if collectOutput { for i in 0..<n { output[offset + i] = buffer[i * 2] } }
+                offset += n
+            }
+            return output
+        }
+
+        // Let the measured ratio converge while enabled (not bypassed): two passes give the
+        // 0.5 s smoothing time constant well over an order of magnitude more cumulative voiced
+        // time than it needs.
+        runOnce(collectOutput: false)
+        runOnce(collectOutput: false)
+
+        chain.setABBypass(true)
+        let bypassed = runOnce(collectOutput: true) // the 10 ms A/B crossfade settles almost immediately
+
+        func rms(_ xs: [Float], ranges: [Range<Int>]) -> Float {
+            var sum: Float = 0
+            var count = 0
+            for r in ranges { for i in r { sum += xs[i] * xs[i]; count += 1 } }
+            return count > 0 ? sqrtf(sum / Float(count)) : 0
+        }
+
+        let inRMS = rms(voice.samples, ranges: voice.steadyStateSpeechRanges)
+        let outRMS = rms(bypassed, ranges: voice.steadyStateSpeechRanges)
+        let ratio = outRMS / inRMS
+
+        // A frozen ratio of 1 (the bug) would put this at 1.0; the fix should land close to the
+        // node's actual 3x gain.
+        #expect(ratio > 2.0, "A/B-bypassed output/input ratio \(ratio) should track the measured ~\(gain)x gain, not stay near 1")
+    }
+
+    @Test("A settled-bypassed stage skips node.process, and re-enabling a latent node has no output discontinuity")
+    func settledBypassSkipsProcessingAndReenableHasNoDiscontinuity() {
+        final class CountingInvertDelayNode: FXNode, @unchecked Sendable {
+            let kind: FXNodeKind = .gate
+            let specs: [FXParamSpec] = []
+            let params = FXParamStore(specs: [])
+            let meters = FXMeters()
+            let latencySamples: Int
+            private(set) var processCallCount = 0
+            private(set) var resetCallCount = 0
+            private var history: [Float]
+            private var writeIndex = 0
+
+            init(latencySamples: Int) {
+                self.latencySamples = latencySamples
+                history = [Float](repeating: 0, count: max(latencySamples, 1) * 4)
+            }
+
+            func process(_ block: FXBlock) {
+                processCallCount += 1
+                for i in 0..<block.frames {
+                    let x = block.left[i]
+                    history[writeIndex % history.count] = x
+                    let readIndex = writeIndex - latencySamples
+                    let delayed = readIndex >= 0 ? history[((readIndex % history.count) + history.count) % history.count] : 0
+                    block.left[i] = -delayed
+                    writeIndex += 1
+                }
+                if block.channels == 2 { for i in 0..<block.frames { block.right[i] = block.left[i] } }
+            }
+
+            func reset() {
+                resetCallCount += 1
+                writeIndex = 0
+                for i in history.indices { history[i] = 0 }
+            }
+        }
+
+        let latency = 37
+        let node = CountingInvertDelayNode(latencySamples: latency)
+        let chain = FXChain(sampleRate: Self.sampleRate, captureDeviceUID: "settled-bypass")
+        let slot = ChainGraph.Slot(id: UUID(), node: node, enabled: true, latency: latency, loadError: nil)
+        chain.debugInstallGraph(ChainGraph(slots: [slot]))
+
+        let value: Float = 0.5
+        func processBlock(_ frames: Int) -> [Float] {
+            var buffer = [Float](repeating: value, count: frames * 2)
+            buffer.withUnsafeMutableBufferPointer { ptr in
+                chain.process(ptr.baseAddress!, frames: frames, stride: 2, sampleTime: nil, rawPreNS: nil)
+            }
+            return stride(from: 0, to: buffer.count, by: 2).map { buffer[$0] }
+        }
+
+        // Warm up enabled: the node runs and its wet (inverted-delayed) output settles in.
+        _ = processBlock(600)
+        #expect(node.processCallCount > 0)
+
+        // Disable and run past the 10 ms crossfade so the stage settles fully bypassed by the
+        // end of this call.
+        slot.enabled.store(false, ordering: .relaxed)
+        let settleOut = processBlock(600)
+        #expect(settleOut.suffix(100).allSatisfy { abs($0 - value) < 1e-4 })
+        let countAfterSettle = node.processCallCount
+
+        // Already settled off before this call starts: must skip `node.process` for its entire
+        // duration and emit pure delayed dry throughout.
+        let stillOff = processBlock(600)
+        #expect(node.processCallCount == countAfterSettle, "a settled bypassed stage must skip node.process")
+        #expect(stillOff.allSatisfy { abs($0 - value) < 1e-4 })
+
+        // Re-enable: must reset exactly once, and the output stream (settled-off -> priming ->
+        // crossfade-in) must never jump by more than one crossfade step at a time, despite the
+        // node's own history having been skipped (stale/zeroed) while it was off.
+        slot.enabled.store(true, ordering: .relaxed)
+        var allSamples: [Float] = []
+        for _ in 0..<4 { allSamples += processBlock(480) }
+
+        #expect(node.resetCallCount == 1, "re-enabling a settled-off stage must reset its history exactly once")
+
+        var maxStep: Float = 0
+        for i in 1..<allSamples.count { maxStep = max(maxStep, abs(allSamples[i] - allSamples[i - 1])) }
+        #expect(maxStep < 1.0 / 480 + 1e-3, "re-enable produced a discontinuity bigger than one crossfade step: \(maxStep)")
+
+        // Eventually settles back to fully wet (inverted dry): -value.
+        #expect(abs(allSamples.last! - (-value)) < 1e-3)
+    }
 }

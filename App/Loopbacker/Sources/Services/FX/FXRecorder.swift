@@ -43,6 +43,14 @@ final class FXRecorder: @unchecked Sendable {
         armed.store(true, ordering: .releasing)
     }
 
+    /// Any thread: stop capturing immediately (chain teardown or caller cancellation), without
+    /// waiting to fill. A `capture` call already past its `armed` guard when this runs may
+    /// still write the block in flight, but the next call sees `armed == false` and bails out,
+    /// so what's in the arena once this returns is a stable, reportable partial snapshot.
+    func disarm() {
+        armed.store(false, ordering: .releasing)
+    }
+
     /// IO thread: appends up to `frames` mono samples of each stream. A no-op while not armed.
     /// Stops (and clears `armed`) once the target length is reached, never writing past the
     /// arena.
