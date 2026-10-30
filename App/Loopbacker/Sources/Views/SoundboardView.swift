@@ -8,6 +8,7 @@ struct SoundboardView: View {
 
     @State private var isDragTarget = false
     @State private var pendingClearAll = false
+    @State private var editingItem: SoundboardItem?
 
     private let columns = [GridItem(.adaptive(minimum: 130, maximum: 170), spacing: Metrics.panelSpacing)]
 
@@ -43,6 +44,9 @@ struct SoundboardView: View {
             }
         } message: {
             Text("This removes every sound from the soundboard. This can't be undone.")
+        }
+        .sheet(item: $editingItem) { item in
+            SoundPadEditorView(item: binding(for: item.id), onClose: { editingItem = nil })
         }
     }
 
@@ -114,7 +118,10 @@ struct SoundboardView: View {
                             isPlaying: soundboardPlayer.playingIDs.contains(item.id),
                             reduceMotion: reduceMotion,
                             action: { soundboardPlayer.play(item: item) },
+                            onPress: { soundboardPlayer.press(item: item) },
+                            onRelease: { soundboardPlayer.release(item: item) },
                             onShowInFinder: { showInFinder(item) },
+                            onEdit: { editingItem = item },
                             onRemove: { remove(item) }
                         )
                     }
@@ -133,6 +140,22 @@ struct SoundboardView: View {
     private func remove(_ item: SoundboardItem) {
         soundboardPlayer.stop(id: item.id)
         soundboardState.remove(id: item.id)
+    }
+
+    /// A two-way binding into `soundboardState.items` for the given pad, used by the editor
+    /// sheet. Falls back to a throwaway value if the pad was removed while the sheet was open.
+    private func binding(for id: UUID) -> Binding<SoundboardItem> {
+        Binding(
+            get: {
+                soundboardState.items.first(where: { $0.id == id })
+                    ?? SoundboardItem(name: "", fileBookmark: Data())
+            },
+            set: { newValue in
+                guard let index = soundboardState.items.firstIndex(where: { $0.id == id }) else { return }
+                soundboardState.items[index] = newValue
+                soundboardState.save()
+            }
+        )
     }
 
     // MARK: - Empty state
@@ -235,46 +258,83 @@ private struct SoundPad: View {
     let isPlaying: Bool
     let reduceMotion: Bool
     let action: () -> Void
+    let onPress: () -> Void
+    let onRelease: () -> Void
     let onShowInFinder: () -> Void
+    let onEdit: () -> Void
     let onRemove: () -> Void
 
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 8) {
-                ZStack {
-                    if isPlaying {
-                        Image(systemName: "waveform")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(Color.loopbacker)
-                            .symbolEffect(.variableColor.iterative, isActive: isPlaying && !reduceMotion)
-                    } else {
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(height: 28)
+    /// Tracks whether a hold-to-play press is down, so a drag that leaves the pad still
+    /// releases it (SwiftUI drag gestures don't get a separate "cancelled" callback).
+    @State private var isHeld = false
 
-                Text(item.emoji.isEmpty ? item.name : "\(item.emoji) \(item.name)")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(isPlaying ? Color.loopbacker : .primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
+    var body: some View {
+        Group {
+            if item.playMode == .holdToPlay {
+                padContent.gesture(holdGesture)
+            } else {
+                Button(action: action) { padContent }
+                    .buttonStyle(.glass)
+                    .tint(isPlaying ? Color.loopbacker : nil)
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 92)
-            .padding(.horizontal, 6)
-            .contentShape(RoundedRectangle(cornerRadius: Metrics.innerRadius))
         }
-        .buttonStyle(.glass)
-        .tint(isPlaying ? Color.loopbacker : nil)
-        .help(isPlaying ? "Stop \(item.name)" : "Play \(item.name)")
+        .help(helpText)
         .accessibilityLabel(item.name)
         .accessibilityValue(isPlaying ? "Playing" : "Stopped")
         .contextMenu {
+            Button("Edit…", action: onEdit)
             Button("Show in Finder", action: onShowInFinder)
             Divider()
             Button("Remove", role: .destructive, action: onRemove)
         }
+    }
+
+    private var helpText: String {
+        switch item.playMode {
+        case .holdToPlay: "Hold to play \(item.name)"
+        default: isPlaying ? "Stop \(item.name)" : "Play \(item.name)"
+        }
+    }
+
+    private var holdGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                guard !isHeld else { return }
+                isHeld = true
+                onPress()
+            }
+            .onEnded { _ in
+                isHeld = false
+                onRelease()
+            }
+    }
+
+    private var padContent: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                if isPlaying {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.loopbacker)
+                        .symbolEffect(.variableColor.iterative, isActive: isPlaying && !reduceMotion)
+                } else {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(height: 28)
+
+            Text(item.emoji.isEmpty ? item.name : "\(item.emoji) \(item.name)")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(isPlaying ? Color.loopbacker : .primary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 92)
+        .padding(.horizontal, 6)
+        .contentShape(RoundedRectangle(cornerRadius: Metrics.innerRadius))
+        .glassEffect(Glass.regular.tint(isPlaying ? Color.loopbacker : nil), in: .rect(cornerRadius: Metrics.innerRadius))
     }
 }
