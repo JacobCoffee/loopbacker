@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 struct EffectsView: View {
     @EnvironmentObject var routingState: RoutingState
     @EnvironmentObject var fxEngine: FXEngine
+    @EnvironmentObject var hostedPluginStateCapture: HostedPluginStateCapture
     @EnvironmentObject var presetAutoSwitchState: PresetAutoSwitchState
     /// False once the user switches to another app, so app-based preset switching resumes even
     /// if this page stays open in the background.
@@ -42,6 +43,7 @@ struct EffectsView: View {
     @State private var savedPresetNames: [String] = []
     @State private var showingSavePopover = false
     @State private var newPresetName: String = ""
+    @State private var importErrorMessage: String?
 
     // Add/replace effect
     @State private var showingEffectBrowser = false
@@ -127,8 +129,14 @@ struct EffectsView: View {
         .onDisappear {
             presetAutoSwitchState.isSuppressedByEditing = false
         }
-        .onReceive(NotificationCenter.default.publisher(for: .fxPluginEditorClosed)) { _ in
-            Task { await captureHostedStatesIntoPreset() }
+        .alert(
+            "Couldn't Import Preset",
+            isPresented: Binding(get: { importErrorMessage != nil }, set: { if !$0 { importErrorMessage = nil } }),
+            presenting: importErrorMessage
+        ) { _ in
+            Button("OK") { importErrorMessage = nil }
+        } message: { message in
+            Text(message)
         }
     }
 
@@ -403,7 +411,7 @@ struct EffectsView: View {
             }
 
             Button("Export to File...") {
-                exportPresetToFile()
+                Task { await exportPresetToFile() }
             }
 
             Divider()
@@ -432,9 +440,13 @@ struct EffectsView: View {
                 onCancel: { showingSavePopover = false },
                 onSave: {
                     guard !newPresetName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-                    EffectsPresetManager.save(name: newPresetName, preset: routingState.effectsPreset)
-                    refreshSavedPresets()
+                    let name = newPresetName
                     showingSavePopover = false
+                    Task {
+                        await hostedPluginStateCapture.captureIntoPreset()
+                        EffectsPresetManager.save(name: name, preset: routingState.effectsPreset)
+                        refreshSavedPresets()
+                    }
                 }
             )
         }
@@ -448,15 +460,21 @@ struct EffectsView: View {
         panel.allowedContentTypes = [.json]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        if panel.runModal() == .OK, let url = panel.url {
-            if let data = try? Data(contentsOf: url),
-               let imported = EffectsPresetManager.importData(data) {
-                applyPreset(imported)
-            }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = try? Data(contentsOf: url) else {
+            importErrorMessage = "Couldn't read that file."
+            return
+        }
+        switch EffectsPresetManager.importData(data) {
+        case .success(let imported):
+            applyPreset(imported)
+        case .failure(let error):
+            importErrorMessage = error.errorDescription
         }
     }
 
-    private func exportPresetToFile() {
+    private func exportPresetToFile() async {
+        await hostedPluginStateCapture.captureIntoPreset()
         let panel = NSSavePanel()
         panel.title = "Export Effects Preset"
         panel.allowedContentTypes = [.json]
@@ -617,16 +635,6 @@ struct EffectsView: View {
         guard let node = routingState.effectsPreset.nodes.first(where: { $0.id == id }),
               let hosted = fxEngine.liveNode(id: id) as? any FXHostedNode else { return }
         await PluginEditorWindowController.show(for: hosted, title: node.pluginRef?.name ?? displayName(for: node.kind))
-    }
-
-    private func captureHostedStatesIntoPreset() async {
-        let states = await fxEngine.captureHostedStates()
-        guard !states.isEmpty else { return }
-        for (id, data) in states {
-            guard let idx = routingState.effectsPreset.nodes.firstIndex(where: { $0.id == id }) else { continue }
-            routingState.effectsPreset.nodes[idx].pluginState = data
-        }
-        routingState.save()
     }
 
     // MARK: - Add / replace effect
