@@ -8,6 +8,13 @@ struct ChannelStripView: View {
     let isSourceEnabled: Bool
     var connectorEnd: ConnectorEnd
     @EnvironmentObject var routingState: RoutingState
+    @Environment(MeterLevels.self) private var meters
+
+    /// Polled (not observed) at low frequency only while connected, so VoiceOver's accessibility
+    /// value can include a live dB reading without the per-tick SwiftUI re-render `MeterLevels`'
+    /// doc comment warns about -- reading `meters` here happens outside a SwiftUI body, so it
+    /// never registers Observation tracking; only the explicit `liveLevelText` write does.
+    @State private var liveLevelText: String = "Silent"
 
     enum StripSide {
         /// Connector port on the right; meter reads the source's route key (`AudioSource.deviceUID`).
@@ -74,9 +81,31 @@ struct ChannelStripView: View {
             .help(isConnected
                 ? "Click to start a new route from this channel, right-click to disconnect all routes"
                 : "Click to connect this channel to a source or output")
-            .accessibilityLabel(Text(channel.label + " connector"))
-            .accessibilityValue(Text(isConnected ? "Connected" : (isPending ? "Pending" : "Not connected")))
+            .accessibilityLabel(Text(channel.label + " connector, " + connectionSummary))
+            .accessibilityValue(Text(accessibilityValueText))
             .accessibilityAddTraits(.isButton)
+            // VoiceOver's default activation gesture: `onTapGesture` alone isn't wired to it.
+            .accessibilityAction(.default) { handleTap() }
+            .accessibilityActions {
+                ForEach(connectableTargets, id: \.end) { target in
+                    Button("Connect to \(target.label)") { connect(to: target.end) }
+                }
+                ForEach(connectedTargets, id: \.end) { target in
+                    Button("Disconnect from \(target.label)") {
+                        withAnimation { routingState.removeRouteBetween(from: connectorEnd, to: target.end) }
+                    }
+                }
+            }
+            // Polled (not observed) at low frequency, and only while this port is part of a live
+            // route, so VoiceOver's value can include a dB reading without paying the per-tick
+            // SwiftUI re-render cost `MeterLevels` warns against.
+            .task(id: isConnected) {
+                guard isConnected else { liveLevelText = "Silent"; return }
+                while !Task.isCancelled {
+                    liveLevelText = SignalMeter.dbString(currentLevel())
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
             .background(
                 GeometryReader { geo in
                     Color.clear
@@ -86,6 +115,68 @@ struct ChannelStripView: View {
                         )
                 }
             )
+    }
+
+    private func currentLevel() -> Float {
+        switch side {
+        case .source(let key): return meters.level(source: key, channel: channel.id)
+        case .output: return meters.output(channel: channel.id)
+        }
+    }
+
+    // MARK: - Accessibility: opposite-side targets
+
+    private struct ConnectorTarget {
+        let end: ConnectorEnd
+        let label: String
+    }
+
+    /// Every opposite-side port this connector could reach: output channels for a source port,
+    /// or every source's channels for an output port.
+    private var oppositeEnds: [ConnectorTarget] {
+        switch connectorEnd {
+        case .source:
+            return routingState.outputChannels.map {
+                ConnectorTarget(end: .output(channelId: $0.id), label: "Channel \($0.label)")
+            }
+        case .output:
+            return routingState.sources.flatMap { source in
+                source.channels.map {
+                    ConnectorTarget(end: .source(sourceId: source.id, channelId: $0.id),
+                                     label: "\(source.name) input \($0.label)")
+                }
+            }
+        }
+    }
+
+    private var connectableTargets: [ConnectorTarget] {
+        oppositeEnds.filter { routingState.findRoute(from: connectorEnd, to: $0.end) == nil }
+    }
+
+    private var connectedTargets: [ConnectorTarget] {
+        oppositeEnds.filter { routingState.findRoute(from: connectorEnd, to: $0.end) != nil }
+    }
+
+    private var connectionSummary: String {
+        let names = connectedTargets.map(\.label)
+        return names.isEmpty ? "not connected" : "connected to \(names.joined(separator: ", "))"
+    }
+
+    private var accessibilityValueText: String {
+        if isPending { return "Pending connection" }
+        guard isConnected else { return "Not connected" }
+        return "Connected, \(liveLevelText)"
+    }
+
+    private func connect(to target: ConnectorEnd) {
+        switch (connectorEnd, target) {
+        case (.source(let sid, let sch), .output(let och)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och) }
+        case (.output(let och), .source(let sid, let sch)):
+            withAnimation { routingState.addRoute(sourceId: sid, sourceChannelId: sch, outputChannelId: och) }
+        default:
+            break
+        }
     }
 
     private func handleTap() {
@@ -138,8 +229,10 @@ private struct ConnectorPortView: View {
 
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
+        let highContrast = contrast == .increased
         ZStack {
             if isPending {
                 Circle()
@@ -151,7 +244,10 @@ private struct ConnectorPortView: View {
             Circle()
                 .fill(isConnected ? Color.loopbacker : Color.clear)
                 .overlay(
-                    Circle().strokeBorder(isConnected ? Color.clear : Color.secondary.opacity(0.5), lineWidth: 1.25)
+                    Circle().strokeBorder(
+                        isConnected ? Color.primary.opacity(highContrast ? 0.6 : 0) : Color.secondary.opacity(highContrast ? 0.85 : 0.5),
+                        lineWidth: highContrast ? 1.75 : 1.25
+                    )
                 )
                 .frame(width: 12, height: 12)
 
