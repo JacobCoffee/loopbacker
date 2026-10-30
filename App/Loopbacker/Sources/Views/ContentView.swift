@@ -7,6 +7,7 @@ struct ContentView: View {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var driverInstaller: DriverInstaller
+    @EnvironmentObject var appUpdater: AppUpdater
 
     @SceneStorage("studioSection") private var section: StudioSection = .routing
     @State private var showSourcePicker = false
@@ -14,7 +15,8 @@ struct ContentView: View {
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
-                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller,
+                      appUpdater: appUpdater)
     }
 
     var body: some View {
@@ -92,12 +94,14 @@ struct GlobalToolbar: ToolbarContent {
     @EnvironmentObject var audioDeviceManager: AudioDeviceManager
     @EnvironmentObject var audioRouter: AudioRouter
     @EnvironmentObject var driverInstaller: DriverInstaller
+    @EnvironmentObject var appUpdater: AppUpdater
     @AppStorage(AppearanceMode.storageKey) private var appearance: AppearanceMode = .system
     @ObservedObject private var loginItem = LoginItem.shared
 
     private var actions: StudioActions {
         StudioActions(routingState: routingState, audioRouter: audioRouter,
-                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller)
+                      audioDeviceManager: audioDeviceManager, driverInstaller: driverInstaller,
+                      appUpdater: appUpdater)
     }
 
     var body: some ToolbarContent {
@@ -135,11 +139,29 @@ struct GlobalToolbar: ToolbarContent {
                     actions.toggleDriver()
                 }
                 .disabled(driverInstaller.isProcessing)
+                if driverInstaller.updateAvailable {
+                    Button("Install Driver Update…", systemImage: "arrow.triangle.2.circlepath") {
+                        actions.installDriverUpdate()
+                    }
+                    .disabled(driverInstaller.isProcessing)
+                    .help("Needs admin and briefly drops audio while coreaudiod restarts")
+                }
+                Divider()
+                Button("Check for Updates…", systemImage: "arrow.down.circle.dotted") {
+                    actions.checkForUpdates()
+                }
+                .disabled(!appUpdater.canCheckForUpdates)
+                if let update = appUpdater.availableUpdate {
+                    Button("Update to \(update.displayVersion)…", systemImage: "arrow.down.circle") {
+                        actions.installAvailableUpdate()
+                    }
+                }
+                Divider()
                 Button("Quit and Stop Routing", systemImage: "power") { AppDelegate.forceQuit() }
             } label: {
                 Label("More", systemImage: "ellipsis")
             }
-            .help("Devices, test tone, open at login, appearance, driver")
+            .help("Devices, test tone, open at login, appearance, driver, updates")
         }
     }
 }

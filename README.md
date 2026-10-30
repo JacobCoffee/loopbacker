@@ -98,6 +98,10 @@ The EQ settings match [jtrv's EasyEffects Masculine NPR Voice preset](https://gi
 - Effects shown as a vertical insert chain, like a channel strip
 - Menu bar panel with live meters, per-source switches, Reconnect, and Test Tone
 - Audio menu with keyboard shortcuts: Reconnect (⌘R), Stop All Routing (⇧⌘.), Test Tone (⌥⌘T)
+- Background auto-update (Sparkle, EdDSA-signed): checks silently, never pops a window in front
+  of you -- "Update available" shows in the menu bar panel and the app menu, and installs on your
+  click or on quit. Driver updates are offered the same way but always need your click, since
+  installing one needs admin and briefly drops audio
 
 <p align="center">
   <img src="docs/screenshots/menubar-dark.png" alt="Menu bar panel with engine status, per-source meters and switches, Reconnect, and Test Tone" width="300">

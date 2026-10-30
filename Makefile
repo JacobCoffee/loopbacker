@@ -33,6 +33,7 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 	@echo "==> Packaging Loopbacker.app..."
 	mkdir -p $(APP_CONTENTS)/MacOS
 	mkdir -p $(APP_CONTENTS)/Resources
+	mkdir -p $(APP_CONTENTS)/Frameworks
 	cp $(SWIFT_BIN) $(APP_CONTENTS)/MacOS/Loopbacker
 	cp App/Loopbacker/Resources/Info.plist $(APP_CONTENTS)/Info.plist
 	cp App/Loopbacker/Resources/AppIcon.icns $(APP_CONTENTS)/Resources/
@@ -48,6 +49,10 @@ bundle: app driver ## Package as Loopbacker.app with embedded driver
 		--platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
 		--output-partial-info-plist $(BUILD_DIR)/assets-partial.plist >/dev/null
 	cp -R Driver/build/Loopbacker.driver $(APP_CONTENTS)/Resources/
+	rm -rf $(APP_CONTENTS)/Frameworks/Sparkle.framework
+	cp -R App/Loopbacker/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework \
+		$(APP_CONTENTS)/Frameworks/
+	scripts/sign-sparkle.sh $(BUILD_DIR)/$(APP_BUNDLE) "$(SIGN_IDENTITY)"
 	codesign --force --deep --sign "$(SIGN_IDENTITY)" --identifier com.jacobcoffee.loopbacker $(BUILD_DIR)/$(APP_BUNDLE)
 	codesign --verify --deep --strict $(BUILD_DIR)/$(APP_BUNDLE)
 	@echo "==> $(BUILD_DIR)/$(APP_BUNDLE) ready."

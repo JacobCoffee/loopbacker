@@ -34,12 +34,18 @@ jobs:
           else
             echo "has_notary=false" >> "$GITHUB_OUTPUT"
           fi
+          if [ -n "$SPARKLE_KEY" ]; then
+            echo "has_sparkle_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sparkle_key=false" >> "$GITHUB_OUTPUT"
+          fi
         env:
           CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           CERT_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           NOTARY_ID: ${{ secrets.APPLE_ID }}
           NOTARY_PASS: ${{ secrets.APPLE_APP_PASSWORD }}
           NOTARY_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
 
       # ── Build ────────────────────────────────────────────────────
       - name: Install dependencies
@@ -61,6 +67,7 @@ jobs:
         run: |
           mkdir -p Loopbacker.app/Contents/MacOS
           mkdir -p Loopbacker.app/Contents/Resources
+          mkdir -p Loopbacker.app/Contents/Frameworks
 
           cp App/Loopbacker/.build/release/Loopbacker Loopbacker.app/Contents/MacOS/
           cp App/Loopbacker/Resources/Info.plist        Loopbacker.app/Contents/
@@ -71,6 +78,8 @@ jobs:
           cp App/Loopbacker/Resources/RNNoise-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp App/Loopbacker/Resources/FastEnhancer-LICENSE.txt Loopbacker.app/Contents/Resources/
           cp -R Driver/build/Loopbacker.driver          Loopbacker.app/Contents/Resources/
+          cp -R App/Loopbacker/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework \
+            Loopbacker.app/Contents/Frameworks/
           xcrun actool App/Loopbacker/Resources/Assets.xcassets --compile Loopbacker.app/Contents/Resources \
             --platform macosx --minimum-deployment-target 26.0 --accent-color AccentColor \
             --output-partial-info-plist "$RUNNER_TEMP/assets-partial.plist" >/dev/null
@@ -115,6 +124,8 @@ jobs:
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app/Contents/Resources/Loopbacker.driver
 
+          scripts/sign-sparkle.sh Loopbacker.app "$SIGNING_IDENTITY" --hardened
+
           codesign --force --options runtime \
             --sign "$SIGNING_IDENTITY" \
             Loopbacker.app
@@ -125,6 +136,7 @@ jobs:
           echo "::notice::No signing certificate found — using ad-hoc signature"
           codesign --force --sign - \
             Loopbacker.app/Contents/Resources/Loopbacker.driver
+          scripts/sign-sparkle.sh Loopbacker.app -
           codesign --force --sign - \
             Loopbacker.app
 
@@ -162,6 +174,27 @@ jobs:
           cd Driver/build
           zip -r "../../Loopbacker-Driver-${TAG}.zip" Loopbacker.driver/
 
+      # ── Signed appcast (Sparkle auto-update feed) ──────────────────
+      - name: Generate signed appcast
+        if: steps.secrets.outputs.has_sparkle_key == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p appcast
+          cp "Loopbacker-${TAG}.dmg" appcast/
+          # Carry forward history from the previous release's appcast, if any, so
+          # generate_appcast can prune/retain older entries instead of starting from scratch.
+          gh release download --pattern appcast.xml --dir appcast --clobber 2>/dev/null || true
+          echo "$SPARKLE_ED_PRIVATE_KEY" | App/Loopbacker/.build/artifacts/sparkle/Sparkle/bin/generate_appcast \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/JacobCoffee/loopbacker/releases/download/${TAG}/" \
+            appcast
+
+      - name: Skip appcast (no Sparkle key configured)
+        if: steps.secrets.outputs.has_sparkle_key != 'true'
+        run: echo "::warning::SPARKLE_ED_PRIVATE_KEY not set — skipping signed appcast; in-app auto-update won't see this release"
+
       # ── SBOM ─────────────────────────────────────────────────────
       - name: Generate SBOM
         run: |
@@ -188,6 +221,12 @@ jobs:
             "Loopbacker-Driver-${TAG}.zip" \
             "Loopbacker-${TAG}.sbom.json" \
             checksums-sha256.txt
+
+      - name: Upload signed appcast
+        if: steps.secrets.outputs.has_sparkle_key == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" appcast/appcast.xml
 
       # ── Cleanup ──────────────────────────────────────────────────
       - name: Cleanup keychain
