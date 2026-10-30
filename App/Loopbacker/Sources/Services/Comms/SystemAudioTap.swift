@@ -376,8 +376,9 @@ final class SystemAudioTap: ObservableObject {
 
     // MARK: - Default output device lookup
 
-    /// The current default output device's UID, or nil if none can be found.
-    private static func defaultOutputDeviceUID() -> String? {
+    /// The current default output device's UID, or nil if none can be found. Not `private`:
+    /// `ListenDucker` reuses this to build its own replay aggregate against the same device.
+    static func defaultOutputDeviceUID() -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -403,8 +404,9 @@ final class SystemAudioTap: ObservableObject {
 
     /// `VirtualDeviceChannels.micUID` ("LoopbackerDevice_UID") and the extra output devices
     /// (`"LoopbackerDevice_UID_2"`, ...) all share this prefix; matches `DefaultDeviceRestorer`'s
-    /// own `isLoopbackerDevice` check.
-    private static func isLoopbackerVirtualDevice(_ uid: String) -> Bool {
+    /// own `isLoopbackerDevice` check. Not `private`: `ListenDucker` reuses this to refuse
+    /// replaying into one of Loopbacker's own virtual devices.
+    static func isLoopbackerVirtualDevice(_ uid: String) -> Bool {
         uid.contains("Loopbacker")
     }
 

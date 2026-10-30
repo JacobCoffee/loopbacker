@@ -17,6 +17,14 @@ final class RoutingSync: ObservableObject {
     /// app's whole lifetime, same as the audio routing it's wired into. Injected as an
     /// environment object for `EchoCancellationSection`'s permission/status UI.
     let systemAudioTap: SystemAudioTap
+    /// Owned here so it starts/stops with whichever call-duck feature (Part A's trigger or
+    /// Part B) currently wants the far-end signal, for the app's whole lifetime. Injected as an
+    /// environment object for the Effects page's "Duck what I hear" status UI.
+    let callAudioMonitor: CallAudioMonitor
+    /// Owned here so it starts/stops with `CallDuckSettings.listenDuckEnabled`. Injected as an
+    /// environment object for the same status UI.
+    let listenDucker: ListenDucker
+    private let callDuckSettings: CallDuckSettings
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -25,13 +33,20 @@ final class RoutingSync: ObservableObject {
         audioDeviceManager: AudioDeviceManager,
         audioRouter: AudioRouter,
         appCaptureService: AppCaptureService,
-        systemAudioTap: SystemAudioTap
+        systemAudioTap: SystemAudioTap,
+        callAudioMonitor: CallAudioMonitor,
+        listenDucker: ListenDucker,
+        callDuckSettings: CallDuckSettings
     ) {
         self.routingState = routingState
         self.audioDeviceManager = audioDeviceManager
         self.audioRouter = audioRouter
         self.appCaptureService = appCaptureService
         self.systemAudioTap = systemAudioTap
+        self.callAudioMonitor = callAudioMonitor
+        self.listenDucker = listenDucker
+        self.callDuckSettings = callDuckSettings
+        callAudioMonitor.extraCallAppBundleIDs = { [weak callDuckSettings] in callDuckSettings?.extraCallAppBundleIDs ?? [] }
 
         start()
     }
@@ -47,6 +62,8 @@ final class RoutingSync: ObservableObject {
         // right away; it just reads silence until the tap starts.
         audioRouter.setEchoReference(systemAudioTap.ring)
         pushEcho(EchoPush(settings: routingState.noiseSuppression, sources: routingState.sources))
+        pushCallMonitor(CallMonitorPush(appAudio: routingState.effectsPreset.appAudio, listenDuckEnabled: callDuckSettings.listenDuckEnabled))
+        pushListenDuck()
 
         // Start routing for saved state after the audio system settles.
         // After a driver reinstall, coreaudiod can take 2-3s to fully
@@ -112,6 +129,22 @@ final class RoutingSync: ObservableObject {
                 guard let self else { return }
                 self.audioRouter.currentEffectsPreset = newPreset
                 self.audioRouter.updateEffectsPreset(newPreset)
+                self.pushCallMonitor(CallMonitorPush(appAudio: newPreset.appAudio, listenDuckEnabled: self.callDuckSettings.listenDuckEnabled))
+            }
+            .store(in: &cancellables)
+
+        // Re-evaluate call-monitor/listen-duck demand whenever any global call-duck setting
+        // changes (toggling "Duck what I hear", editing its app set/amount/trigger, or adding/
+        // removing an extra call-app bundle ID). `objectWillChange` fires *before* the
+        // property actually changes, so the re-read is deferred one run-loop turn (`async`)
+        // until the new value has landed.
+        callDuckSettings.objectWillChange
+            .sink { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.pushCallMonitor(CallMonitorPush(appAudio: self.routingState.effectsPreset.appAudio, listenDuckEnabled: self.callDuckSettings.listenDuckEnabled))
+                    self.pushListenDuck()
+                }
             }
             .store(in: &cancellables)
 
@@ -209,6 +242,40 @@ final class RoutingSync: ObservableObject {
             tapWanted = settings.echoCancellation
                 && devices.contains { $0.isEnabled && !$0.isMuted && !excluded.contains($0.deviceUID) }
         }
+    }
+
+    /// Starts/stops `CallAudioMonitor` with demand: any feature that reads `CallVoiceBus`
+    /// wants it running. The tap costs a coreaudiod round trip and a TCC-gated process tap,
+    /// same reasoning as `pushEcho`, so it shouldn't run with nothing consuming its signal.
+    private func pushCallMonitor(_ wanted: CallMonitorPush) {
+        if wanted.isWanted {
+            callAudioMonitor.start()
+        } else {
+            callAudioMonitor.stop()
+        }
+    }
+
+    private struct CallMonitorPush: Equatable {
+        let isWanted: Bool
+
+        init(appAudio: AppAudioFX, listenDuckEnabled: Bool) {
+            isWanted = (appAudio.duckingEnabled && appAudio.trigger.dependsOnCallVoices) || listenDuckEnabled
+        }
+    }
+
+    /// Pushes the full "Duck what I hear" config to `ListenDucker`. Called on every
+    /// `callDuckSettings` change (see `observe()`); `ListenDucker.updateConfig` itself no-ops a
+    /// rebuild when the effective (sanitized) app set and enabled state haven't changed.
+    private func pushListenDuck() {
+        let callApps = Set(CallAppAdviceCatalog.all.map(\.id)).union(callDuckSettings.extraCallAppBundleIDs)
+        listenDucker.updateConfig(ListenDucker.Config(
+            isEnabled: callDuckSettings.listenDuckEnabled,
+            bundleIDs: callDuckSettings.listenDuckBundleIDs,
+            duckAmountDB: callDuckSettings.listenDuckAmountDB,
+            trigger: callDuckSettings.listenDuckTrigger
+        ), excludingCallApps: callApps)
+        audioRouter.setListenDuckNeedsMyVoice(
+            callDuckSettings.listenDuckEnabled && callDuckSettings.listenDuckTrigger != .callVoices)
     }
 
     // MARK: - Audio routing sync

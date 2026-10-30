@@ -122,6 +122,23 @@ retry it once you've sorted out the plugin.
 - Per-source opt-out; off by default
 - A live "echo removed" indicator in the Effects section while a call-shaped signal is present
 
+**Call-Aware Ducking**
+
+- App Audio ducking (Effects page) can trigger on far-end call voices instead of, or in addition
+  to, your own mic -- pick "My voice" (default, original behavior), "Call voices", or "Both" per
+  preset. Far-end speech is detected by tapping only the running call apps' own audio (Zoom,
+  Discord, Teams, Slack), never a global or device-wide tap
+- "Duck What I Hear": lowers apps like Spotify, Music, or a browser on your own speakers/
+  headphones while people in a call are talking (and optionally while you're talking too) --
+  global, not tied to a preset, with its own app picker and amount. Ducked apps keep playing,
+  just quieter, replayed through Loopbacker with a short (~10 ms) smoothed ramp, not silenced
+  and restored
+- Browsers running a web call (Meet, Webex, FaceTime in a tab) aren't auto-detected -- a tab
+  can't be told apart from any other page -- but can be added manually as "this is a call" so
+  far-end detection and "Duck What I Hear" both treat it correctly
+- Needs System Audio Recording permission, same as Echo Cancellation; both call-voice detection
+  and "Duck What I hear"'s replay path stop (no coreaudiod tap) when nothing needs them
+
 **Stream Mix**
 
 - A second virtual mic ("Loopbacker Stream"), independent of your main virtual mic -- route a source
