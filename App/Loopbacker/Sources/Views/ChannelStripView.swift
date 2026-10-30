@@ -12,8 +12,8 @@ struct ChannelStripView: View {
     enum StripSide {
         /// Connector port on the right; meter reads the source's route key (`AudioSource.deviceUID`).
         case source(meterKey: String)
-        /// Connector port on the left; meter reads the virtual mic's post-mix level.
-        case output
+        /// Connector port on the left; meter reads the given target device's post-mix level.
+        case output(target: RouteTarget)
     }
 
     private var isSourceSide: Bool {
@@ -25,8 +25,8 @@ struct ChannelStripView: View {
         switch connectorEnd {
         case .source(let sid, let ch):
             return routingState.routes.contains { $0.sourceId == sid && $0.sourceChannelId == ch }
-        case .output(let ch):
-            return routingState.routes.contains { $0.outputChannelId == ch }
+        case .output(let target, let ch):
+            return routingState.routes.contains { $0.targetId == target && $0.outputChannelId == ch }
         }
     }
 
@@ -122,7 +122,7 @@ private struct ChannelLevelMeter: View {
             guard isLive else { return 0 }
             switch side {
             case .source(let key): return meters.level(source: key, channel: channel)
-            case .output: return meters.output(channel: channel)
+            case .output(let target): return meters.output(target: target.deviceUID, channel: channel)
             }
         }
     }

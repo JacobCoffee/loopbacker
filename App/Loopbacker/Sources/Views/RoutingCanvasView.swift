@@ -49,8 +49,12 @@ struct RoutingCanvasView: View {
 
             ScrollView(.vertical) {
                 VStack(alignment: .trailing, spacing: Metrics.panelSpacing) {
-                    virtualMicHeader
+                    outputHeader
                     outputColumn
+                    if routingState.streamMixEnabled {
+                        streamMixHeader
+                        streamMixColumn
+                    }
                     outputRoutingSection
                 }
                 .padding(.bottom, Metrics.canvasMargin)
@@ -122,21 +126,57 @@ struct RoutingCanvasView: View {
         .frame(maxWidth: .infinity, minHeight: 200)
     }
 
-    private var virtualMicHeader: some View {
+    // MARK: - Virtual Mic header + column
+
+    /// The canvas header for the output side: the Virtual Mic title plus the Stream Mix toggle
+    /// (so it's visible whether or not Stream Mix is currently shown).
+    private var outputHeader: some View {
         HStack {
             Text("Virtual Mic")
                 .font(.headline)
             Spacer()
+            streamMixToggle
             Text("Loopbacker")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
-    // MARK: - Output column
-
     private var outputColumn: some View {
-        OutputChannelView()
+        OutputChannelView(target: .virtualMic)
+    }
+
+    // MARK: - Stream Mix header + column
+
+    private var streamMixHeader: some View {
+        HStack {
+            Text("Stream Mix")
+                .font(.headline)
+            Spacer()
+            Text("Loopbacker Stream")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, Metrics.panelSpacing)
+    }
+
+    private var streamMixColumn: some View {
+        OutputChannelView(target: .streamMix)
+    }
+
+    /// Shows/hides the Stream Mix column. Off by default: existing users see no change until
+    /// they opt in here.
+    private var streamMixToggle: some View {
+        Toggle(isOn: Binding(
+            get: { routingState.streamMixEnabled },
+            set: { routingState.setStreamMixEnabled($0) }
+        )) {
+            Label("Stream Mix", systemImage: "music.mic")
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .labelsHidden()
+        .help("Show a second virtual mic (\"Stream Mix\") you can route sources into separately, e.g. for OBS.")
     }
 
     // MARK: - Output routing section
