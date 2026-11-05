@@ -97,10 +97,7 @@ LoopbackerDriver::LoopbackerDriver()
         mDevices[i].mute             = false;
         mDevices[i].channelCount.store(kDefaultChannelCount, std::memory_order_relaxed);
         mDevices[i].pendingChannelCount = kDefaultChannelCount;
-        mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames,
-                                            BytesPerFrameForChannelCount(kDefaultChannelCount));
-        mDevices[i].snapshotBuffer.resize(kDefaultIOBufferFrames * kDefaultChannelCount, 0.0f);
-        mDevices[i].needsSnapshot.store(false, std::memory_order_relaxed);
+        mDevices[i].ringBuffer       = std::make_unique<RingBuffer>(kRingBufferFrames, kDefaultChannelCount);
         mDevices[i].anchorHostTime   = 0;
         mDevices[i].hostTicksPerFrame = 0.0;
     }
@@ -276,9 +273,7 @@ OSStatus LoopbackerDriver::Initialize(AudioServerPlugInDriverRef inDriver,
         dev.channelCount.store(restoredCount, std::memory_order_relaxed);
         dev.pendingChannelCount = restoredCount;
         // Safe to (re)allocate here: IO has not started yet.
-        dev.ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames,
-                                                        BytesPerFrameForChannelCount(restoredCount));
-        dev.snapshotBuffer.assign(static_cast<size_t>(kDefaultIOBufferFrames) * restoredCount, 0.0f);
+        dev.ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames, restoredCount);
         dev.hostTicksPerFrame = ComputeHostTicksPerFrame(dev.sampleRate);
     }
     return kAudioHardwareNoError;
@@ -337,10 +332,7 @@ OSStatus LoopbackerDriver::PerformDeviceConfigurationChange(AudioServerPlugInDri
 
     // The HAL has stopped IO for this device while this call is in progress,
     // so buffer reallocation is safe here (and only here, or at Initialize()).
-    dev->ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames,
-                                                     BytesPerFrameForChannelCount(newCount));
-    dev->snapshotBuffer.assign(static_cast<size_t>(kDefaultIOBufferFrames) * newCount, 0.0f);
-    dev->needsSnapshot.store(false, std::memory_order_relaxed);
+    dev->ringBuffer = std::make_unique<RingBuffer>(kRingBufferFrames, newCount);
     dev->channelCount.store(newCount, std::memory_order_release);
 
     if (driver->mHost != nullptr) {
@@ -942,9 +934,10 @@ OSStatus LoopbackerDriver::GetPropertyData(AudioServerPlugInDriverRef inDriver,
                 }
 
                 case kAudioDevicePropertyLatency:
-                    // Report the ring buffer depth as latency -- this is the honest
-                    // round-trip buffering delay through the virtual loopback device.
-                    WRITE_PROP(UInt32, kRingBufferFrames);
+                    // Writers and readers meet at the same sample time in the ring, so the
+                    // device adds no delay beyond the safety offset and IO buffer the HAL
+                    // already accounts for.
+                    WRITE_PROP(UInt32, 0);
 
                 case kAudioDevicePropertySafetyOffset:
                     // Safety offset tells CoreAudio how far ahead/behind to read/write
@@ -1470,8 +1463,6 @@ OSStatus LoopbackerDriver::StartIO(AudioServerPlugInDriverRef inDriver,
         dev->ioCycleCount = 0;
         dev->anchorHostTime = mach_absolute_time();
         dev->ringBuffer->reset();
-        std::fill(dev->snapshotBuffer.begin(), dev->snapshotBuffer.end(), 0.0f);
-        dev->needsSnapshot.store(false, std::memory_order_relaxed);
     }
     return kAudioHardwareNoError;
 }
@@ -1556,7 +1547,7 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                                          UInt32 /*inClientID*/,
                                          UInt32 inOperationID,
                                          UInt32 inIOBufferFrameSize,
-                                         const AudioServerPlugInIOCycleInfo* /*inIOCycleInfo*/,
+                                         const AudioServerPlugInIOCycleInfo* inIOCycleInfo,
                                          void* ioMainBuffer,
                                          void* /*ioSecondaryBuffer*/)
 {
@@ -1566,49 +1557,18 @@ OSStatus LoopbackerDriver::DoIOOperation(AudioServerPlugInDriverRef inDriver,
 
     switch (inOperationID) {
         case kAudioServerPlugInIOOperationWriteMix: {
-            auto* samples = static_cast<const float*>(ioMainBuffer);
-            dev->ringBuffer->write(samples, inIOBufferFrameSize);
-            // Signal that fresh data is available for readers to snapshot
-            dev->needsSnapshot.store(true, std::memory_order_release);
+            // Each writing client gets its own WriteMix; mix it in at its output time.
+            dev->ringBuffer->mix(static_cast<int64_t>(inIOCycleInfo->mOutputTime.mSampleTime),
+                                 static_cast<const float*>(ioMainBuffer), inIOBufferFrameSize);
             break;
         }
 
         case kAudioServerPlugInIOOperationReadInput: {
-            auto* samples = static_cast<float*>(ioMainBuffer);
-            // Real-time safe: atomic load only, no allocation/lock/logging.
-            // Only changes while IO is stopped (PerformDeviceConfigurationChange).
-            UInt32 ch = dev->channelCount.load(std::memory_order_acquire);
-
-            // Snapshot the ring buffer once per IO cycle. The first reader
-            // atomically claims the snapshot; all subsequent readers in the
-            // same cycle get the same data. This allows multiple apps (Meet,
-            // Granola, output routing) to read identical audio.
-            bool expected = true;
-            if (dev->needsSnapshot.compare_exchange_strong(expected, false,
-                    std::memory_order_acq_rel)) {
-                // First reader this cycle — consume from ring buffer into snapshot
-                uint32_t framesRead = dev->ringBuffer->read(
-                    dev->snapshotBuffer.data(), inIOBufferFrameSize);
-                if (framesRead < inIOBufferFrameSize) {
-                    uint32_t rem = (inIOBufferFrameSize - framesRead) * ch;
-                    memset(&dev->snapshotBuffer[framesRead * ch], 0,
-                           rem * sizeof(float));
-                }
-
-                // Apply volume & mute once (into the snapshot)
-                float vol = dev->volume;
-                if (dev->mute) vol = 0.0f;
-                if (vol < 1.0f) {
-                    uint32_t totalSamples = inIOBufferFrameSize * ch;
-                    for (uint32_t i = 0; i < totalSamples; ++i) {
-                        dev->snapshotBuffer[i] *= vol;
-                    }
-                }
-            }
-
-            // All readers get the same snapshot
-            memcpy(samples, dev->snapshotBuffer.data(),
-                   static_cast<size_t>(inIOBufferFrameSize) * BytesPerFrameForChannelCount(ch));
+            // Each reading client reads the frames at its own input time; nothing is consumed,
+            // so every reader (Meet, Discord, output routing, ...) hears the same signal.
+            float vol = dev->mute ? 0.0f : dev->volume;
+            dev->ringBuffer->read(static_cast<int64_t>(inIOCycleInfo->mInputTime.mSampleTime),
+                                  static_cast<float*>(ioMainBuffer), inIOBufferFrameSize, vol);
             break;
         }
 

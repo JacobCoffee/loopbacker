@@ -84,8 +84,11 @@ static const Float64 kSampleRates[] = { 48000.0 };
 static const uint32_t kNumSampleRates = 1;
 static const Float64 kDefaultSampleRate = 48000.0;
 
-// Ring buffer
-static const uint32_t kRingBufferFrames = 2048; // must be power of 2 (~42ms at 48kHz)
+// Ring buffer, indexed by sample time (see RingBuffer.h). It must span the gap between a
+// writer's output time and the slowest reader's input time: two safety offsets plus both
+// IO buffers. 16384 frames (~341 ms at 48 kHz) covers client buffers of several thousand
+// frames. It adds no delay: a reader gets the frame written for its own sample time.
+static const uint32_t kRingBufferFrames = 16384; // must be power of 2
 
 // IO
 static const uint32_t kDefaultIOBufferFrames = 256;

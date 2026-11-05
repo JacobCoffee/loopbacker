@@ -59,10 +59,12 @@ App A (e.g. Music.app)           App B (e.g. Discord)
 ```
 
 1. The host calls `DoIOOperation` with `kAudioServerPlugInIOOperationWriteMix` on
-   a device's output stream. The plugin writes the samples into that device's
-   ring buffer.
+   a device's output stream, once per writing client. The plugin mixes the
+   samples into that device's ring buffer at the cycle's output sample time.
 2. The host calls `DoIOOperation` with `kAudioServerPlugInIOOperationReadInput` on
-   the same device's input stream. The plugin reads the same samples back.
+   the same device's input stream, once per reading client. The plugin copies the
+   frames at that cycle's input sample time; nothing is consumed, so every reader
+   gets the same signal.
 3. `GetZeroTimeStamp` drives each device's virtual clock. It advances sample time
    based on `mach_absolute_time()` at the nominal sample rate.
 
@@ -72,18 +74,25 @@ independent, so one device's IO never blocks or interferes with another's.
 
 ## Ring Buffer Design
 
-- **Size**: `kRingBufferFrames` = 2048 frames (power of 2, ~42ms at 48kHz) per
-  device, sized at least 4x the default IO buffer to prevent underruns.
-- **Format**: Interleaved Float32, `BytesPerFrameForChannelCount(channelCount)`
-  bytes/frame -- the device's current `lbch` channel count, not a fixed 2.
-- **Indexing**: Atomic 64-bit write position. Read position derived from
-  `GetZeroTimeStamp` sample time. Masking with `(size - 1)` for wrap-around.
-- **Thread safety**: Lock-free. The host guarantees that `DoIOOperation` calls
-  are serialized per stream within an IO cycle. The only shared state is the
-  write cursor (atomic store from output, atomic load from input).
-- **Zero-copy**: `ReadInput` and `WriteMix` operate directly on the ring buffer
-  memory via `memcpy` to/from the host-provided IO buffers. No intermediate
-  allocations.
+- **Size**: `kRingBufferFrames` = 16384 frames (power of 2, ~341 ms at 48 kHz)
+  per device. It only has to span the gap between a writer's output time and the
+  slowest reader's input time (two safety offsets plus both IO buffers); it adds
+  no delay, so `kAudioDevicePropertyLatency` is 0.
+- **Format**: Interleaved, `channelCount` samples per frame -- the device's
+  current `lbch` channel count, not a fixed 2.
+- **Indexing**: By device sample time. Frame `t` lives at slot `t & (size - 1)`.
+  Each sample is a 64-bit atomic packing the Float32 bits with a lap tag
+  (`t >> log2(size)`). A write whose tag differs overwrites the slot; one whose
+  tag matches adds to it, which mixes several writing clients. A read whose tag
+  differs returns silence, so a stopped writer never loops stale audio.
+- **Why not a consuming FIFO**: the HAL runs a separate IO cycle per client. With
+  one shared read/write cursor, a second writer (a browser or Discord opening the
+  device duplex) or a reader on a different cycle consumed or appended frames out
+  of turn, and every listener heard 96-frame blocks spliced out of order -- a
+  constant fuzz on the virtual mic.
+- **Thread safety**: Lock-free. Writers update samples with CAS, so writers on
+  different IO threads mix correctly; readers do acquire loads. No allocation
+  after construction; `reset()` runs only while IO is stopped.
 
 ## Virtual Clock
 
@@ -134,7 +143,7 @@ Driver/
 | `PluginEntry.cpp` | Exports `Loopbacker_Create` (the CFPlugIn factory). Allocates the driver struct, returns `IUnknown`. ~50 lines. |
 | `LoopbackerTypes.h` | `kMaxDevices`, `kDeviceInfos` (name/UID/object-ID base/terminal types per device), channel-count/sample-rate/ring-buffer constants, and `'lbch'` custom property selector. Adding a device means adding one `VirtualDeviceInfo` entry and bumping `kMaxDevices`; nothing else in the driver assumes a device count. |
 | `LoopbackerDriver.h/cpp` | The `AudioServerPlugInDriverInterface` vtable and IUnknown methods (`QueryInterface`, `AddRef`, `Release`), `Initialize`, `CreateDevice`/`DestroyDevice` (both unsupported), client management, property handling (`HasProperty`/`GetPropertyData`/`SetPropertyData`/...), and IO dispatch (`StartIO`/`StopIO`/`GetZeroTimeStamp`/`DoIOOperation`) for every device, stream, and control, keyed generically by `FindDeviceByObjectID`. |
-| `RingBuffer.h` | ~60 lines. A trivial lock-free SPSC ring buffer. `write(const float*, frameCount)` and `read(float*, frameCount, atFrame)`. Header-only, no allocations after construction. |
+| `RingBuffer.h` | Lock-free ring indexed by device sample time, shared by every client of a device. `mix(sampleTime, data, frames)` for `WriteMix`, `read(sampleTime, out, frames, gain)` for `ReadInput`, `reset()` while IO is stopped. Header-only, no allocations after construction. |
 
 ### Why Not More Files
 
@@ -189,8 +198,8 @@ substituting that device's own IDs/UID/name/channel count):
 - `kAudioDevicePropertyBufferFrameSize` -> `kDefaultIOBufferFrames` (settable)
 - `kLoopbackerDevicePropertyChannelCount` (`'lbch'`) -> this device's current channel count (settable, even 2-16; see "Per-Device Channel Count")
 - `kAudioDevicePropertyLatency` -> `0`
-- `kAudioDevicePropertySafetyOffset` -> `0`
-- `kAudioDevicePropertyZeroTimeStampPeriod` -> `kRingBufferFrames`
+- `kAudioDevicePropertySafetyOffset` -> `kDefaultIOBufferFrames`
+- `kAudioDevicePropertyZeroTimeStampPeriod` -> `kDefaultIOBufferFrames`
 - `kAudioDevicePropertyClockIsStable` -> `1`
 - `kAudioDevicePropertyClockAlgorithm` -> `kAudioDeviceClockAlgorithmRaw`
 - `kAudioDevicePropertyIsRunning` -> `(0 or 1)`, per device
@@ -233,9 +242,7 @@ struct DeviceState {
     UInt64  ioCycleCount;
     Float32 volume; bool mute;
     UInt32  inputTerminalType, outputTerminalType;
-    std::unique_ptr<RingBuffer> ringBuffer;
-    std::vector<float> snapshotBuffer;        // broadcast-read snapshot for this IO cycle
-    std::atomic<bool>  needsSnapshot;
+    std::unique_ptr<RingBuffer> ringBuffer;   // sample-time indexed, shared by all clients
     UInt64  anchorHostTime; Float64 hostTicksPerFrame;
     std::atomic<UInt32> channelCount;          // current 'lbch' value, IO-thread safe
     UInt32  pendingChannelCount;               // guarded by LoopbackerDriver::mMutex
@@ -439,7 +446,7 @@ Input and output streams on a device always share the same count.
      `PerformDeviceConfigurationChange`.
   3. `PerformDeviceConfigurationChange` is the only place (besides
      `Initialize`) allowed to reallocate: it rebuilds the device's
-     `RingBuffer` and `snapshotBuffer` sized for the new channel count,
+     `RingBuffer` sized for the new channel count,
      stores the count atomically on `DeviceState::channelCount`, and writes
      it to host storage.
   4. The HAL re-reads `kAudioStreamPropertyVirtualFormat` /
@@ -1071,7 +1078,7 @@ on a given machine, independent of the app's own UI.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Clock drift vs. real hardware | Glitches when aggregating with MOTU M2 | Use `kAudioDeviceClockAlgorithmRaw` and keep timestamps precise. For aggregate device use, the host handles drift compensation. The app's own routes (input AUHAL on one device, output AUHAL on another) bridge clocks through `DriftCompensatedRing`, which resamples by up to ±0.1% to hold the ring at its target fill; a measured M2 runs ~45 ppm slow vs. the host clock, which drained the old plain ring into continuous crackle within minutes. |
-| Ring buffer overrun/underrun | Silence or stale audio | 2048-frame-per-device buffer provides >4x the default IO buffer size of headroom. Log (to stderr/syslog) on wrap. |
+| Ring buffer overrun/underrun | Silence or stale audio | The ring is indexed by sample time and spans 16384 frames, far more than the writer-to-reader gap. A frame no writer produced reads as silence, never stale audio. |
 | coreaudiod crash on bad property response | System-wide audio failure | Extensive testing of every property the host queries, on every device. Return `kAudioHardwareUnknownPropertyError` for anything unexpected. |
 | Code signing on macOS 13+ | Plugin may not load | Ad-hoc signing (`codesign -s -`) is sufficient for local use. Distribution requires a Developer ID. |
 | Apple Silicon / Intel | Must run on both | CMake `CMAKE_OSX_ARCHITECTURES "arm64;x86_64"` for universal binary. |

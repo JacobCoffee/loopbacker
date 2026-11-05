@@ -3,99 +3,108 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <vector>
+#include <memory>
 
-/// Lock-free single-producer single-consumer ring buffer for audio frames.
-/// Size must be a power of two for efficient bitwise masking.
+/// Loopback ring indexed by device sample time, shared by every client of one device.
+///
+/// The HAL hands each client its own IO cycle: WriteMix runs once per writing client and
+/// ReadInput once per reading client, each with that client's sample time. So writers mix
+/// into the frames at their output sample time, and readers copy the frames at their input
+/// sample time without consuming anything. Any number of writers and readers, at any buffer
+/// size, see the same continuous signal.
+///
+/// Each slot packs the sample's float bits with a tag naming which lap of the ring wrote it
+/// (`sampleTime >> log2(capacity)`). A writer whose tag differs overwrites the slot, one
+/// whose tag matches adds to it; a reader treats a mismatched tag as silence, so a stopped
+/// writer leaves silence instead of looping stale audio. Slots are updated by CAS, so writers
+/// on different IO threads mix without locks. No allocation after construction.
 class RingBuffer {
+    static_assert(std::atomic<uint64_t>::is_always_lock_free, "IO path needs lock-free 64-bit atomics");
+
 public:
-    explicit RingBuffer(uint32_t capacityFrames, uint32_t bytesPerFrame)
+    /// `capacityFrames` must be a power of two.
+    RingBuffer(uint32_t capacityFrames, uint32_t channels)
         : mMask(capacityFrames - 1)
-        , mBytesPerFrame(bytesPerFrame)
-        , mBuffer(static_cast<size_t>(capacityFrames) * bytesPerFrame, 0.0f)
-        , mWritePos(0)
-        , mReadPos(0)
+        , mLapShift(static_cast<uint32_t>(__builtin_ctz(capacityFrames)))
+        , mChannels(channels)
+        , mSlots(new std::atomic<uint64_t>[static_cast<size_t>(capacityFrames) * channels]())
     {
-        // capacityFrames must be power of 2
-        // (compile-time guard is in LoopbackerTypes.h; runtime assert here for dynamic use)
     }
 
-    /// Write frames into the ring buffer. Returns number of frames actually written.
-    /// Uses at most two bulk memcpy calls (one for each wrapped segment).
-    uint32_t write(const float* data, uint32_t frames)
+    /// Mixes `frames` interleaved frames into the ring, starting at device sample time
+    /// `sampleTime`. Frames before sample time 0 are dropped.
+    void mix(int64_t sampleTime, const float* data, uint32_t frames)
     {
-        uint32_t wr = mWritePos.load(std::memory_order_relaxed);
-        uint32_t rd = mReadPos.load(std::memory_order_acquire);
-
-        uint32_t available = capacity() - (wr - rd);
-        uint32_t toWrite = (frames < available) ? frames : available;
-
-        if (toWrite > 0) {
-            const uint32_t samplesPerFrame = mBytesPerFrame / sizeof(float);
-            uint32_t startIdx = wr & mMask;
-            uint32_t firstChunk = capacity() - startIdx; // frames until wrap
-            if (firstChunk > toWrite) firstChunk = toWrite;
-            uint32_t secondChunk = toWrite - firstChunk;
-
-            std::memcpy(&mBuffer[static_cast<size_t>(startIdx) * samplesPerFrame],
-                        data,
-                        static_cast<size_t>(firstChunk) * mBytesPerFrame);
-
-            if (secondChunk > 0) {
-                std::memcpy(&mBuffer[0],
-                            &data[static_cast<size_t>(firstChunk) * samplesPerFrame],
-                            static_cast<size_t>(secondChunk) * mBytesPerFrame);
+        for (uint32_t f = 0; f < frames; ++f) {
+            const int64_t t = sampleTime + f;
+            if (t < 0) continue;
+            const uint32_t tag = lapTag(t);
+            std::atomic<uint64_t>* frame = frameSlots(t);
+            for (uint32_t c = 0; c < mChannels; ++c) {
+                const float sample = data[static_cast<size_t>(f) * mChannels + c];
+                uint64_t old = frame[c].load(std::memory_order_relaxed);
+                uint64_t next;
+                do {
+                    const float base = (tagOf(old) == tag) ? floatOf(old) : 0.0f;
+                    next = pack(tag, base + sample);
+                } while (!frame[c].compare_exchange_weak(old, next, std::memory_order_release,
+                                                         std::memory_order_relaxed));
             }
         }
-
-        mWritePos.store(wr + toWrite, std::memory_order_release);
-        return toWrite;
     }
 
-    /// Read frames from the ring buffer. Returns number of frames actually read.
-    /// Uses at most two bulk memcpy calls (one for each wrapped segment).
-    uint32_t read(float* data, uint32_t frames)
+    /// Copies `frames` interleaved frames starting at device sample time `sampleTime` into
+    /// `out`, scaled by `gain`. Frames no writer produced for that sample time read as silence.
+    void read(int64_t sampleTime, float* out, uint32_t frames, float gain) const
     {
-        uint32_t rd = mReadPos.load(std::memory_order_relaxed);
-        uint32_t wr = mWritePos.load(std::memory_order_acquire);
-
-        uint32_t available = wr - rd;
-        uint32_t toRead = (frames < available) ? frames : available;
-
-        if (toRead > 0) {
-            const uint32_t samplesPerFrame = mBytesPerFrame / sizeof(float);
-            uint32_t startIdx = rd & mMask;
-            uint32_t firstChunk = capacity() - startIdx; // frames until wrap
-            if (firstChunk > toRead) firstChunk = toRead;
-            uint32_t secondChunk = toRead - firstChunk;
-
-            std::memcpy(data,
-                        &mBuffer[static_cast<size_t>(startIdx) * samplesPerFrame],
-                        static_cast<size_t>(firstChunk) * mBytesPerFrame);
-
-            if (secondChunk > 0) {
-                std::memcpy(&data[static_cast<size_t>(firstChunk) * samplesPerFrame],
-                            &mBuffer[0],
-                            static_cast<size_t>(secondChunk) * mBytesPerFrame);
+        for (uint32_t f = 0; f < frames; ++f) {
+            const int64_t t = sampleTime + f;
+            float* dst = out + static_cast<size_t>(f) * mChannels;
+            if (t < 0) {
+                std::memset(dst, 0, mChannels * sizeof(float));
+                continue;
+            }
+            const uint32_t tag = lapTag(t);
+            const std::atomic<uint64_t>* frame = frameSlots(t);
+            for (uint32_t c = 0; c < mChannels; ++c) {
+                const uint64_t v = frame[c].load(std::memory_order_acquire);
+                dst[c] = (tagOf(v) == tag) ? floatOf(v) * gain : 0.0f;
             }
         }
-
-        mReadPos.store(rd + toRead, std::memory_order_release);
-        return toRead;
     }
 
-    uint32_t capacity() const { return mMask + 1; }
-
+    /// Clears every slot. Only call while no IO is running on the device.
     void reset()
     {
-        mWritePos.store(0, std::memory_order_relaxed);
-        mReadPos.store(0, std::memory_order_relaxed);
+        const size_t count = static_cast<size_t>(mMask + 1) * mChannels;
+        for (size_t i = 0; i < count; ++i) mSlots[i].store(0, std::memory_order_relaxed);
     }
 
 private:
+    uint32_t lapTag(int64_t t) const { return static_cast<uint32_t>(static_cast<uint64_t>(t) >> mLapShift); }
+
+    std::atomic<uint64_t>* frameSlots(int64_t t) const
+    {
+        return &mSlots[static_cast<size_t>(static_cast<uint64_t>(t) & mMask) * mChannels];
+    }
+
+    static uint64_t pack(uint32_t tag, float value)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof bits);
+        return (static_cast<uint64_t>(tag) << 32) | bits;
+    }
+    static uint32_t tagOf(uint64_t v) { return static_cast<uint32_t>(v >> 32); }
+    static float floatOf(uint64_t v)
+    {
+        const uint32_t bits = static_cast<uint32_t>(v);
+        float value;
+        std::memcpy(&value, &bits, sizeof value);
+        return value;
+    }
+
     const uint32_t mMask;
-    const uint32_t mBytesPerFrame;
-    std::vector<float> mBuffer;
-    std::atomic<uint32_t> mWritePos;
-    std::atomic<uint32_t> mReadPos;
+    const uint32_t mLapShift;
+    const uint32_t mChannels;
+    const std::unique_ptr<std::atomic<uint64_t>[]> mSlots;
 };

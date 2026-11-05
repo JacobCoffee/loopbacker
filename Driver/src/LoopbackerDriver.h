@@ -28,12 +28,8 @@ struct DeviceState {
     UInt32 inputTerminalType;
     UInt32 outputTerminalType;
 
+    // Shared by every client of this device; see RingBuffer.h.
     std::unique_ptr<RingBuffer> ringBuffer;
-
-    // Snapshot buffer for broadcast reads: all ReadInput clients in the same
-    // IO cycle get the same data instead of each consuming from the ring buffer.
-    std::vector<float> snapshotBuffer;
-    std::atomic<bool>  needsSnapshot;      // set by WriteMix, cleared by first ReadInput
 
     UInt64  anchorHostTime;                // mach_absolute_time at IO start
     Float64 hostTicksPerFrame;             // host ticks per sample frame
@@ -62,7 +58,6 @@ struct DeviceState {
         , mute(false)
         , inputTerminalType(0)
         , outputTerminalType(0)
-        , needsSnapshot(false)
         , anchorHostTime(0)
         , hostTicksPerFrame(0.0)
         , channelCount(kDefaultChannelCount)
